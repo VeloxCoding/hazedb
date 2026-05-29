@@ -33,9 +33,11 @@ const (
 	walMagic   uint16 = 0x485A // "HZ"
 	walVersion uint8  = 1
 
-	recMutation   uint8 = 1
-	recTxn        uint8 = 2 // reserved — M5
-	recCheckpoint uint8 = 3 // reserved — M7
+	recMutation    uint8 = 1
+	recTxn         uint8 = 2 // reserved — transactions
+	recCheckpoint  uint8 = 3 // reserved — snapshot/checkpoint
+	recCreateTable uint8 = 4 // catalog: CREATE TABLE
+	recDropTable   uint8 = 5 // catalog: DROP TABLE
 
 	opInsert uint8 = 1
 	opUpdate uint8 = 2
@@ -274,25 +276,15 @@ func (w *wal) close() error {
 	return w.closeErr
 }
 
-// replayRecord is one decoded MUTATION handed to the apply callback. Body is
-// the op-body (the bytes after op+tableID) and aliases the read buffer; the
-// decoders copy strings/bytes so a decoded Row is safe to retain.
-type replayRecord struct {
-	Op      uint8
-	TableID uint16
-	Body    []byte
-}
-
-// replay reads the WAL from the start to EOF, applying each MUTATION.
+// replay reads the WAL from the start to EOF, handing each record's (type,
+// payload) to apply. The caller dispatches by type (mutation vs catalog).
 //
 // Tail tolerance: a truncated final record (short header/payload read, or a
 // declared length past EOF) is the incomplete tail of an interrupted write
-// and is discarded. Everything else is hard corruption and aborts Open: a
-// wrong magic, a version newer than this binary, an unknown record type, or
-// a CRC mismatch on a fully-present record. CHECKPOINT records are recognised
-// and skipped (their effect is captured by loading the snapshot); TXN is
-// reserved and not yet emitted.
-func (w *wal) replay(apply func(replayRecord) error) error {
+// and is discarded. A wrong magic, a version newer than this binary, or a CRC
+// mismatch on a fully-present record is hard corruption and aborts Open.
+// payload aliases the read buffer; the caller's decoders copy what they keep.
+func (w *wal) replay(apply func(recType uint8, payload []byte) error) error {
 	if _, err := w.f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
@@ -347,24 +339,8 @@ func (w *wal) replay(apply func(replayRecord) error) error {
 			return fmt.Errorf("%w: crc mismatch at offset %d", ErrWALCorrupt, pos-int64(length)-4-8)
 		}
 		w.lsn++
-
-		switch recType {
-		case recMutation:
-			if len(payload) < 3 {
-				return fmt.Errorf("%w: short mutation payload", ErrWALCorrupt)
-			}
-			rec := replayRecord{
-				Op:      payload[0],
-				TableID: binary.LittleEndian.Uint16(payload[1:3]),
-				Body:    payload[3:],
-			}
-			if err := apply(rec); err != nil {
-				return err
-			}
-		case recCheckpoint:
-			// Recognised, no row state — skip.
-		default:
-			return fmt.Errorf("%w: unknown record type %d", ErrWALCorrupt, recType)
+		if err := apply(recType, payload); err != nil {
+			return err
 		}
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,18 +17,21 @@ type tableRT struct {
 // DB is the embedded database handle. One DB per process per WAL
 // path. Open is goroutine-safe; Exec and Query are goroutine-safe.
 type DB struct {
-	schema    Schema
-	tables    map[string]*resolvedTable
-	t         map[string]*tableRT
-	tableByID []*tableRT // tableID → tableRT (for replay)
+	schema   Schema // bootstrap schema, re-applied each Open
+	sizeHint int
+
+	// cat is the live table catalog, published atomically. Reads/writes load
+	// it lock-free; DDL swaps in a new one. ddlMu serialises CREATE/DROP only.
+	cat   atomic.Pointer[catalog]
+	ddlMu sync.Mutex
 
 	wal     *wal
 	scratch *scratchPool
 
-	// stmtCache memoises (SQL → *plan). Hit path is lockless read;
-	// miss path takes the write lock once per unique SQL string. A
-	// plan is read-only after prepare so sharing across goroutines
-	// is safe.
+	// stmtCache memoises (SQL → *plan). A cached plan is stamped with the
+	// catalog version it was bound against; prepare re-binds it when the
+	// catalog has changed since (CREATE/DROP), so a plan never points at a
+	// stale table.
 	stmtCache sync.Map
 }
 
@@ -65,32 +69,21 @@ type Options struct {
 // opened and any existing records are replayed into memory before
 // Open returns. Open is blocking until replay completes.
 func Open(opts Options) (*DB, error) {
-	if len(opts.Schema.Tables) == 0 {
-		return nil, fmt.Errorf("fastsql: schema has no tables")
-	}
-	resolved, err := resolveSchema(opts.Schema)
-	if err != nil {
-		return nil, err
-	}
-	db := &DB{
-		schema:    opts.Schema,
-		tables:    resolved,
-		t:         make(map[string]*tableRT, len(resolved)),
-		tableByID: make([]*tableRT, 0, len(resolved)),
-		scratch:   newScratchPool(),
-	}
 	sizeHint := opts.SizeHint
 	if sizeHint <= 0 {
 		sizeHint = 1024
 	}
-	for i, td := range opts.Schema.Tables {
-		rt := &tableRT{
-			table:   newTable(resolved[td.Name], sizeHint),
-			tableID: uint16(i),
-		}
-		db.t[td.Name] = rt
-		db.tableByID = append(db.tableByID, rt)
+	// An empty schema is allowed — tables can be created at runtime.
+	cat, err := newCatalog(opts.Schema, sizeHint)
+	if err != nil {
+		return nil, err
 	}
+	db := &DB{
+		schema:   opts.Schema,
+		sizeHint: sizeHint,
+		scratch:  newScratchPool(),
+	}
+	db.cat.Store(cat)
 	if opts.WALPath != "" {
 		w, err := openWAL(opts.WALPath, opts.WALSync, opts.WALSyncPerWrite)
 		if err != nil {
@@ -135,11 +128,19 @@ func (db *DB) FlushWAL() error {
 	return db.wal.flush()
 }
 
-// Exec runs an INSERT, UPDATE, or DELETE. Returns the affected row count.
+// Exec runs an INSERT, UPDATE, DELETE, CREATE TABLE, or DROP TABLE. Returns
+// the affected row count (0 for DDL).
 func (db *DB) Exec(sql string, args ...any) (int, error) {
-	pl, err := db.prepare(sql)
+	cat := db.cat.Load() // one snapshot for the whole call
+	pl, err := db.prepare(sql, cat)
 	if err != nil {
 		return 0, err
+	}
+	switch s := pl.st.(type) {
+	case *createStmt:
+		return 0, db.createTable(s.def)
+	case *dropStmt:
+		return 0, db.dropTable(s.name)
 	}
 	vargs, err := toValues(args)
 	if err != nil {
@@ -160,7 +161,8 @@ func (db *DB) Exec(sql string, args ...any) (int, error) {
 // and the rows. Rows are deep-cloned; callers may retain them past
 // future Exec calls without worrying about aliasing into storage.
 func (db *DB) Query(sql string, args ...any) ([]string, []Row, error) {
-	pl, err := db.prepare(sql)
+	cat := db.cat.Load()
+	pl, err := db.prepare(sql, cat)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -174,87 +176,127 @@ func (db *DB) Query(sql string, args ...any) ([]string, []Row, error) {
 	return db.execSelect(pl, vargs)
 }
 
-func (db *DB) prepare(sql string) (*plan, error) {
+// prepare returns a plan bound against cat. A cached plan is reused only if it
+// was bound against the same catalog version; otherwise it is re-parsed and
+// re-bound so it never references a table that has since changed.
+func (db *DB) prepare(sql string, cat *catalog) (*plan, error) {
 	if cached, ok := db.stmtCache.Load(sql); ok {
-		return cached.(*plan), nil
+		if pl := cached.(*plan); pl.catVersion == cat.version {
+			return pl, nil
+		}
 	}
 	st, err := parseSQL(sql)
 	if err != nil {
 		return nil, err
 	}
 	assignParamIndices(st)
-	pl, err := db.plan(st)
+	pl, err := db.plan(st, cat)
 	if err != nil {
 		return nil, err
 	}
-	// LoadOrStore so a concurrent parse of the same SQL doesn't double-bind.
-	actual, _ := db.stmtCache.LoadOrStore(sql, pl)
-	return actual.(*plan), nil
+	db.stmtCache.Store(sql, pl) // overwrite any stale-version entry
+	return pl, nil
 }
 
+// replayWAL rebuilds state from the log. It is single-threaded (runs inside
+// Open before the DB is returned), so it mutates the catalog directly via the
+// atomic pointer. Catalog records (CREATE/DROP) come before any mutation that
+// references the table, so a mutation always resolves against an
+// already-rebuilt catalog.
 func (db *DB) replayWAL(w *wal) error {
-	return w.replay(func(rec replayRecord) error {
-		if int(rec.TableID) >= len(db.tableByID) {
-			return fmt.Errorf("%w: unknown table id %d", ErrWALCorrupt, rec.TableID)
-		}
-		rt := db.tableByID[rec.TableID]
-		switch rec.Op {
-		case opInsert:
-			row, err := decodeRow(rec.Body)
+	return w.replay(func(recType uint8, payload []byte) error {
+		switch recType {
+		case recCreateTable:
+			tableID, td, err := decodeCreateTable(payload)
 			if err != nil {
 				return err
 			}
-			return rt.insert(row)
-		case opUpdate:
-			// op-body: pk-cell | nsets:1 | (ordinal:2 | cell) × nsets.
-			b := rec.Body
-			pk, n, err := decodeCell(b)
+			resolved, err := resolveSchema(Schema{Tables: []TableDef{td}})
 			if err != nil {
 				return err
 			}
-			b = b[n:]
-			if len(b) < 1 {
-				return fmt.Errorf("%w: update missing nsets", ErrWALCorrupt)
-			}
-			nsets := int(b[0])
-			b = b[1:]
-			ords := make([]int, nsets)
-			vals := make([]Value, nsets)
-			for i := 0; i < nsets; i++ {
-				if len(b) < 2 {
-					return fmt.Errorf("%w: update ordinal truncated", ErrWALCorrupt)
-				}
-				ords[i] = int(binary.LittleEndian.Uint16(b[0:2]))
-				b = b[2:]
-				v, m, err := decodeCell(b)
-				if err != nil {
-					return err
-				}
-				vals[i] = v
-				b = b[m:]
-			}
-			// A logical update can only re-apply onto an existing row; in a
-			// consistent WAL the insert always precedes it. An absent target
-			// is corruption (the delta cannot reconstruct a full row).
-			if !rt.update(pk.U, func(r Row) Row {
-				for i := range ords {
-					r[ords[i]] = vals[i]
-				}
-				return r
-			}) {
-				return fmt.Errorf("%w: update for absent pk during replay", ErrWALCorrupt)
-			}
+			rt := &tableRT{table: newTable(resolved[td.Name], db.sizeHint), tableID: tableID}
+			db.cat.Store(db.cat.Load().withTable(rt))
 			return nil
-		case opDelete:
-			pk, _, err := decodeCell(rec.Body)
+		case recDropTable:
+			name, err := decodeDropTable(payload)
 			if err != nil {
 				return err
 			}
-			rt.deleteByPK(pk.U)
+			db.cat.Store(db.cat.Load().withoutTable(name))
 			return nil
+		case recCheckpoint:
+			return nil // no row state — skip
+		case recMutation:
+			if len(payload) < 3 {
+				return fmt.Errorf("%w: short mutation payload", ErrWALCorrupt)
+			}
+			op := payload[0]
+			tableID := binary.LittleEndian.Uint16(payload[1:3])
+			cat := db.cat.Load()
+			if int(tableID) >= len(cat.byID) || cat.byID[tableID] == nil {
+				return fmt.Errorf("%w: mutation for unknown table id %d", ErrWALCorrupt, tableID)
+			}
+			return db.applyMutation(cat.byID[tableID], op, payload[3:])
 		}
-		return fmt.Errorf("%w: unknown op %d", ErrWALCorrupt, rec.Op)
+		return fmt.Errorf("%w: unknown record type %d", ErrWALCorrupt, recType)
 	})
+}
+
+// applyMutation re-applies one decoded mutation to a table during replay.
+func (db *DB) applyMutation(rt *tableRT, op uint8, body []byte) error {
+	switch op {
+	case opInsert:
+		row, err := decodeRow(body)
+		if err != nil {
+			return err
+		}
+		return rt.insert(row)
+	case opUpdate:
+		// op-body: pk-cell | nsets:1 | (ordinal:2 | cell) × nsets.
+		pk, n, err := decodeCell(body)
+		if err != nil {
+			return err
+		}
+		body = body[n:]
+		if len(body) < 1 {
+			return fmt.Errorf("%w: update missing nsets", ErrWALCorrupt)
+		}
+		nsets := int(body[0])
+		body = body[1:]
+		ords := make([]int, nsets)
+		vals := make([]Value, nsets)
+		for i := 0; i < nsets; i++ {
+			if len(body) < 2 {
+				return fmt.Errorf("%w: update ordinal truncated", ErrWALCorrupt)
+			}
+			ords[i] = int(binary.LittleEndian.Uint16(body[0:2]))
+			body = body[2:]
+			v, m, err := decodeCell(body)
+			if err != nil {
+				return err
+			}
+			vals[i] = v
+			body = body[m:]
+		}
+		if !rt.update(pk.U, func(r Row) Row {
+			for i := range ords {
+				r[ords[i]] = vals[i]
+			}
+			return r
+		}) {
+			return fmt.Errorf("%w: update for absent pk during replay", ErrWALCorrupt)
+		}
+		return nil
+	case opDelete:
+		pk, _, err := decodeCell(body)
+		if err != nil {
+			return err
+		}
+		rt.deleteByPK(pk.U)
+		return nil
+	}
+	return fmt.Errorf("%w: unknown op %d", ErrWALCorrupt, op)
 }
 
 // toValues converts variadic args into Value cells. Supports int, int64,

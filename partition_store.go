@@ -100,13 +100,15 @@ func (t *table) getByPKPartitioned(pk UUID) (Row, bool) {
 		}
 		s := &t.shards[loc.shard]
 		s.mu.RLock()
-		var r Row
+		var cl Row
 		if loc.rowID < uint64(len(s.rows)) {
-			r = s.rows[loc.rowID]
+			if r := s.rows[loc.rowID]; r != nil && r[t.def.pkOrdinal].U == pk {
+				cl = r.Clone() // validate + clone UNDER the lock
+			}
 		}
 		s.mu.RUnlock()
-		if r != nil && r[t.def.pkOrdinal].U == pk {
-			return r, true
+		if cl != nil {
+			return cl, true
 		}
 		// Stale location (deleted or moved) → re-resolve via the directory.
 	}

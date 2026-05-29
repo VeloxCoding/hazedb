@@ -189,7 +189,7 @@ func BenchmarkInsertViaStmtNoSQL(b *testing.B) {
 	// Bypass SQL: build a plan once, reuse it across iterations.
 	db, _ := Open(Options{Schema: benchSchema(), SizeHint: b.N})
 	defer db.Close()
-	pl, err := db.prepare("INSERT INTO users (id, name, age) VALUES (?, ?, ?)")
+	pl, err := db.prepare("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", db.cat.Load())
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func BenchmarkInsertViaStmtNoSQL(b *testing.B) {
 func BenchmarkSelectByPKViaStmtNoSQL(b *testing.B) {
 	const N = 10000
 	db := newBenchDB(b, N)
-	pl, err := db.prepare("SELECT name, age FROM users WHERE id = ?")
+	pl, err := db.prepare("SELECT name, age FROM users WHERE id = ?", db.cat.Load())
 	if err != nil {
 		b.Fatal(err)
 	}

@@ -50,6 +50,9 @@ const (
 	tkTrue
 	tkFalse
 	tkIs
+	tkCreate
+	tkTable
+	tkDrop
 )
 
 var keywords = map[string]tokenKind{
@@ -74,6 +77,9 @@ var keywords = map[string]tokenKind{
 	"true":   tkTrue,
 	"false":  tkFalse,
 	"is":     tkIs,
+	"create": tkCreate,
+	"table":  tkTable,
+	"drop":   tkDrop,
 }
 
 type token struct {

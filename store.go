@@ -229,13 +229,14 @@ func (t *table) getByPK(pk UUID) (Row, bool) {
 	s := t.shardOf(pk)
 	s.mu.RLock()
 	rowID, ok := s.pk[pk]
-	if !ok {
-		s.mu.RUnlock()
-		return nil, false
+	var cl Row
+	if ok {
+		if r := s.rows[rowID]; r != nil {
+			cl = r.Clone() // clone UNDER the lock — a concurrent writer holds the write lock
+		}
 	}
-	r := s.rows[rowID]
 	s.mu.RUnlock()
-	return r, r != nil
+	return cl, cl != nil
 }
 
 // scanAll walks every row across every shard, invoking fn. Returning

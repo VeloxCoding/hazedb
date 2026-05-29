@@ -284,7 +284,7 @@ func newMsgDB(tb testing.TB) *DB {
 func newMsgDBFilled(tb testing.TB) *DB {
 	db := newMsgDB(tb)
 	for i := 0; i < spikeCorpus; i++ {
-		if err := db.t["messages"].insert(msgRow(i, spikeBody)); err != nil {
+		if err := db.cat.Load().byName["messages"].insert(msgRow(i, spikeBody)); err != nil {
 			tb.Fatal(err)
 		}
 	}
@@ -321,7 +321,7 @@ func buildCorpus(enc func(i int) []byte) [][]byte {
 
 func applyDirectIns(db *DB, rec []byte) {
 	row, _ := getRow(rec[3:]) // skip op+tableID
-	_ = db.t["messages"].insert(row)
+	_ = db.cat.Load().byName["messages"].insert(row)
 }
 
 func applySQLIns(db *DB, rec []byte) {
@@ -329,7 +329,7 @@ func applySQLIns(db *DB, rec []byte) {
 	off := 4 + sl
 	sql := string(rec[4 : 4+sl])
 	params, _ := getRow(rec[off:])
-	pl, err := db.prepare(sql)
+	pl, err := db.prepare(sql, db.cat.Load())
 	if err != nil {
 		return
 	}
@@ -354,7 +354,7 @@ func BenchmarkWALReplay_Insert_SQLStr(b *testing.B) {
 func applyPhysUpd(db *DB, rec []byte) {
 	row, _ := getRow(rec[3:])
 	pk := row[0].U
-	db.t["messages"].update(pk, func(_ Row) Row { return row })
+	db.cat.Load().byName["messages"].update(pk, func(_ Row) Row { return row })
 }
 
 func applyTypedUpd(db *DB, rec []byte) {
@@ -372,7 +372,7 @@ func applyTypedUpd(db *DB, rec []byte) {
 		off += k
 		vals[i] = v
 	}
-	db.t["messages"].update(pk.U, func(r Row) Row {
+	db.cat.Load().byName["messages"].update(pk.U, func(r Row) Row {
 		for i := range ords {
 			r[ords[i]] = vals[i]
 		}
@@ -385,7 +385,7 @@ func applySQLUpd(db *DB, rec []byte) {
 	off := 4 + sl
 	sql := string(rec[4 : 4+sl])
 	params, _ := getRow(rec[off:])
-	pl, err := db.prepare(sql)
+	pl, err := db.prepare(sql, db.cat.Load())
 	if err != nil {
 		return
 	}
@@ -411,7 +411,7 @@ func BenchmarkWALReplay_UpdNarrow_SQLStr(b *testing.B) {
 
 func applyDirectDel(db *DB, rec []byte) {
 	pk, _ := getVal(rec[3:]) // skip op+tableID
-	db.t["messages"].deleteByPK(pk.U)
+	db.cat.Load().byName["messages"].deleteByPK(pk.U)
 }
 
 func applySQLDel(db *DB, rec []byte) {
@@ -419,7 +419,7 @@ func applySQLDel(db *DB, rec []byte) {
 	off := 4 + sl
 	sql := string(rec[4 : 4+sl])
 	params, _ := getRow(rec[off:])
-	pl, err := db.prepare(sql)
+	pl, err := db.prepare(sql, db.cat.Load())
 	if err != nil {
 		return
 	}

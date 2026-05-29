@@ -11,4 +11,5 @@ var (
 	ErrPKUpdate       = errors.New("fastsql: UPDATE on PK column not supported")
 	ErrParse          = errors.New("fastsql: parse error")
 	ErrWALCorrupt     = errors.New("fastsql: WAL corrupted")
+	ErrTableExists    = errors.New("hazedb: table already exists")
 )

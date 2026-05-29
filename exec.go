@@ -55,6 +55,11 @@ func assignParamIndices(st stmt) {
 type plan struct {
 	st    stmt
 	table *resolvedTable
+	// rt is the table's runtime storage, resolved from the catalog snapshot
+	// this plan was bound against. catVersion is that snapshot's version;
+	// prepare re-binds the plan if the catalog has changed since.
+	rt         *tableRT
+	catVersion uint64
 	// SELECT projection: ordinals into the row, in output order. nil if
 	// SELECT *.
 	projOrdinals []int
@@ -84,8 +89,14 @@ type plan struct {
 	partSource expr
 }
 
-func (db *DB) plan(st stmt) (*plan, error) {
-	pl := &plan{st: st, orderOrdinal: -1}
+func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
+	pl := &plan{st: st, orderOrdinal: -1, catVersion: cat.version}
+	// DDL needs no table resolution: CREATE defines a new table, DROP names
+	// one; both are dispatched straight from Exec.
+	switch st.(type) {
+	case *createStmt, *dropStmt:
+		return pl, nil
+	}
 	tname := ""
 	switch s := st.(type) {
 	case *selectStmt:
@@ -97,10 +108,12 @@ func (db *DB) plan(st stmt) (*plan, error) {
 	case *deleteStmt:
 		tname = s.table
 	}
-	rt, ok := db.tables[tname]
+	trt, ok := cat.byName[tname]
 	if !ok {
 		return nil, fmt.Errorf("%w: %q", ErrUnknownTable, tname)
 	}
+	pl.rt = trt
+	rt := trt.table.def
 	pl.table = rt
 	switch s := st.(type) {
 	case *selectStmt:
@@ -414,7 +427,7 @@ func truthy(v Value) bool {
 // may mutate them without affecting storage.
 func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 	st := pl.st.(*selectStmt)
-	tbl := db.t[pl.table.def.Name]
+	tbl := pl.rt
 
 	colNames := make([]string, 0, len(tbl.def.def.Columns))
 	if st.starAll {
@@ -448,19 +461,14 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 		if !ok {
 			return colNames, nil, nil
 		}
+		// r is already a private clone (cloned under the shard lock), so it is
+		// safe to read here and to hand back directly.
 		if st.starAll {
-			return colNames, []Row{r.Clone()}, nil
+			return colNames, []Row{r}, nil
 		}
 		pr := make(Row, len(pl.projOrdinals))
 		for j, ord := range pl.projOrdinals {
-			v := r[ord]
-			// Defensive copy for KindBytes; strings/ints are value-safe.
-			if v.Kind == KindBytes && v.B != nil {
-				cp := make([]byte, len(v.B))
-				copy(cp, v.B)
-				v.B = cp
-			}
-			pr[j] = v
+			pr[j] = r[ord]
 		}
 		return colNames, []Row{pr}, nil
 	}
@@ -535,7 +543,7 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 // inserted) and an error.
 func (db *DB) execInsert(pl *plan, args []Value) (int, error) {
 	st := pl.st.(*insertStmt)
-	tbl := db.t[pl.table.def.Name]
+	tbl := pl.rt
 	row := make(Row, len(tbl.def.def.Columns))
 	for i := range row {
 		row[i] = Null()
@@ -604,7 +612,7 @@ func (db *DB) execInsert(pl *plan, args []Value) (int, error) {
 // stay identical — the one-shard-at-a-time form is a replay-divergence bug.
 func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 	st := pl.st.(*updateStmt)
-	tbl := db.t[pl.table.def.Name]
+	tbl := pl.rt
 	ctx := &evalCtx{cols: tbl.def.colByName, args: args}
 
 	match := func(r Row) bool {
@@ -706,7 +714,7 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 // the store under the locks — never as a side effect of the match predicate.
 func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 	st := pl.st.(*deleteStmt)
-	tbl := db.t[pl.table.def.Name]
+	tbl := pl.rt
 	ctx := &evalCtx{cols: tbl.def.colByName, args: args}
 
 	// Fast path: PK equality — single shard, journal-before-tombstone under

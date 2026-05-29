@@ -56,8 +56,107 @@ func (p *parser) parseStmt() (stmt, error) {
 		return p.parseUpdate()
 	case tkDelete:
 		return p.parseDelete()
+	case tkCreate:
+		return p.parseCreate()
+	case tkDrop:
+		return p.parseDrop()
 	}
 	return nil, fmt.Errorf("%w: unexpected token at %d", ErrParse, p.peek().pos)
+}
+
+// parseCreate parses CREATE TABLE name (col TYPE [constraints], ...). Types:
+// int, text/string, bool, bytes/blob, uuid. Constraints: PRIMARY KEY,
+// PARTITION KEY, IMMUTABLE, NULL (nullable; columns are NOT NULL by default).
+func (p *parser) parseCreate() (*createStmt, error) {
+	p.advance() // CREATE
+	if _, err := p.expect(tkTable, "TABLE"); err != nil {
+		return nil, err
+	}
+	tn, err := p.expect(tkIdent, "table name")
+	if err != nil {
+		return nil, err
+	}
+	st := &createStmt{def: TableDef{Name: tn.text}}
+	if _, err := p.expect(tkLParen, "("); err != nil {
+		return nil, err
+	}
+	for {
+		cn, err := p.expect(tkIdent, "column name")
+		if err != nil {
+			return nil, err
+		}
+		tt, err := p.expect(tkIdent, "column type")
+		if err != nil {
+			return nil, err
+		}
+		ct, err := parseColType(tt.text)
+		if err != nil {
+			return nil, err
+		}
+		col := ColumnDef{Name: cn.text, Type: ct}
+		for k := p.peek().kind; k != tkComma && k != tkRParen && k != tkEOF; k = p.peek().kind {
+			t := p.advance()
+			switch {
+			case t.kind == tkNull:
+				col.Nullable = true
+			case t.kind == tkNot: // NOT NULL — the default; consume optional NULL
+				if p.peek().kind == tkNull {
+					p.advance()
+				}
+			case t.text == "primary":
+				if w := p.advance(); w.text != "key" {
+					return nil, fmt.Errorf("%w: expected KEY after PRIMARY at %d", ErrParse, w.pos)
+				}
+				col.PK = true
+			case t.text == "partition":
+				if w := p.advance(); w.text != "key" {
+					return nil, fmt.Errorf("%w: expected KEY after PARTITION at %d", ErrParse, w.pos)
+				}
+				col.PartitionKey = true
+			case t.text == "immutable":
+				col.Immutable = true
+			default:
+				return nil, fmt.Errorf("%w: unexpected column constraint %q at %d", ErrParse, t.text, t.pos)
+			}
+		}
+		st.def.Columns = append(st.def.Columns, col)
+		if p.peek().kind != tkComma {
+			break
+		}
+		p.advance()
+	}
+	if _, err := p.expect(tkRParen, ")"); err != nil {
+		return nil, err
+	}
+	return st, nil
+}
+
+func parseColType(s string) (ColumnType, error) {
+	switch s {
+	case "int":
+		return TypeInt, nil
+	case "text", "string":
+		return TypeString, nil
+	case "bool":
+		return TypeBool, nil
+	case "bytes", "blob":
+		return TypeBytes, nil
+	case "uuid":
+		return TypeUUID, nil
+	}
+	return 0, fmt.Errorf("%w: unknown column type %q", ErrParse, s)
+}
+
+func (p *parser) parseDrop() (*dropStmt, error) {
+	p.advance() // DROP
+	if _, err := p.expect(tkTable, "TABLE"); err != nil {
+		return nil, err
+	}
+	tn, err := p.expect(tkIdent, "table name")
+	if err != nil {
+		return nil, err
+	}
+	return &dropStmt{name: tn.text}, nil
 }
 
 func (p *parser) parseSelect() (*selectStmt, error) {

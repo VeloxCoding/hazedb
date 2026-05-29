@@ -31,6 +31,10 @@ type deleteStmt struct {
 	where expr
 }
 
+// createStmt / dropStmt are the runtime DDL statements.
+type createStmt struct{ def TableDef }
+type dropStmt struct{ name string }
+
 type setAssign struct {
 	col string
 	val expr
@@ -44,6 +48,8 @@ func (*selectStmt) isStmt() {}
 func (*insertStmt) isStmt() {}
 func (*updateStmt) isStmt() {}
 func (*deleteStmt) isStmt() {}
+func (*createStmt) isStmt() {}
+func (*dropStmt) isStmt()   {}
 
 // Expression AST. Kept tiny for v1: column refs, literals, parameters,
 // comparison ops, AND/OR/NOT, IS NULL, IS NOT NULL.
