@@ -183,3 +183,64 @@ func TestPartitionedConcurrent(t *testing.T) {
 func insMsg2(db *DB, id, thread UUID, seq int) {
 	db.Exec("INSERT INTO messages (id, thread, seq, body) VALUES (?, ?, ?, ?)", id, thread, seq, "m")
 }
+
+// A WHERE partition = ? SELECT returns only that partition's rows (reading
+// just its row list), respects ORDER BY + LIMIT, and skips deleted rows.
+func TestPartitionScanQuery(t *testing.T) {
+	db := openMsgsMem(t)
+	tA, tB := NewUUIDv7(), NewUUIDv7()
+	for i := 0; i < 20; i++ {
+		insMsg(t, db, NewUUIDv7(), tA, i, "a")
+		insMsg(t, db, NewUUIDv7(), tB, i, "b")
+	}
+	_, rows, err := db.Query("SELECT body FROM messages WHERE thread = ?", tA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 20 {
+		t.Fatalf("thread A: got %d rows, want 20", len(rows))
+	}
+	for _, r := range rows {
+		if r[0].S != "a" {
+			t.Fatalf("scan returned a row from another partition: %v", r)
+		}
+	}
+	_, top, err := db.Query("SELECT seq FROM messages WHERE thread = ? ORDER BY seq DESC LIMIT 3", tB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(top) != 3 || top[0][0].I != 19 || top[1][0].I != 18 || top[2][0].I != 17 {
+		t.Fatalf("ORDER BY seq DESC LIMIT 3: %v", top)
+	}
+	// Delete the whole partition; the scan must then skip the tombstones.
+	if _, err := db.Exec("DELETE FROM messages WHERE thread = ?", tA); err != nil {
+		t.Fatal(err)
+	}
+	_, rows, _ = db.Query("SELECT body FROM messages WHERE thread = ?", tA)
+	if len(rows) != 0 {
+		t.Fatalf("after deleting partition: got %d rows, want 0", len(rows))
+	}
+	_, rb, _ := db.Query("SELECT body FROM messages WHERE thread = ?", tB)
+	if len(rb) != 20 {
+		t.Fatalf("other partition disturbed: got %d, want 20", len(rb))
+	}
+}
+
+// Indexed partition scan: one thread (~100 rows) out of a 10k-row table.
+// Contrast with BenchmarkSelectRange_Mem (~790us full scan of 10k).
+func BenchmarkPartitionScan(b *testing.B) {
+	db, _ := Open(Options{Schema: msgsSchema(), SizeHint: 10000})
+	defer db.Close()
+	threads := make([]UUID, 100)
+	for i := range threads {
+		threads[i] = NewUUIDv7()
+	}
+	for i := 0; i < 10000; i++ {
+		db.Exec("INSERT INTO messages (id, thread, seq, body) VALUES (?, ?, ?, ?)", NewUUIDv7(), threads[i%100], i, "m")
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		db.Query("SELECT id FROM messages WHERE thread = ? ORDER BY seq DESC LIMIT 10", threads[i%100])
+	}
+}

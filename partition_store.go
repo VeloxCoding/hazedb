@@ -40,7 +40,8 @@ const pkRetryBudget = 8
 // row is applied. journal may be nil (replay / memory-only).
 func (t *table) insertPartitioned(row Row, journal func() error) error {
 	pk := row[t.def.pkOrdinal].U
-	idx := t.shardIdxOf(row[t.def.partitionOrdinal].U)
+	part := row[t.def.partitionOrdinal].U
+	idx := t.shardIdxOf(part)
 	s := &t.shards[idx]
 
 	t.pkDir.mu.Lock()
@@ -58,8 +59,30 @@ func (t *table) insertPartitioned(row Row, journal func() error) error {
 	rowID := uint64(len(s.rows))
 	s.rows = append(s.rows, row)
 	s.live++
+	s.tails[part] = append(s.tails[part], rowID)
 	t.pkDir.idx[pk] = rowLocation{shard: idx, rowID: rowID}
 	return nil
+}
+
+// scanPartition visits every live row of one partition value in insert order,
+// reading only that partition's rowID list (O(partition size), not O(table)).
+// fn returning false stops the scan. Holds the owning shard's read lock.
+func (t *table) scanPartition(part UUID, fn func(Row) bool) {
+	s := t.shardOf(part)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, rowID := range s.tails[part] {
+		if rowID >= uint64(len(s.rows)) {
+			continue
+		}
+		r := s.rows[rowID]
+		if r == nil {
+			continue // tombstoned
+		}
+		if !fn(r) {
+			return
+		}
+	}
 }
 
 // getByPKPartitioned resolves PK → location, reads under the shard lock, and

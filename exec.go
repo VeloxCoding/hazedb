@@ -75,6 +75,13 @@ type plan struct {
 	// scan. pkSource is the expression that yields the key.
 	pkLookup bool
 	pkSource expr
+
+	// partLookup is true when a SELECT on a partitioned table pins the
+	// PartitionKey column to a value (WHERE thread = ?). The executor then
+	// scans only that partition's rows instead of the whole table. partSource
+	// yields the partition value.
+	partLookup bool
+	partSource expr
 }
 
 func (db *DB) plan(st stmt) (*plan, error) {
@@ -121,6 +128,11 @@ func (db *DB) plan(st stmt) (*plan, error) {
 			if ok, src := detectPKEq(s.where, rt); ok {
 				pl.pkLookup = true
 				pl.pkSource = src
+			} else if rt.partitioned() {
+				if ok, src := detectColEq(s.where, rt, rt.partitionOrdinal); ok {
+					pl.partLookup = true
+					pl.partSource = src
+				}
 			}
 		}
 	case *insertStmt:
@@ -181,27 +193,31 @@ func (db *DB) plan(st stmt) (*plan, error) {
 	return pl, nil
 }
 
-// detectPKEq returns (true, valueSide) when e is a single binOp =
-// between the PK column and a literal/parameter expression. Returns
-// (false, nil) otherwise. Walks across AND chains in a future pass —
-// v1 only accepts the bare equality.
-func detectPKEq(e expr, rt *resolvedTable) (bool, expr) {
+// detectColEq returns (true, valueSide) when e is a single binOp = between the
+// named column (by ordinal) and a literal/parameter. Walks across AND chains
+// in a future pass — v1 only accepts the bare equality.
+func detectColEq(e expr, rt *resolvedTable, ordinal int) (bool, expr) {
 	bop, ok := e.(*binOp)
 	if !ok || bop.op != tkEq {
 		return false, nil
 	}
-	pkName := rt.def.Columns[rt.pkOrdinal].Name
-	if cr, ok := bop.lhs.(*colRef); ok && cr.name == pkName {
+	name := rt.def.Columns[ordinal].Name
+	if cr, ok := bop.lhs.(*colRef); ok && cr.name == name {
 		if isLitOrParam(bop.rhs) {
 			return true, bop.rhs
 		}
 	}
-	if cr, ok := bop.rhs.(*colRef); ok && cr.name == pkName {
+	if cr, ok := bop.rhs.(*colRef); ok && cr.name == name {
 		if isLitOrParam(bop.lhs) {
 			return true, bop.lhs
 		}
 	}
 	return false, nil
+}
+
+// detectPKEq is detectColEq pinned to the PK column.
+func detectPKEq(e expr, rt *resolvedTable) (bool, expr) {
+	return detectColEq(e, rt, rt.pkOrdinal)
 }
 
 func isLitOrParam(e expr) bool {
@@ -449,9 +465,25 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 		return colNames, []Row{pr}, nil
 	}
 
-	// Collect matching rows from the storage layer.
+	// Collect matching rows. A partition-pinned SELECT (WHERE partkey = ?)
+	// reads only that partition's rows; otherwise scan every shard.
+	scan := tbl.scanAll
+	if pl.partLookup {
+		pv, err := evalExpr(pl.partSource, ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		if pv.IsNull() {
+			return colNames, nil, nil
+		}
+		part, err := coerceToUUID(pv)
+		if err != nil {
+			return nil, nil, err
+		}
+		scan = func(fn func(Row) bool) { tbl.scanPartition(part, fn) }
+	}
 	var matched []Row
-	tbl.scanAll(func(r Row) bool {
+	scan(func(r Row) bool {
 		if st.where != nil {
 			ctx.row = r
 			v, err := evalExpr(st.where, ctx)

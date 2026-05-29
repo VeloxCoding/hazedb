@@ -40,9 +40,15 @@ type table struct {
 
 type tableShard struct {
 	mu   sync.RWMutex
-	rows []Row            // arena; nil entries are tombstones
-	pk   map[UUID]uint64  // PK (UUID) → rowID
-	live int              // count of non-tombstoned rows
+	rows []Row // arena; nil entries are tombstones
+	// pk is the per-shard PK→rowID index for NON-partitioned tables.
+	pk map[UUID]uint64
+	// tails groups rowIDs by PartitionKey value for PARTITIONED tables, in
+	// insert order. A WHERE partition=? scan reads only the matching list
+	// instead of every row, so it is O(partition size), not O(table). Deleted
+	// rowIDs stay in the list (rows[rowID] is nil) and the scan skips them.
+	tails map[UUID][]uint64
+	live  int // count of non-tombstoned rows
 }
 
 func newTable(def *resolvedTable, sizeHint int) *table {
@@ -58,7 +64,9 @@ func newTable(def *resolvedTable, sizeHint int) *table {
 	}
 	for i := range t.shards {
 		t.shards[i].rows = make([]Row, 0, per)
-		if !def.partitioned() {
+		if def.partitioned() {
+			t.shards[i].tails = make(map[UUID][]uint64)
+		} else {
 			t.shards[i].pk = make(map[UUID]uint64, per)
 		}
 	}
