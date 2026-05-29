@@ -454,28 +454,31 @@ func (db *DB) execInsert(pl *plan, args []Value) (int, error) {
 			return 0, fmt.Errorf("column %q is NOT NULL", c.Name)
 		}
 	}
-	// WAL
-	if db.wal != nil {
-		body := encodeRow(db.scratch.get(), row)
-		err := db.wal.writeRecord(opInsert, tbl.tableID, body)
-		db.scratch.put(body)
-		if err != nil {
-			return 0, err
+	// PK uniqueness + WAL append + apply run atomically under the shard
+	// lock (see insertJournaled). Ordering matters: a duplicate PK must be
+	// rejected before anything is journaled, and a WAL failure must abort
+	// before the row is applied.
+	err := tbl.insertJournaled(row, func() error {
+		if db.wal == nil {
+			return nil
 		}
-	}
-	if err := tbl.insert(row); err != nil {
+		body := encodeRow(db.scratch.get(), row)
+		werr := db.wal.writeRecord(opInsert, tbl.tableID, body)
+		db.scratch.put(body)
+		return werr
+	})
+	if err != nil {
 		return 0, err
 	}
 	return 1, nil
 }
 
-// execUpdate evaluates SET values once per matched row, mutates rows
-// in place under each shard's write lock, and journals each change.
-//
-// Note on WAL ordering: each row update goes through writeRecord
-// inside the shard write lock, so the WAL ordering within one shard
-// matches the storage order. Cross-shard ordering is undefined (same
-// as Insert).
+// execUpdate evaluates the SET values once, then dispatches on the WHERE
+// shape. A PK-pinned update hits exactly one shard and mutates in place
+// under that shard's lock (hot path, allocation-free). An unpinned predicate
+// update can span shards and goes through updateWhereAll, which holds every
+// shard lock across the journal+apply so the WAL order and in-memory order
+// stay identical — the one-shard-at-a-time form is a replay-divergence bug.
 func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 	st := pl.st.(*updateStmt)
 	tbl := db.t[pl.table.def.Name]
@@ -509,21 +512,9 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		setVals[i] = v
 	}
 
-	mutate := func(r Row) Row {
-		// Mutate in place. Storage layer expects a Row back even if the
-		// reference is the same.
-		for i, ord := range pl.updateOrdinals {
-			r[ord] = setVals[i]
-		}
-		if db.wal != nil {
-			body := encodeRow(db.scratch.get(), r)
-			db.wal.writeRecord(opUpdate, tbl.tableID, body)
-			db.scratch.put(body)
-		}
-		return r
-	}
-
-	// Fast path: PK equality — go straight through tableShard.update.
+	// Fast path: PK equality — single shard. Mutate in place and journal
+	// inside that shard's write lock (WAL order == storage order for the
+	// one shard); no row clone on this hot path.
 	if pl.pkLookup {
 		keyVal, err := evalExpr(pl.pkSource, &evalCtx{args: args})
 		if err != nil {
@@ -532,23 +523,56 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		if keyVal.IsNull() {
 			return 0, nil
 		}
+		mutate := func(r Row) Row {
+			for i, ord := range pl.updateOrdinals {
+				r[ord] = setVals[i]
+			}
+			if db.wal != nil {
+				body := encodeRow(db.scratch.get(), r)
+				db.wal.writeRecord(opUpdate, tbl.tableID, body)
+				db.scratch.put(body)
+			}
+			return r
+		}
 		if tbl.update(keyVal.AsString(), mutate) {
 			return 1, nil
 		}
 		return 0, nil
 	}
 
-	n := tbl.updateWhere(match, mutate)
-	return n, nil
+	// Multi-shard predicate path: build each post-update image without
+	// mutating storage, journal it, then store it — all under every shard
+	// lock (updateWhereAll). The clone here is acceptable: bulk predicate
+	// updates are not the hot path, and correctness requires journaling the
+	// image before it is applied.
+	newImage := func(r Row) Row {
+		nr := r.Clone()
+		for i, ord := range pl.updateOrdinals {
+			nr[ord] = setVals[i]
+		}
+		return nr
+	}
+	journal := func(nr Row) error {
+		if db.wal == nil {
+			return nil
+		}
+		body := encodeRow(db.scratch.get(), nr)
+		err := db.wal.writeRecord(opUpdate, tbl.tableID, body)
+		db.scratch.put(body)
+		return err
+	}
+	return tbl.updateWhereAll(match, newImage, journal)
 }
 
-// execDelete tombstones matching rows and journals each one.
+// execDelete dispatches on the WHERE shape, mirroring execUpdate. A
+// PK-pinned delete hits one shard. An unpinned predicate delete goes
+// through deleteWhereAll, which holds every shard lock across journal+apply
+// (the one-shard-at-a-time form diverges on replay). Journaling is done by
+// the store under the locks — never as a side effect of the match predicate.
 func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 	st := pl.st.(*deleteStmt)
 	tbl := db.t[pl.table.def.Name]
 	ctx := &evalCtx{cols: tbl.def.colByName, args: args}
-
-	pkOrd := tbl.def.pkOrdinal
 
 	// Fast path: PK equality — single map lookup, no scan.
 	if pl.pkLookup {
@@ -577,6 +601,8 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 		return 0, nil
 	}
 
+	// Multi-shard predicate path: match is pure; deleteWhereAll journals
+	// each PK before tombstoning, under every shard lock.
 	match := func(r Row) bool {
 		if st.where == nil {
 			return true
@@ -586,16 +612,16 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 		if err != nil {
 			return false
 		}
-		if !truthy(v) {
-			return false
-		}
-		if db.wal != nil {
-			body := encodePK(db.scratch.get(), r[pkOrd])
-			db.wal.writeRecord(opDelete, tbl.tableID, body)
-			db.scratch.put(body)
-		}
-		return true
+		return truthy(v)
 	}
-	n := tbl.deleteWhere(match)
-	return n, nil
+	journal := func(pk Value) error {
+		if db.wal == nil {
+			return nil
+		}
+		body := encodePK(db.scratch.get(), pk)
+		err := db.wal.writeRecord(opDelete, tbl.tableID, body)
+		db.scratch.put(body)
+		return err
+	}
+	return tbl.deleteWhereAll(match, journal)
 }

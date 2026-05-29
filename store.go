@@ -87,6 +87,40 @@ func (t *table) insert(row Row) error {
 	return nil
 }
 
+// insertJournaled is the live-write insert path: it checks PK uniqueness,
+// runs journal() (the WAL append), and adds the row — all under one shard
+// lock, in that order. This enforces the RFC pipeline (validate → WAL →
+// apply) atomically:
+//
+//   - a duplicate PK returns ErrDuplicatePK BEFORE journal runs, so a
+//     rejected insert never reaches the WAL (otherwise replay re-hits the
+//     duplicate and Open fails permanently);
+//   - if journal returns an error the row is NOT added, so RAM never holds
+//     a mutation absent from the WAL;
+//   - holding the shard lock across journal+append makes WAL order and
+//     in-memory order identical for inserts on the same shard.
+//
+// journal may be nil (memory-only DB).
+func (t *table) insertJournaled(row Row, journal func() error) error {
+	pk := row[t.def.pkOrdinal].AsString()
+	s := t.shardOf(pk)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.pk[pk]; exists {
+		return ErrDuplicatePK
+	}
+	if journal != nil {
+		if err := journal(); err != nil {
+			return err
+		}
+	}
+	rowID := uint32(len(s.rows))
+	s.rows = append(s.rows, row)
+	s.pk[pk] = rowID
+	s.live++
+	return nil
+}
+
 // getByPK returns the row for pk, or (nil, false). The returned Row is
 // a shallow alias into the shard arena; callers that escape it past
 // the call must Clone.
@@ -145,30 +179,61 @@ func (t *table) update(pk string, mutate func(Row) Row) bool {
 	return true
 }
 
-// updateWhere walks rows under each shard's write lock and applies
-// mutate when match returns true. Returns the count of mutated rows.
-// match runs under the lock but must be pure (no store calls).
+// lockAllShards / unlockAllShards take (and release) every shard lock in
+// the global order: ascending index to lock, descending to unlock. Used by
+// the multi-shard predicate writes below, which must hold all shard locks
+// for the whole operation.
+func (t *table) lockAllShards() {
+	for i := range t.shards {
+		t.shards[i].mu.Lock()
+	}
+}
+
+func (t *table) unlockAllShards() {
+	for i := len(t.shards) - 1; i >= 0; i-- {
+		t.shards[i].mu.Unlock()
+	}
+}
+
+// updateWhereAll applies a predicate UPDATE across the whole table while
+// holding EVERY shard lock for the entire operation. This is mandatory for
+// correctness, not an optimisation choice: the one-shard-at-a-time pattern
+// (lock shard, journal, apply, unlock, next shard) is a write-serializability
+// + replay-divergence bug — two interleaved multi-shard writers can leave
+// RAM in a state no serial order produces, while the WAL's total order
+// replays to a different state. Holding all locks makes the journal appends
+// and the in-memory applies one serialisable unit.
 //
-// PK changes: if mutate changes the row's PK value, the pk index must
-// be reseated. The executor refuses UPDATEs that touch the PK column,
-// so updateWhere can ignore this case.
-func (t *table) updateWhere(match func(Row) bool, mutate func(Row) Row) int {
+// For each matched row: newImage(r) builds the post-update row image WITHOUT
+// touching storage; journal(image) appends the WAL record; only then is the
+// image stored. So a WAL-append failure aborts before the row is applied
+// (returns the count applied so far plus the error). match and newImage run
+// under the locks and must be pure (no store calls). newImage must not
+// mutate r in place — it is journaled before it is stored.
+func (t *table) updateWhereAll(match func(Row) bool, newImage func(Row) Row, journal func(Row) error) (int, error) {
+	t.lockAllShards()
+	defer t.unlockAllShards()
 	count := 0
 	for i := range t.shards {
 		s := &t.shards[i]
-		s.mu.Lock()
 		for j, r := range s.rows {
 			if r == nil {
 				continue
 			}
-			if match(r) {
-				s.rows[j] = mutate(r)
-				count++
+			if !match(r) {
+				continue
 			}
+			nr := newImage(r)
+			if journal != nil {
+				if err := journal(nr); err != nil {
+					return count, err
+				}
+			}
+			s.rows[j] = nr
+			count++
 		}
-		s.mu.Unlock()
 	}
-	return count
+	return count, nil
 }
 
 // deleteByPK removes the row at pk. Returns false if absent.
@@ -187,29 +252,38 @@ func (t *table) deleteByPK(pk string) bool {
 	return true
 }
 
-// deleteWhere tombstones all matching rows and removes their PK
-// entries. Returns the count deleted. match runs under the shard
-// write lock and must not call back into the store.
-func (t *table) deleteWhere(match func(Row) bool) int {
-	count := 0
+// deleteWhereAll tombstones all matching rows across the whole table while
+// holding EVERY shard lock for the entire operation — same correctness
+// requirement as updateWhereAll (the one-shard-at-a-time form diverges on
+// replay). For each match, journal(pk) appends the WAL record before the
+// tombstone is applied, so a WAL-append failure aborts before that row is
+// removed. Returns the count deleted (or applied-so-far plus the error).
+func (t *table) deleteWhereAll(match func(Row) bool, journal func(pk Value) error) (int, error) {
 	pkOrd := t.def.pkOrdinal
+	t.lockAllShards()
+	defer t.unlockAllShards()
+	count := 0
 	for i := range t.shards {
 		s := &t.shards[i]
-		s.mu.Lock()
 		for j, r := range s.rows {
 			if r == nil {
 				continue
 			}
-			if match(r) {
-				delete(s.pk, r[pkOrd].AsString())
-				s.rows[j] = nil
-				s.live--
-				count++
+			if !match(r) {
+				continue
 			}
+			if journal != nil {
+				if err := journal(r[pkOrd]); err != nil {
+					return count, err
+				}
+			}
+			delete(s.pk, r[pkOrd].AsString())
+			s.rows[j] = nil
+			s.live--
+			count++
 		}
-		s.mu.Unlock()
 	}
-	return count
+	return count, nil
 }
 
 // liveCount returns the number of non-tombstoned rows across all

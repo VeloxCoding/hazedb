@@ -120,6 +120,12 @@ func (w *wal) replay(apply func(replayRecord) error) error {
 	if _, err := w.f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
+	fi, err := w.f.Stat()
+	if err != nil {
+		return err
+	}
+	fileSize := fi.Size()
+	var pos int64 // bytes consumed so far
 	var u32 [4]byte
 	for {
 		n, err := io.ReadFull(w.f, u32[:])
@@ -133,8 +139,18 @@ func (w *wal) replay(apply func(replayRecord) error) error {
 		if err != nil {
 			return err
 		}
-		_ = n
+		pos += int64(n)
 		totalLen := binary.LittleEndian.Uint32(u32[:])
+		// Bounds-check the declared length against the bytes actually left
+		// in the file BEFORE allocating. A crash-torn or corrupt final
+		// record can carry a bogus huge length; make([]byte, totalLen) on
+		// it would over-allocate (OOM). A record that can't fit in the
+		// remaining bytes — or is too small to even hold its CRC — is the
+		// truncated tail: stop here. CRC sits after the length-driven read,
+		// so it cannot guard this.
+		if totalLen < 4 || int64(totalLen) > fileSize-pos {
+			return nil
+		}
 		buf := make([]byte, totalLen)
 		if _, err := io.ReadFull(w.f, buf); err != nil {
 			if err == io.ErrUnexpectedEOF {
@@ -143,6 +159,7 @@ func (w *wal) replay(apply func(replayRecord) error) error {
 			}
 			return err
 		}
+		pos += int64(totalLen)
 		innerLen := int(totalLen) - 4
 		innerBuf := buf[:innerLen]
 		crc := binary.LittleEndian.Uint32(buf[innerLen:])
