@@ -1,0 +1,18 @@
+# Smoke/runtime Caddyfile: one FrankenPHP process serving both the hazedb
+# HTTP module (/db/*) and PHP (php_server). The `hazedb` directive provisions
+# the *DB and registers it under "default" at boot, so the PHP functions
+# (hazedb_query/hazedb_exec) reach that same instance in-process.
+{
+	auto_https off
+	frankenphp
+}
+
+:8080 {
+	handle /db/* {
+		hazedb {
+			registry_name default
+		}
+	}
+	root * /work
+	php_server
+}
