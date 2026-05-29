@@ -148,12 +148,11 @@ type txAct struct {
 }
 
 // commit applies every staged mutation atomically. It holds the table's
-// pkDirectory write lock (partitioned tables) and EVERY shard lock for the
-// whole operation, in the global lock order (pkDirectory → shards ascending) —
-// reusing the lock-all pattern of updateWhereAll. v1 locks all shards rather
-// than the touched subset: the subset is cheap to know for non-partitioned
-// tables but needs a directory lookup for partitioned ones, so locking all is
-// the simpler correct default (transactions are opt-in, not the hot path).
+// pkDirectory write lock (partitioned tables) and only the shards the
+// transaction touches, in the global lock order (pkDirectory → shards
+// ascending). Locking the touched subset rather than every shard is safe
+// against the all-shard acquirers (updateWhereAll / predicate writes) because
+// both acquire in ascending shard-index order, so no lock cycle can form.
 //
 // Walk the staged list in order against an overlay (read-your-writes,
 // arithmetic SET evaluated against the locked live/overlay row), validate, then
@@ -169,8 +168,20 @@ func (tx *Tx) commit() error {
 		t.pkDir.mu.Lock()
 		defer t.pkDir.mu.Unlock()
 	}
-	t.lockAllShards()
-	defer t.unlockAllShards()
+	// Lock only the touched shards, ascending (deadlock-safe). For partitioned
+	// tables the shard set is read from the pkDirectory, which we hold — so the
+	// set is stable across the commit. The stack buffer keeps the common
+	// small-transaction case allocation-free.
+	var shardBuf [16]uint32
+	shards := tx.collectShards(t, shardBuf[:0])
+	for _, idx := range shards {
+		t.shards[idx].mu.Lock()
+	}
+	defer func() {
+		for i := len(shards) - 1; i >= 0; i-- {
+			t.shards[shards[i]].mu.Unlock()
+		}
+	}()
 
 	overlay := make(map[UUID]Row, len(tx.staged)) // present row, or nil = deleted in-tx
 	// present resolves a PK against the overlay first, then the live store.
@@ -245,6 +256,57 @@ func (tx *Tx) commit() error {
 		}
 	}
 	return nil
+}
+
+// collectShards appends the distinct shard indices the staged mutations hit
+// into out (a caller stack buffer), deduplicated and sorted ascending. For a
+// non-partitioned table the shard is the PK's hash, known directly. For a
+// partitioned table an INSERT routes by its row's PartitionKey value, while an
+// UPDATE/DELETE routes by the current pkDirectory location (caller holds the
+// directory lock, so the lookup is stable); an absent PK contributes no shard
+// (the statement no-ops at apply). A later UPDATE of a row inserted earlier in
+// the same tx needs no extra shard: it resolves to the same partition value,
+// whose shard the INSERT already added.
+//
+// Dedup is a linear scan and the sort is an insertion sort — both trivial at
+// the handful of shards a transaction touches, and allocation-free (no map, no
+// sort.Slice closure) so a small transaction allocates nothing here.
+func (tx *Tx) collectShards(t *table, out []uint32) []uint32 {
+	for _, m := range tx.staged {
+		var idx uint32
+		switch {
+		case t.pkDir == nil:
+			idx = t.shardIdxOf(m.pk)
+		case m.kind == opInsert:
+			idx = t.shardIdxOf(m.row[t.def.partitionOrdinal].U)
+		default:
+			loc, found := t.pkDir.idx[m.pk]
+			if !found {
+				continue
+			}
+			idx = loc.shard
+		}
+		dup := false
+		for _, x := range out {
+			if x == idx {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			out = append(out, idx)
+		}
+	}
+	for i := 1; i < len(out); i++ { // insertion sort, ascending (tiny n)
+		v := out[i]
+		j := i - 1
+		for j >= 0 && out[j] > v {
+			out[j+1] = out[j]
+			j--
+		}
+		out[j+1] = v
+	}
+	return out
 }
 
 // computeSets evaluates an UPDATE's SET expressions against row (which carries

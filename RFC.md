@@ -64,7 +64,7 @@ The remainder of this RFC describes the **target architecture** — the full des
 - The *Measured benchmarks* table predates M3/M4. M4 perf cost recorded in `bench/baseline_m4.txt`: the 16-byte UUID in every `Value` cell adds ~10-22% ns and +50-100 B/op vs M3; allocs flat-or-better. (An optional typed-struct wrapper could reclaim the `[]Value` overhead later, but is post-1.0 and not on the hot path.)
 - Read-path clone-under-lock: a PK/partition lookup clones the matched row while still holding the shard read lock, so a returned row never aliases storage a concurrent write could mutate (~85 ns on point reads; optimisable by projecting only the needed columns under the lock)
 
-- **Transactions (M6, v1 scope)** — `db.Transaction(func(tx *Tx) error)` closure; `tx.Exec` only (write-only API), PK-pinned statements, single table per tx; staged overlay for read-your-writes; arithmetic `SET` evaluated under the commit locks; poison-on-first-error; one `TXN` WAL envelope (atomic across crash, replayed all-or-nothing). Commit locks all shards of the table (subset-locking is the documented later optimisation).
+- **Transactions (M6, v1 scope)** — `db.Transaction(func(tx *Tx) error)` closure; `tx.Exec` only (write-only API), PK-pinned statements, single table per tx; staged overlay for read-your-writes; arithmetic `SET` evaluated under the commit locks; poison-on-first-error; one `TXN` WAL envelope (atomic across crash, replayed all-or-nothing). Commit locks only the shards the transaction touches, ascending (deadlock-safe against the all-shard acquirers).
 
 ### Designed, not yet implemented
 
@@ -766,6 +766,10 @@ hazedb compiles into your Go binary, keeps all data in RAM, writes a WAL for dur
 ---
 
 ## Changelog
+
+**rev. 10 (2026-05-29) — transaction commit locks only the touched shards**
+
+The M6 commit path no longer locks every shard of the table; it locks only the shards the staged statements touch, in ascending shard-index order. The set is computed alloc-free into a stack buffer (linear dedup + insertion sort, no map, no `sort.Slice` closure). For a non-partitioned table each shard is the PK's hash; for a partitioned table an INSERT routes by its row's PartitionKey value and an UPDATE/DELETE by the current pkDirectory location (read under the directory lock the commit already holds). Deadlock-safe against `updateWhereAll`/predicate writes because every acquirer takes shard locks in ascending order. Measured: a 2-row transfer drops from ~3.0 µs to ~1.0 µs (≈2.9×) on a 128-shard box, with allocations and bytes/op unchanged (19 allocs / 1376 B) — a win on CPU with no regression on allocation or memory.
 
 **rev. 9 (2026-05-29) — M6 single-table transactions implemented (v1 scope)**
 
