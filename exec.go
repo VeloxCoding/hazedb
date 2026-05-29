@@ -457,18 +457,18 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		r, ok := tbl.getByPK(pk)
-		if !ok {
-			return colNames, nil, nil
-		}
-		// r is already a private clone (cloned under the shard lock), so it is
-		// safe to read here and to hand back directly.
+		// SELECT * needs the whole row; a projection clones only its columns
+		// under the lock (getByPKProject), skipping a full-row clone.
 		if st.starAll {
+			r, ok := tbl.getByPK(pk)
+			if !ok {
+				return colNames, nil, nil
+			}
 			return colNames, []Row{r}, nil
 		}
-		pr := make(Row, len(pl.projOrdinals))
-		for j, ord := range pl.projOrdinals {
-			pr[j] = r[ord]
+		pr, ok := tbl.getByPKProject(pk, pl.projOrdinals)
+		if !ok {
+			return colNames, nil, nil
 		}
 		return colNames, []Row{pr}, nil
 	}

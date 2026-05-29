@@ -62,7 +62,7 @@ The remainder of this RFC describes the **target architecture** — the full des
 - **PartitionKey shard routing + table-wide `pkDirectory` + per-partition tail index** (M5) — partition-routed shards, `map[UUID]rowLocation` directory for table-wide PK uniqueness + O(1) `WHERE id = ?`, indexed `WHERE partkey = ?` scan
 - **Runtime catalog + first-class DDL** — `CREATE TABLE` / `DROP TABLE` over an `atomic.Pointer[catalog]` (RCU swap), durable append-only table IDs, catalog-version plan invalidation, WAL-logged and replayed before mutations; runtime tables are not second-class (insert/read benchmarks identical to predeclared)
 - The *Measured benchmarks* table predates M3/M4. M4 perf cost recorded in `bench/baseline_m4.txt`: the 16-byte UUID in every `Value` cell adds ~10-22% ns and +50-100 B/op vs M3; allocs flat-or-better. (An optional typed-struct wrapper could reclaim the `[]Value` overhead later, but is post-1.0 and not on the hot path.)
-- Read-path clone-under-lock: a PK/partition lookup clones the matched row while still holding the shard read lock, so a returned row never aliases storage a concurrent write could mutate (~85 ns on point reads; optimisable by projecting only the needed columns under the lock)
+- Read-path clone-under-lock: a PK/partition lookup clones the matched row while still holding the shard read lock, so a returned row never aliases storage a concurrent write could mutate. A projected `SELECT` (`getByPKProject`) clones only its projected columns under the lock — no full-row clone — so a point read is ~260 ns / 6 allocs (a 3-col table projecting 2); `SELECT *` still takes the full-row clone
 
 - **Transactions (M6, v1 scope)** — `db.Transaction(func(tx *Tx) error)` closure; `tx.Exec` only (write-only API), PK-pinned statements, single table per tx; staged overlay for read-your-writes; arithmetic `SET` evaluated under the commit locks; poison-on-first-error; one `TXN` WAL envelope (atomic across crash, replayed all-or-nothing). Commit locks only the shards the transaction touches, ascending (deadlock-safe against the all-shard acquirers).
 
@@ -766,6 +766,10 @@ hazedb compiles into your Go binary, keeps all data in RAM, writes a WAL for dur
 ---
 
 ## Changelog
+
+**rev. 11 (2026-05-29) — projected point reads clone only their columns**
+
+The race fix (clone the matched row under the shard read lock so a returned row never aliases the arena) cloned the *whole* row, after which a projected SELECT copied the wanted columns out of that clone — two allocations and a full-width copy for a query that wants a few columns. Now a projected point read (`getByPKProject` / partitioned variant) clones only the projected columns directly into the result row under the lock; `SELECT *` keeps the full-row clone. Measured on a 3-column table projecting 2: ~384 ns → ~260 ns, 7 → 6 allocs, 600 → 376 B/op — a CPU win with allocations and memory *also* down. The gap widens with table width vs projection width.
 
 **rev. 10 (2026-05-29) — transaction commit locks only the touched shards**
 

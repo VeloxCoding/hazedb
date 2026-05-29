@@ -219,9 +219,8 @@ func (t *table) deleteByPKJournaled(pk UUID, journal func() error) (bool, error)
 	return true, nil
 }
 
-// getByPK returns the row for pk, or (nil, false). The returned Row is
-// a shallow alias into the shard arena; callers that escape it past
-// the call must Clone.
+// getByPK returns a private full-row clone for pk, or (nil, false). The clone
+// is taken UNDER the shard read lock so the result never aliases the arena.
 func (t *table) getByPK(pk UUID) (Row, bool) {
 	if t.pkDir != nil {
 		return t.getByPKPartitioned(pk)
@@ -237,6 +236,43 @@ func (t *table) getByPK(pk UUID) (Row, bool) {
 	}
 	s.mu.RUnlock()
 	return cl, cl != nil
+}
+
+// getByPKProject is getByPK for a projected SELECT: it clones only the ords
+// columns into a fresh Row under the shard read lock, skipping the full-row
+// clone the caller would otherwise make and then project from. The win grows
+// with the gap between table width and projection width.
+func (t *table) getByPKProject(pk UUID, ords []int) (Row, bool) {
+	if t.pkDir != nil {
+		return t.getByPKProjectPartitioned(pk, ords)
+	}
+	s := t.shardOf(pk)
+	s.mu.RLock()
+	var pr Row
+	if rowID, ok := s.pk[pk]; ok {
+		if r := s.rows[rowID]; r != nil {
+			pr = projectClone(r, ords)
+		}
+	}
+	s.mu.RUnlock()
+	return pr, pr != nil
+}
+
+// projectClone copies the ords columns of r into a fresh Row, deep-copying any
+// []byte cells so the result aliases nothing in the arena. Caller holds the
+// shard read lock.
+func projectClone(r Row, ords []int) Row {
+	pr := make(Row, len(ords))
+	for j, ord := range ords {
+		v := r[ord]
+		if v.Kind == KindBytes && v.B != nil {
+			b := make([]byte, len(v.B))
+			copy(b, v.B)
+			v.B = b
+		}
+		pr[j] = v
+	}
+	return pr
 }
 
 // scanAll walks every row across every shard, invoking fn. Returning

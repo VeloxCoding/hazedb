@@ -115,6 +115,34 @@ func (t *table) getByPKPartitioned(pk UUID) (Row, bool) {
 	return nil, false
 }
 
+// getByPKProjectPartitioned is getByPKPartitioned for a projected SELECT:
+// same resolve + retry-on-stale-location loop, but it clones only the ords
+// columns under the shard read lock instead of the whole row.
+func (t *table) getByPKProjectPartitioned(pk UUID, ords []int) (Row, bool) {
+	for retry := 0; retry < pkRetryBudget; retry++ {
+		t.pkDir.mu.RLock()
+		loc, ok := t.pkDir.idx[pk]
+		t.pkDir.mu.RUnlock()
+		if !ok {
+			return nil, false
+		}
+		s := &t.shards[loc.shard]
+		s.mu.RLock()
+		var pr Row
+		if loc.rowID < uint64(len(s.rows)) {
+			if r := s.rows[loc.rowID]; r != nil && r[t.def.pkOrdinal].U == pk {
+				pr = projectClone(r, ords)
+			}
+		}
+		s.mu.RUnlock()
+		if pr != nil {
+			return pr, true
+		}
+		// Stale location (deleted or moved) → re-resolve via the directory.
+	}
+	return nil, false
+}
+
 // updateByPKJournaledPartitioned applies a PK-pinned update. It holds the
 // directory read lock across the shard write so a concurrent move (which needs
 // the directory write lock) cannot invalidate the location mid-update. PK and
