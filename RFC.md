@@ -2,7 +2,7 @@
 
 **Status:** M1–M6 implemented (store, SQL, WAL durability, UUIDv7 PK, partitioning, runtime catalog + `CREATE`/`DROP TABLE`, single-table transactions); M7–M8 open. See *Implementation status* for what is running vs designed.  
 **Module:** `github.com/VeloxCoding/hazedb`  
-**Updated:** 2026-05-29 (rev. 21 — gateway contract + output-boundary design note: db.go = Go API boundary, future `bridge/` = protocol boundary)
+**Updated:** 2026-05-30 (rev. 23 — point-op benchmarks re-measured under go1.25; ~18× SQLite `:memory:` on reads)
 
 ---
 
@@ -367,6 +367,32 @@ n, err := db.Exec("INSERT INTO messages (id, body) VALUES (?, ?)", id, "hello")
 
 `QueryRow` returns the first matching row without the `[]Row` slice `Query` allocates; for a PK lookup it goes straight through the point-read path. For an unpinned query it returns the first row of the scan, so add `LIMIT 1`.
 
+### Prepared statements
+
+`db.Prepare(sql)` compiles a SQL string to a plan once and returns a `*Stmt` that holds it, skipping the per-call statement-cache lookup (no SQL-string hash) that the bare `Query`/`Exec` path pays. The handle rebinds its plan automatically if a `CREATE`/`DROP` changes the catalog after `Prepare` (one atomic load + version compare on the hot path), and is safe for concurrent use.
+
+```go
+st, _ := db.Prepare("SELECT name, age FROM users WHERE id = ?")
+cols, rows, err := st.Query(args...)      // mirrors db.Query
+_, row, err := st.QueryRow(args...)       // mirrors db.QueryRow
+
+// Zero-allocation point-read fast path:
+dst := make([]Value, 0, 4)                // caller-owned buffer, reused
+out, found, err := st.QueryRowByPK(id, dst)
+```
+
+`QueryRowByPK` is the hot-read fast path the in-process cgo/FrankenPHP front wants: the key is a typed `UUID` (no interface boxing) and the projected cells are written into a caller-owned, reused buffer (no result clone), so a projection without `BYTES` columns **allocates nothing**. `BYTES` cells are cloned to honour storage's no-alias guarantee; a non-PK-pinned statement is rejected as misuse.
+
+The win is the typed argument plus the scan-into buffer, not the handle alone. Measured against `db.QueryRow` (point read, go1.25):
+
+| Path | ns/op | allocs |
+|---|---|---|
+| `db.QueryRow` (baseline) | ~87 | 2 |
+| `Stmt.QueryRow` (handle, `...any`) | ~82 | 2 |
+| `Stmt.QueryRowByPK` (typed + scan-into) | ~36 | **0** |
+
+The handle alone saves only the statement-cache hash (~6%); `QueryRowByPK` nearly halves the point read and removes every engine-side allocation. This is the layer that gives a non-Go consumer a stable, allocation-free read without changing the core.
+
 ### The gateway — one official entry point
 
 `*DB` is the **single official entry point** — the gateway. Every consumer enters through it: Caddy calls these methods as native Go, and the FrankenPHP/PHP extension reaches them via cgo (`C → exported Go → the same methods`). **There is no second transport** — the PHP path is cgo calling the very same verbs, not a parallel API. This is the key difference from a network-fronted cache: both consumers bottom out in the same in-process Go call.
@@ -619,7 +645,7 @@ Cross-table transactions (debit one table, credit another) require locking shard
 
 ## Measured benchmarks
 
-> **Scope:** the **hazedb** point-op / scan rows were re-measured at rev. 20 (packed 32-byte `Value`, on top of M6 + the read-path work). The **SQLite / Bolt** cross-store columns, and the *Parallel* / *Durability* / *Mixed* sub-tables, are from earlier sweeps — those engines/paths are unchanged or only get faster, so treat them as conservative. These are the runtime engine itself (no code generation); it runs ~13× SQLite on point reads. All on AMD Ryzen AI MAX+ 395 (32 threads), Docker, golang:1.22; absolute µs are load-sensitive on this dev box, so read them as ratios, not an SLA.
+> **Scope:** the *Point operations* table below — **all** columns, hazedb and SQLite/Bolt — was re-measured at rev. 23 under **go1.25**, on top of the fold shard-hash and the prepared-statement path. The *Parallel* / *Durability* / *Mixed* sub-tables are still from earlier sweeps (those paths are unchanged or only get faster, so treat them as conservative). These are the runtime engine itself (no code generation); it runs ~18× SQLite `:memory:` on point reads. All on AMD Ryzen AI MAX+ 395 (32 threads), Docker, go1.25; absolute µs are load-sensitive on this dev box, so read them as ratios, not an SLA.
 
 ### Point operations vs SQLite and Bolt (single-thread, fair 16-byte UUID keys)
 
@@ -627,14 +653,14 @@ All four stores key by the same 16-byte UUID, so the comparison is fair on key w
 
 | Operation | hazedb (mem) | hazedb (+WAL) | SQLite (mem) | SQLite (disk) | Bolt |
 |---|---:|---:|---:|---:|---:|
-| INSERT | **0.42 µs** | 0.62 µs | 1.8 µs | 20 µs | 1 500 µs † |
-| SELECT WHERE id=? | **0.15 µs** (`QueryRow` 0.13) | — | 2.0 µs | 2.8 µs | 0.52 µs |
-| UPDATE WHERE id=? | **0.11 µs** | — | 1.0 µs | 2.5 µs | 1 400 µs † |
-| DELETE WHERE id=? | **0.32 µs** | — | — | 20–49 µs | 4 000 µs † |
+| INSERT | **0.38 µs** | 0.50 µs | 1.8 µs | 22 µs | 4 100 µs † |
+| SELECT WHERE id=? | **0.11 µs** (`QueryRow` 0.087, `QueryRowByPK` 0.036) | — | 2.0 µs | 3.0 µs | 0.52 µs |
+| UPDATE WHERE id=? | **0.085 µs** | — | 1.07 µs | 2.9 µs | 1 480 µs † |
+| DELETE WHERE id=? | **0.30 µs** | — | — | ~45 µs | 4 100 µs † |
 
-**Even RAM-vs-RAM, hazedb leads:** vs SQLite `:memory:` it is ~13× on reads, ~4× on inserts, ~9× on updates. Allocations per op are 1 (update/delete), 2 (insert), 3 (point read via `Query`, or **2 via `QueryRow`** — no result slice), 4 (range scan); bytes/op roughly halved by the packed 32-byte `Value` (below).
+**Even RAM-vs-RAM, hazedb leads:** vs SQLite `:memory:` it is ~18× on reads (~23× via `QueryRow`, ~55× via the zero-alloc `QueryRowByPK`), ~4.7× on inserts, ~12× on updates. Allocations per op are 1 (update/delete), 2 (insert, or point read via `QueryRow`), 3 (point read via `Query`), 4 (range scan), and **0 via the prepared `QueryRowByPK`** (typed key + scan-into buffer); bytes/op roughly halved by the packed 32-byte `Value` (below).
 
-**What the gap is — and isn't.** It is mostly the Go *access layer*, and it is **not** the cgo crossing. Evidence: swapping the cgo driver for **pure-Go SQLite** (`modernc.org/sqlite`, no cgo, same `database/sql`) made it *slower*, not faster — read **4.3 µs**, insert **14.9 µs**, update **3.4 µs** vs the cgo build's 2.0 / 1.7 / 1.0 µs. So removing cgo costs speed; the crossing was never the bottleneck. What a Go program actually pays to use SQLite is the `database/sql` layer (reflection, interface conversions, ~25 allocations per read vs hazedb's 3) on top of a general-purpose engine. hazedb is faster because it skips that layer — typed rows returned in-process, no SQL dispatch per call — which is the project thesis, **not** a claim that its lookup beats SQLite's B-tree. † Write rows for SQLite-disk and Bolt are **not** like-for-like on durability (they fsync/journal to disk; hazedb-mem does not). Allocations/op: hazedb 1–4, SQLite 9–26, Bolt 49–66.
+**What the gap is — and isn't.** It is mostly the Go *access layer*, and it is **not** the cgo crossing. Evidence: swapping the cgo driver for **pure-Go SQLite** (`modernc.org/sqlite`, no cgo, same `database/sql`) made it *slower*, not faster — read **4.1 µs**, insert **15.3 µs**, update **3.4 µs** vs the cgo build's 2.0 / 1.8 / 1.1 µs. So removing cgo costs speed; the crossing was never the bottleneck. What a Go program actually pays to use SQLite is the `database/sql` layer (reflection, interface conversions, ~24 allocations per read vs hazedb's 3, or 0 via `QueryRowByPK`) on top of a general-purpose engine. hazedb is faster because it skips that layer — typed rows returned in-process, no SQL dispatch per call — which is the project thesis, **not** a claim that its lookup beats SQLite's B-tree. † Write rows for SQLite-disk and Bolt are **not** like-for-like on durability (they fsync/journal to disk; hazedb-mem does not). Allocations/op: hazedb 0–4, SQLite 8–24, Bolt 50–66.
 
 ### Transactions (single-table, v1)
 
