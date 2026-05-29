@@ -8,7 +8,8 @@ import (
 	"testing"
 
 	bolt "go.etcd.io/bbolt"
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/mattn/go-sqlite3" // cgo driver: "sqlite3"
+	_ "modernc.org/sqlite"          // pure-Go driver: "sqlite"
 )
 
 // These benchmarks compare FASTSQL's interpreter path to two pure
@@ -117,6 +118,71 @@ func BenchmarkSelectByPK_SQLiteMem(b *testing.B) {
 
 func BenchmarkUpdateByPK_SQLiteMem(b *testing.B) {
 	d, cleanup := setupSQLiteMem(b)
+	defer cleanup()
+	stmt, _ := d.Prepare("UPDATE users SET age = ? WHERE id = ?")
+	defer stmt.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		stmt.Exec((i%100)+1, key16(i%compareN))
+	}
+}
+
+// setupSQLitePureMem is in-memory SQLite via the PURE-GO driver
+// (modernc.org/sqlite, registered as "sqlite") — same database/sql layer as
+// the cgo build, but no cgo boundary. The gap between this and the cgo
+// :memory: benchmark isolates the cost of the cgo crossing itself.
+func setupSQLitePureMem(b *testing.B) (*sql.DB, func()) {
+	b.Helper()
+	d, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		b.Fatal(err)
+	}
+	d.SetMaxOpenConns(1)
+	if _, err := d.Exec("CREATE TABLE users (id BLOB PRIMARY KEY, name TEXT, age INTEGER)"); err != nil {
+		b.Fatal(err)
+	}
+	stmt, err := d.Prepare("INSERT INTO users (id, name, age) VALUES (?, ?, ?)")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer stmt.Close()
+	for i := 0; i < compareN; i++ {
+		if _, err := stmt.Exec(key16(i), "name", i%100); err != nil {
+			b.Fatal(err)
+		}
+	}
+	return d, func() { d.Close() }
+}
+
+func BenchmarkInsert_SQLitePureMem(b *testing.B) {
+	d, cleanup := setupSQLitePureMem(b)
+	defer cleanup()
+	stmt, _ := d.Prepare("INSERT INTO users (id, name, age) VALUES (?, ?, ?)")
+	defer stmt.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		stmt.Exec(key16(compareN+i), "name", i%100)
+	}
+}
+
+func BenchmarkSelectByPK_SQLitePureMem(b *testing.B) {
+	d, cleanup := setupSQLitePureMem(b)
+	defer cleanup()
+	stmt, _ := d.Prepare("SELECT name, age FROM users WHERE id = ?")
+	defer stmt.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var name string
+		var age int64
+		stmt.QueryRow(key16(i % compareN)).Scan(&name, &age)
+	}
+}
+
+func BenchmarkUpdateByPK_SQLitePureMem(b *testing.B) {
+	d, cleanup := setupSQLitePureMem(b)
 	defer cleanup()
 	stmt, _ := d.Prepare("UPDATE users SET age = ? WHERE id = ?")
 	defer stmt.Close()
