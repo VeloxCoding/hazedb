@@ -591,7 +591,9 @@ All four stores key by the same 16-byte UUID, so the comparison is fair on key w
 | UPDATE WHERE id=? | **0.20 µs** | — | 1.0 µs | 2.5 µs | 1 400 µs † |
 | DELETE WHERE id=? | **0.39 µs** | — | — | 20–49 µs | 4 000 µs † |
 
-**Even RAM-vs-RAM, hazedb leads:** vs SQLite `:memory:` it is ~8× on reads, ~3.5× on inserts, ~5× on updates. That gap is the in-process design — no cgo boundary, no per-call SQL dispatch or row marshalling — not merely "memory vs disk". † Write rows for SQLite-disk and Bolt are **not** like-for-like on durability (they fsync/journal to disk; hazedb-mem does not). Allocations/op: hazedb 2–6, SQLite 9–25, Bolt 49–66.
+**Even RAM-vs-RAM, hazedb leads:** vs SQLite `:memory:` it is ~8× on reads, ~3.5× on inserts, ~5× on updates.
+
+**Read this as an *access-path* comparison, not an engine claim.** SQLite's core lookup in C is sub-µs; a large part of its measured cost here is the price a Go program pays to *reach* it — the cgo boundary plus the `database/sql` layer (reflection, interface conversions, allocations — note SQLite's ~25 allocs/read vs hazedb's 6). hazedb is faster because it lives in the same process and crosses no boundary and marshals nothing, which is the entire point of the project — not because its lookup algorithm beats SQLite's B-tree. The number reflects the latency a real Go app actually sees calling each store. † Write rows for SQLite-disk and Bolt are **not** like-for-like on durability (they fsync/journal to disk; hazedb-mem does not). Allocations/op: hazedb 2–6, SQLite 9–25, Bolt 49–66.
 
 ### Parallel scaling (32 cores)
 
