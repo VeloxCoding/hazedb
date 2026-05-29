@@ -174,6 +174,109 @@ func TestRuntimeCreateConcurrent(t *testing.T) {
 	}
 }
 
+// DROP then CREATE of the same name yields a fresh, empty table with a new
+// durable ID (IDs never reuse), and the recreate survives a restart with only
+// the post-recreate rows — the pre-drop rows do not resurrect.
+func TestRuntimeRecreateTable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "recreate.wal")
+	db, err := Open(Options{Schema: Schema{}, WALPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := NewUUIDv7()
+	db.Exec("CREATE TABLE t (id uuid primary key, n int)")
+	db.Exec("INSERT INTO t (id, n) VALUES (?, ?)", a, 1)
+	db.Exec("DROP TABLE t")
+	db.Exec("CREATE TABLE t (id uuid primary key, n int)")
+	b := NewUUIDv7()
+	db.Exec("INSERT INTO t (id, n) VALUES (?, ?)", b, 2)
+
+	// Old PK is gone; new one is present.
+	if _, rows, _ := db.Query("SELECT n FROM t WHERE id = ?", a); len(rows) != 0 {
+		t.Fatalf("pre-drop row resurrected: %v", rows)
+	}
+	if _, rows, _ := db.Query("SELECT n FROM t WHERE id = ?", b); len(rows) != 1 || rows[0][0].I != 2 {
+		t.Fatalf("post-recreate row wrong: %v", rows)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(Options{Schema: Schema{}, WALPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	if _, rows, _ := db2.Query("SELECT n FROM t WHERE id = ?", a); len(rows) != 0 {
+		t.Fatalf("pre-drop row resurrected after restart: %v", rows)
+	}
+	if _, rows, err := db2.Query("SELECT n FROM t WHERE id = ?", b); err != nil || len(rows) != 1 || rows[0][0].I != 2 {
+		t.Fatalf("recreate did not survive restart: rows=%v err=%v", rows, err)
+	}
+}
+
+// A plan cached against a live table must fail cleanly (ErrUnknownTable) once
+// the table is dropped — the catalog version bumps, so prepare re-binds and the
+// resolution misses rather than dereferencing a stale table.
+func TestStalePlanAfterDrop(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE t (id uuid primary key, n int)")
+	id := NewUUIDv7()
+	db.Exec("INSERT INTO t (id, n) VALUES (?, ?)", id, 1)
+	if _, _, err := db.Query("SELECT n FROM t WHERE id = ?", id); err != nil {
+		t.Fatal(err) // prime the plan cache
+	}
+	if _, err := db.Exec("DROP TABLE t"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.Query("SELECT n FROM t WHERE id = ?", id); !errors.Is(err, ErrUnknownTable) {
+		t.Fatalf("expected ErrUnknownTable from stale plan, got %v", err)
+	}
+}
+
+// A partitioned table created at runtime keeps its directory and tail index
+// after a restart: the indexed partition scan still works on the replayed data.
+func TestRuntimePartitionedSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "part.wal")
+	db, err := Open(Options{Schema: Schema{}, WALPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	th := NewUUIDv7()
+	db.Exec("CREATE TABLE msgs (id uuid primary key, thread uuid partition key, seq int immutable, body text)")
+	for i := 0; i < 5; i++ {
+		db.Exec("INSERT INTO msgs (id, thread, seq, body) VALUES (?, ?, ?, ?)", NewUUIDv7(), th, i, "m")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(Options{Schema: Schema{}, WALPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	_, rows, err := db2.Query("SELECT seq FROM msgs WHERE thread = ? ORDER BY seq DESC LIMIT 2", th)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0][0].I != 4 || rows[1][0].I != 3 {
+		t.Fatalf("partition scan broken after restart: %v", rows)
+	}
+}
+
+// ALTER TABLE is deliberately unsupported in v1 (CREATE + DROP only). It is not
+// a keyword, so it falls through to a parse error rather than partial handling.
+func TestNoAlterTable(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE t (id uuid primary key, n int)")
+	if _, err := db.Exec("ALTER TABLE t ADD COLUMN x int"); !errors.Is(err, ErrParse) {
+		t.Fatalf("expected ErrParse for ALTER, got %v", err)
+	}
+}
+
 // --- benchmarks: a runtime-created table must be as fast as a predeclared one ---
 
 func BenchmarkRuntimeCreatedInsert(b *testing.B) {

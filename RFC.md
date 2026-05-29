@@ -39,7 +39,7 @@ tables are *examples* of that profile, not the scope.)
 | Not for data > RAM | WAL + checkpoints only; no page eviction |
 | Not multi-process | One Go process owns the DB |
 | Not OLAP | No aggregation engine, no columnar storage |
-| No runtime schema migration | `go generate && go build && restart` |
+| No `ALTER TABLE` in v1 | `CREATE TABLE` / `DROP TABLE` run at runtime (WAL-logged, survive restart); no in-place column add/drop/retype |
 | No JOINs in v1 | Multiple Gets in app code; not promised for v2 |
 | No migration tooling | Write your own transfer script; store your old PK as a regular column |
 
@@ -57,19 +57,21 @@ The remainder of this RFC describes the **target architecture** — the full des
 - **Logical typed-mutation WAL**: versioned self-delimiting envelope (`magic|type|version|length|payload|crc32c`); MUTATION payload is `op|tableID|op-body` (insert=full row, update=pk+changed-column deltas, delete=pk); CRC32C; replay fails loud on bad magic / newer version / unknown type / CRC mismatch on a complete record, tolerates truncated tails
 - WAL durability modes (M3): flush ticker (`WALFlushInterval`, 0=1s default, <0=manual), `WALSync` (ticker fsync via a `dirtySinceSync` flag), `WALSyncPerWrite`, sticky WAL error state
 - Write pipeline enforces validate → WAL append → apply under the relevant shard lock(s); multi-shard predicate writes hold every shard lock so WAL order == in-memory order
-- Runtime SQL interpreter: `SELECT` / `INSERT` / `UPDATE` / `DELETE` with arithmetic in `SET` and `WHERE` (`col +/-/* ?`)
-- Statement cache (`sync.Map`) and PK fast path (`WHERE id = ?` → pk-map lookup, one shard)
-- The *Measured benchmarks* table predates M3/M4. M4 perf cost recorded in `bench/baseline_m4.txt`: the 16-byte UUID in every `Value` cell adds ~10-22% ns and +50-100 B/op vs M3; allocs flat-or-better. Reclaimed later by the codegen typed-struct path.
+- Runtime SQL engine (the hot path): `SELECT` / `INSERT` / `UPDATE` / `DELETE` with arithmetic in `SET` and `WHERE` (`col +/-/* ?`); plans cached per SQL string in a `sync.Map`, parsed once then reused
+- PK fast path (`WHERE id = ?` → pk-map lookup, one shard) and indexed partition scan (`WHERE partkey = ?`), both as compiled-plan properties available to runtime-created tables
+- **PartitionKey shard routing + table-wide `pkDirectory` + per-partition tail index** (M5) — partition-routed shards, `map[UUID]rowLocation` directory for table-wide PK uniqueness + O(1) `WHERE id = ?`, indexed `WHERE partkey = ?` scan
+- **Runtime catalog + first-class DDL** — `CREATE TABLE` / `DROP TABLE` over an `atomic.Pointer[catalog]` (RCU swap), durable append-only table IDs, catalog-version plan invalidation, WAL-logged and replayed before mutations; runtime tables are not second-class (insert/read benchmarks identical to predeclared)
+- The *Measured benchmarks* table predates M3/M4. M4 perf cost recorded in `bench/baseline_m4.txt`: the 16-byte UUID in every `Value` cell adds ~10-22% ns and +50-100 B/op vs M3; allocs flat-or-better. (An optional typed-struct wrapper could reclaim the `[]Value` overhead later, but is post-1.0 and not on the hot path.)
+- Read-path clone-under-lock: a PK/partition lookup clones the matched row while still holding the shard read lock, so a returned row never aliases storage a concurrent write could mutate (~85 ns on point reads; optimisable by projecting only the needed columns under the lock)
 
-### Designed, not yet implemented (M5+)
+### Designed, not yet implemented
 
 | Feature | Milestone |
 |---|---|
-| PartitionKey shard routing + table-wide `pkDirectory` + per-partition tail index | M5 |
-| Compiled query API: `go generate` → `*Queries` typed methods + strict mode | M5 |
 | `db.Transaction()` Go closure API + WAL `TXN` envelope grouping | M6 |
 | WAL segments + snapshot checkpoint | M7 |
-| FrankenPHP cgo binding (`hazedb_exec_transaction`, named transaction codegen) | M8 |
+| FrankenPHP cgo binding (`hazedb_exec`/`hazedb_query`, `hazedb_exec_transaction`) | M8 |
+| Optional typed-struct query wrapper (ergonomics; not a speed mechanism) | post-1.0 |
 
 ---
 
@@ -143,7 +145,7 @@ reader:  shard 5 lock → reads rowID 100 → finds a tombstone
 **Key design choices:**
 
 - **PK is always UUIDv7** — see *Primary key* section above.
-- **`[]Value` tagged union in memory** — no binary-encoded rows, no deserialization on the read path. A `Row` is `[]Value` where `Value` carries `Kind` (Int/String/Bytes/Bool/Null). Codegen (M4) moves the hot path to typed Go structs per table; `[]Value` stays for the interpreter fallback.
+- **`[]Value` tagged union in memory** — no binary-encoded rows, no deserialization on the read path. A `Row` is `[]Value` where `Value` carries `Kind` (Int/String/Bytes/Bool/Null). This is the hot-path representation. An optional typed-struct wrapper (post-1.0) could copy a `Row` into a per-table Go struct for caller ergonomics, but the engine itself runs on `[]Value`.
 - **Shard routing:**
   - **No `PartitionKey`** — shard by FNV-1a(PK). `WHERE id = ?` → one shard, one lock. Use for lookup-heavy tables (users, sessions).
   - **`PartitionKey` declared** — shard by FNV-1a(PartitionKey value). All rows for the same partition value land in one shard, but that shard also holds other partition values that hash to it, so the tail index is namespaced per partition value (`map[PartitionValue]*partitionIndex`) with rowIDs into the shard's shared arena. `WHERE id = ?` → pkDirectory → rowLocation → shard, two locks. Use for append/scan-heavy tables (messages, events, logs).
@@ -188,7 +190,7 @@ Every table has exactly one primary key column. Its type is always UUIDv7 — a 
 - **Client-side generation** — the caller generates the ID before the insert; no roundtrip to hazedb for a sequence number
 - **`ORDER BY id` ≈ temporal order at millisecond granularity** — UUIDv7's high 48 bits are a unix-ms timestamp, so IDs sort by creation time *across* milliseconds. **Within a single millisecond the order is not guaranteed** unless the generator implements RFC 9562 monotonicity (a sub-ms counter in `rand_a`); a plain random-fill UUIDv7 sorts randomly inside the same ms. For strict feed order, either mandate a monotonic UUIDv7 generator or order by an explicit sequence column — which is exactly what the tail index's `seqs` provides. Do not rely on `ORDER BY id` alone for exact within-ms ordering.
 - **WAL merge is collision-safe in practice** — UUIDv7 carries 74 bits of randomness; the birthday-bound collision probability across billions of IDs is negligible. We accept this residual theoretical risk in exchange for coordination-free client-side generation
-- **Codegen is simpler** — generated functions always know the PK type at compile time; no `any`, no type switch
+- **Engine stays simple** — the PK type is always UUID, so the runtime engine never needs an `any` PK or a per-table type switch; lookups are uniform `map[UUID]uint64`
 
 **Auto-generation:** if the INSERT omits the PK column, hazedb generates a UUIDv7. If the caller supplies one, hazedb accepts it as-is. In both cases the concrete UUID is written to the WAL record before execution — the WAL never contains a bare INSERT without an explicit PK column, because replay must regenerate the exact same row under the exact same ID.
 
@@ -343,98 +345,90 @@ WHERE supports: `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IS N
 
 ---
 
-## Query API and codegen model
+## Query API
 
-SQL is the **definition language** for typed queries. The hot path never parses SQL at runtime — `go generate` compiles every declared SQL query into a typed Go method before the binary is built.
-
-### Two tiers
-
-**Tier 1 — generic runtime path** (interpreter, `[][]Value` returns, always available):
+**One runtime engine serves every query.** `db.Query()` / `db.Exec()` parse a SQL string once, cache the compiled plan, and re-run it from the cache on every subsequent call. There is no separate "hot path" — this *is* the hot path. The interpreter was measured at roughly 8× SQLite on point reads *without* any code generation, so the engine carries the speed on its own; codegen is not a precondition for performance.
 
 ```go
 rows, err := db.Query("SELECT body FROM messages WHERE id = ?", id)
-// rows is [][]Value — untyped, works for any valid SQL string
+// rows is []Row; the plan for this SQL string is parsed once and cached
 
 n, err := db.Exec("INSERT INTO messages (id, body) VALUES (?, ?)", id, "hello")
 // n is rows affected
 ```
 
-Useful for ad-hoc queries, tooling, `hazedb dump`, and tests. Not the hot path.
+### Prepared plans and the catalog version
 
-**Tier 2 — generated typed path** (no SQL at runtime, typed struct returns):
+The engine memoises `SQL string → *plan` in a `sync.Map`. A plan never parses its SQL twice. Each cached plan is stamped with the **catalog version** it was bound against (see *Runtime catalog* below); on the next call the engine compares that stamp to the live catalog and:
+
+- **match** → reuse the cached plan directly (the common case — no parse, no re-bind),
+- **mismatch** → a `CREATE`/`DROP` has happened since, so re-parse and re-bind against the current catalog before running.
+
+This keeps a cached plan from ever pointing at a table that has since been dropped or replaced: after a `DROP`, the re-bind resolves the now-missing table and the call returns `ErrUnknownTable` cleanly, rather than dereferencing stale storage. Because the catalog version is monotonic and never reused, a stale stamp is always detected.
+
+The PK fast path (`WHERE id = ?` → one shard, O(1) map lookup) and the indexed partition scan (`WHERE partkey = ?`) are both properties of the compiled plan, so a runtime-created table reaches them exactly like a predeclared one — runtime tables are not second-class.
+
+### Optional typed-struct wrapper (post-1.0, not a speed mechanism)
+
+The engine returns `[]Row` (a `[]Value` tagged union). Callers who want typed Go structs instead of pulling fields out of `Value` cells can, post-1.0, layer a thin generated wrapper on top of the *same* prepared plans:
 
 ```go
-// generated by go generate:
+// optional, generated from a declared query — ergonomics only:
 type MessageBodyRow struct{ Body string }
-
 func (q *Queries) SelectBodyByMessageID(id UUID) ([]MessageBodyRow, error)
-func (q *Queries) InsertMessage(id UUID, body string) (int64, error)
-
-// call site — fully typed, no Value union, no type assertions:
-rows, err := q.SelectBodyByMessageID(id)
-// rows[0].Body == "hello"
 ```
 
-`go generate` reads `.sql` query files (one named query per file), validates each against the current schema, and emits a `*Queries` struct with one method per query. Each method calls directly into the store — no dispatch table, no hash lookup, no SQL parsing at runtime.
-
-### Why not a single runtime-dispatch function
-
-A single `hazedb_query(sql string, params ...any)` function cannot return different typed structs depending on the runtime value of `sql`. A dispatch map `map[uint64]fn` can only hold functions with one fixed signature — forcing the return type to `any` or `[][]Value`, which discards all type safety. Named generated methods are the correct model: each method has its own exact return type known at compile time.
-
-This is the sqlc model: SQL files are the source; generated named methods are the API; no SQL string appears at runtime on the hot path.
-
-### What go generate produces
-
-Given a query file:
-
-```sql
--- name: SelectBodyByMessageID
-SELECT body FROM messages WHERE id = ?
-```
-
-`go generate` emits:
-
-```go
-type MessageBodyRow struct{ Body string }
-
-func (q *Queries) SelectBodyByMessageID(id UUID) ([]MessageBodyRow, error) {
-    _, rows, err := q.db.execSelect(selectBodyByMessageIDPlan, id)
-    if err != nil {
-        return nil, err
-    }
-    out := make([]MessageBodyRow, len(rows))
-    for i, r := range rows {
-        out[i] = MessageBodyRow{Body: r[0].S}
-    }
-    return out, nil
-}
-```
-
-`selectBodyByMessageIDPlan` is a pre-compiled, reusable query plan — the same structure the statement cache produces, but pinned at compile time and never re-parsed.
-
-### Fallback and strict mode
-
-- **Declared queries** (`.sql` files processed by `go generate`) → `*Queries` typed methods, hot path
-- **Ad-hoc SQL** passed to `db.Query()` / `db.Exec()` → interpreter fallback, `[][]Value` return
-- **`StrictMode bool` in `Options`** → `db.Query()` / `db.Exec()` return an error for any SQL not backed by a generated method; guarantees no interpreter is ever called in production
-
-### Role of the SQL interpreter
-
-The interpreter (lexer → parser → planner → executor) serves two purposes: it is the `go generate` backend (validates SQL at codegen time and emits plans), and it is the runtime engine for the generic `db.Query()` / `db.Exec()` fallback path. In strict mode the executor is never called at runtime. The `[]Value` / `Row` types are internal to the interpreter and the `hazedb dump` CLI — not on the hot path.
+The wrapper calls the identical executor and copies each `Row` into the typed struct. It buys **compile-time type safety and nicer call sites**, not throughput — the plan it runs is the one the runtime engine already caches. It is therefore optional, deferred, and explicitly subordinate to the runtime engine: hazedb is fast with codegen absent. (Earlier revisions of this RFC made codegen the hot path and the interpreter a "fallback"; that is inverted — the runtime engine is primary, codegen is an optional ergonomic layer.)
 
 ### FrankenPHP / cgo boundary
 
-Two functions exposed through cgo:
+The primary cgo entry points map straight onto the runtime engine:
 
 ```php
-// Generated per-query wrapper — typed params, fast, one cgo crossing
-hazedb_select_body_by_message_id($id)
-
-// Generic fallback — JSON-encoded rows, slower, ad-hoc use only
-hazedb_sql("SELECT body FROM messages WHERE id = ?", $id)
+hazedb_query("SELECT body FROM messages WHERE id = ?", $id)  // → JSON rows
+hazedb_exec("INSERT INTO messages (id, body) VALUES (?, ?)", $id, "hello")
 ```
 
-`go generate` emits both the typed Go method and a matching cgo-compatible C wrapper for each declared query. `hazedb_sql` maps to `db.Query()` / `db.Exec()` and returns JSON-encoded rows — useful for admin tooling, not the hot path.
+One SQL parse per distinct string (cached thereafter), one cgo crossing per call. An optional generated per-query C wrapper (matching the typed-struct wrapper above) can skip JSON encoding for declared queries, but is not required for the boundary to be fast.
+
+---
+
+## Runtime catalog and DDL
+
+The set of tables is **live DB state, not a compile-time constant.** `CREATE TABLE` and `DROP TABLE` are first-class SQL statements that run while the database is serving traffic; the schema does not have to be known at `Open()`. An empty schema is a valid starting point.
+
+### The catalog snapshot
+
+All tables live in an immutable `catalog` value published behind an `atomic.Pointer[catalog]`:
+
+```go
+type catalog struct {
+    version uint64
+    byName  map[string]*tableRT  // name → table
+    byID    []*tableRT           // durable tableID → table; a nil slot is a dropped table
+}
+```
+
+Every read and write loads the pointer **once** at the top of the call and uses that one snapshot for the whole operation — entirely lock-free. DDL never blocks or slows a read/write: it builds a **new** catalog (copying only the small registry maps; existing table storage is shared by pointer, never copied) and swaps the pointer atomically (RCU). An in-flight query keeps its consistent view; the old catalog is GC'd once no call still holds it.
+
+`ddlMu` serialises concurrent `CREATE`/`DROP` against each other. Reads and writes never take it.
+
+### Durable table IDs
+
+Each table has a `tableID` assigned at creation = the current length of `byID`. IDs are **append-only and never reused**: `DROP` nils the `byID` slot but keeps the slice length, so a later `CREATE` of the same name gets a *new* id. This is what makes WAL replay unambiguous — a mutation record carries its `tableID`, and after a drop+recreate the old id's records never collide with the new table.
+
+### Catalog version → plan invalidation
+
+`version` increments on every `CREATE`/`DROP`. It is the stamp the statement cache checks (see *Query API → Prepared plans*): a bump invalidates cached plans lazily, on next use, so a plan can never run against a table that changed under it. DDL being rare, re-binding every cached plan after a schema change is an acceptable cost.
+
+### WAL-logged, replayed before mutations
+
+`CREATE` and `DROP` are journaled to the WAL (`recCreateTable` / `recDropTable`) **before** the new catalog is published — so a crash between the journal and the swap replays to the same state, never a published-but-unlogged table. On `Open()`, replay processes catalog records in order before the mutations that reference them, rebuilding the exact `tableID → table` mapping; runtime-created tables and their rows survive restart. `CREATE` records the full `TableDef` (column types + PK/PartitionKey/Immutable/Nullable flags); a partitioned table created at runtime rebuilds its `pkDirectory` and tail index on replay, identical to a predeclared one.
+
+### v1 limits
+
+- **`CREATE` and `DROP` only — no `ALTER`.** Column add/drop/retype is out of scope for v1; `ALTER` is not even a keyword, so it surfaces as a parse error rather than partial handling. To change a table's shape: `CREATE` the new table, copy rows across, `DROP` the old one.
+- **No "DROP while an active cursor holds the table."** This needs no lock: `Query()` fully materialises and deep-clones its result before returning, so there are no streaming cursors aliasing storage. A concurrent `DROP` only unlinks the table from the next catalog; rows already returned to the caller are independent copies, and an in-flight query finishes against the snapshot it loaded.
 
 ---
 
@@ -559,16 +553,11 @@ func hazedb_exec_transaction(stmts []Statement) error {
 }
 ```
 
-### Codegen — named transactions
+### Multi-statement transactions at runtime
 
-`go generate` can precompile a fixed array of SQL literals into a single typed Go function:
+A transaction is a Go closure (`db.Transaction(func(tx) {...})`, M6) that issues several statements which commit atomically. Each statement runs through the same runtime engine and its cached plan — the SQL is parsed once per distinct string, not per call, so there is no per-transaction parse cost to "compile away." Locking, WAL write, and commit execute at runtime under one `TXN` envelope.
 
-```go
-// generated — zero SQL parsing at runtime, one cgo crossing
-func TransferBalance(fromID, toID UUID, amount int64) error
-```
-
-PHP calls `hazedb_transfer(fromID, toID, amount)` — SQL parsing and dispatch are compiled away. Locking, WAL write, and commit still execute at runtime.
+An optional generated wrapper (post-1.0) could expose a fixed transaction as one typed function — e.g. `TransferBalance(fromID, toID, amount)` calling the same cached plans — for caller ergonomics and one cgo crossing. It is a convenience layer, not a performance requirement.
 
 ### What this does not cover
 
@@ -578,7 +567,7 @@ Cross-table transactions (debit one table, credit another) require locking shard
 
 ## Measured benchmarks
 
-> **Scope:** measured on the **M5 implementation** — UUIDv7 PK, partitioned tables, logical typed-mutation WAL, runtime SQL interpreter. The interpreter path still carries per-row overhead that the planned codegen step removes, so treat hazedb's single-thread numbers as a **floor** (they get faster, not slower). All on AMD Ryzen AI MAX+ 395 (32 threads), Docker, golang:1.22; medians of count≥3.
+> **Scope:** measured on the **M5 implementation** — UUIDv7 PK, partitioned tables, logical typed-mutation WAL, runtime SQL engine with cached prepared plans. These numbers are the runtime engine itself (no code generation involved); it already runs ~8× SQLite on point reads. The `[]Value` representation carries some per-row overhead an optional typed-struct wrapper could trim later, so treat the single-thread numbers as a **floor**. All on AMD Ryzen AI MAX+ 395 (32 threads), Docker, golang:1.22; medians of count≥3.
 
 ### Point operations vs SQLite and Bolt (single-thread, fair 16-byte UUID keys)
 
@@ -643,14 +632,16 @@ github.com/VeloxCoding/hazedb   (package hazedb)
 ├── value.go         Value union (Int/String/Bytes/Bool/Null), Row, Clone
 ├── schema.go        Schema, TableDef, ColumnDef, resolvedTable, validateValue
 ├── errors.go        Sentinel errors
-├── store.go         Sharded RWMutex storage: insert/getByPK/scanAll/update/delete
-├── wal.go           Logical typed-mutation WAL: versioned envelope (magic|type|version|length|payload|crc32c), MUTATION payload, CRC32C, durability modes, bounds-checked tail recovery. Planned: TXN envelope grouping (M6), snapshot load (M7)
+├── store.go         Sharded RWMutex storage: insert/getByPK/scanAll/update/delete (clone-under-lock reads)
+├── partition_store.go  Partitioned-table storage: pkDirectory (UUID→location), tail index, two-lock insert, release-then-retry read
+├── catalog.go       Runtime catalog (atomic snapshot, RCU swap), CREATE/DROP, durable table IDs, catalog WAL record codec
+├── wal.go           Logical typed-mutation WAL: versioned envelope (magic|type|version|length|payload|crc32c), MUTATION + CREATE/DROP catalog records, CRC32C, durability modes, bounds-checked tail recovery. Planned: TXN envelope grouping (M6), snapshot load (M7)
 ├── uuid.go          UUID [16]byte type + monotonic RFC-9562 UUIDv7 generator
 ├── lexer.go         Tokenizer
-├── ast.go           AST node types
-├── parser.go        Recursive-descent parser
-├── exec.go          Planner + executor (PK fast path, scan fallback)
-├── db.go            Public API: Open/Exec/Query/Close, stmt cache
+├── ast.go           AST node types (incl. createStmt/dropStmt)
+├── parser.go        Recursive-descent parser (incl. CREATE/DROP TABLE)
+├── exec.go          Planner + executor (PK fast path, indexed partition scan, full-scan fallback)
+├── db.go            Public API: Open/Exec/Query/Close, catalog pointer, stmt cache + plan re-bind, replay
 ├── *_test.go        Unit, race, stress, mixed-latency, bench, comparison
 └── spike/           Preserved prototype code (package spike) — reference only
 ```
@@ -675,7 +666,8 @@ github.com/VeloxCoding/hazedb   (package hazedb)
 | pkDirectory for partitioned tables | Required from day one — not deferred. Enforces table-wide PK uniqueness and enables O(1) `WHERE id = ?` without scanning all shards. PK and PartitionKey columns are immutable (enforced at plan time). |
 | WAL format | Logical **typed-mutation**: op + tableID + resolved typed params per record (full row on insert; PK + changed-column deltas on update; PK on delete). **NOT SQL-string** — benchmarked and rejected (SQL text cost +50% bytes/insert, 2.5× bytes/delete, ~2× replay; spike in `wal_format_spike_test.go`). All auto-generated values resolved before write; deterministic replay via the apply path; `hazedb dump` reconstructs SQL for inspection. |
 | WAL durability default | async-bufio + ticker (1 s), fsync opt-in via `WALSync bool` |
-| Public API | Two tiers: `db.Query()`/`db.Exec()` generic interpreter path (`[][]Value`) + `*Queries` generated typed methods per declared `.sql` query (hot path); no runtime SQL dispatch table |
+| Public API | One runtime engine: `db.Query()`/`db.Exec()` parse once, cache the plan per SQL string, re-bind on catalog-version change. This is the hot path (~8× SQLite without codegen). An optional typed-struct wrapper over the same plans is post-1.0 ergonomics, not a speed mechanism. |
+| Schema lifecycle | `CREATE`/`DROP TABLE` at runtime over an atomic catalog (RCU); durable append-only table IDs; no `ALTER` in v1 |
 | Multi-shard non-PK writes | Closed by correctness, not preference. The one-shard-at-a-time pattern is a write-serializability + replay-divergence bug (see *Transactions — The problem*). A multi-shard `UPDATE`/`DELETE` not pinned to a single shard by PK/PartitionKey must either lock all affected shards before the WAL write, or be wrapped in `db.Transaction()`. Until `db.Transaction()` lands (M5), such statements take the lock-all-shards path or are rejected at plan time. |
 
 ---
@@ -687,11 +679,12 @@ github.com/VeloxCoding/hazedb   (package hazedb)
 | **M1** | Single-table store, WAL, tail-recovery, CI bench gate | ✅ done |
 | **M2** | SQL parser + interpreter (SELECT/INSERT/UPDATE/DELETE) | ✅ done |
 | **M3** | WAL ticker flush + optional fsync (`WALFlushInterval`, `WALSync`, `WALSyncPerWrite`, sticky error state); arithmetic expressions in `SET`/`WHERE` (`col + ?`, `col - ?`, `col * ?`) | ✅ done |
-| **M4** | Codegen: `go generate` reads `.sql` query files → `*Queries` struct with one typed method per query + pre-compiled plan; strict mode (`StrictMode` option); generated cgo wrappers per query for FrankenPHP; generic `hazedb_sql` fallback | open |
-| **M5** | Single-table transactions: `db.Transaction(func)` Go API + staged overlay (read-your-writes) + atomic `TXN` WAL envelope + torn-envelope discard on replay | open |
-| **M6** | Multi-table support, secondary indexes on non-PK columns (note: `pkDirectory` for partitioned tables is a primary-key directory, not a secondary index — it is required from M4 onward, not deferred here) | open |
+| **M4** | UUIDv7 PK enforced (`[16]byte` inline, monotonic auto-gen) + immutable order column + logical typed-mutation WAL | ✅ done |
+| **M5** | PartitionKey routing + table-wide `pkDirectory` + indexed partition scan; **runtime catalog + first-class `CREATE`/`DROP TABLE`** (atomic RCU swap, durable table IDs, catalog-version plan invalidation, WAL-logged DDL) | ✅ done |
+| **M6** | Single-table transactions: `db.Transaction(func)` Go API + staged overlay (read-your-writes) + atomic `TXN` WAL envelope + torn-envelope discard on replay | open |
 | **M7** | WAL segments (each with a `base` global-offset header) + snapshot checkpoint with consistent cut: pause all writes → record current global LSN → dump all live rows as `INSERT` statements to snapshot file → fsync snapshot + dir → write `CHECKPOINT <file> <lsn>` to WAL → atomically update `MANIFEST{snapshot,lsn}` → resume writes; on restart read manifest (or two-pass scan) to find the newest *verified* checkpoint, load its snapshot, then replay WAL from its global LSN (resolved to `(segment, offset)` by base comparison); delete pre-checkpoint segments | open |
-| **M8** | CLI (`hazedb dump/verify/checkpoint`), Caddy module, FrankenPHP cgo binding (`hazedb_exec_transaction` array API + named transaction codegen) | open |
+| **M8** | CLI (`hazedb dump/verify/checkpoint`), Caddy module, FrankenPHP cgo binding (`hazedb_exec_transaction` array API) | open |
+| **post-1.0** | Multi-table support + secondary indexes on non-PK columns (note: `pkDirectory` for partitioned tables is a primary-key directory, not a secondary index — it is core, not deferred here); optional typed-struct query wrapper | open |
 
 **M7 note:** the snapshot IS a logical WAL file — a series of INSERT *mutations* (typed-mutation records, not SQL text) for every live row at a known WAL position. Loading it produces a fresh arena with no tombstones. No special arena compaction code is needed: tombstones accumulate in active memory until a snapshot restart or live reload; once the snapshot loads, the arena starts clean.
 
@@ -771,6 +764,16 @@ hazedb compiles into your Go binary, keeps all data in RAM, writes a WAL for dur
 ---
 
 ## Changelog
+
+**rev. 8 (2026-05-29) — runtime catalog is the primary architecture; codegen demoted to optional wrapper**
+
+A foundational direction change, validated in code (insert/read benchmarks for a runtime-created table are identical to a predeclared one). Earlier revisions treated `go generate` codegen as *the hot path* and the SQL interpreter as a "fallback," with the schema fixed at `Open()`. That is inverted:
+
+- **One runtime engine is the hot path.** `db.Query()`/`db.Exec()` parse each SQL string once, cache the compiled plan, and re-run it from cache. Measured ~8× SQLite on point reads with **no** code generation, so codegen is not a performance precondition. Rewrote *Query API* (was *Query API and codegen model*): removed the two-tier "generated methods = hot path / interpreter = fallback" framing and the `StrictMode` "no interpreter in production" guarantee.
+- **Codegen demoted to an optional, post-1.0 ergonomic wrapper.** A generated typed-struct layer can sit *on top of the same cached plans* for compile-time type safety and nicer call sites; it buys ergonomics, not throughput. Updated the `[]Value` note, the PK rationale ("engine stays simple", not "codegen is simpler"), the named-transaction section, the cgo-boundary section, the benchmark-scope note, and the settled-decisions *Public API* row to match.
+- **Runtime catalog + first-class DDL (new section).** Tables are live state behind an `atomic.Pointer[catalog]` (RCU swap on DDL, lock-free reads/writes, `ddlMu` serialises DDL only). `CREATE`/`DROP TABLE` run while serving; durable append-only `tableID`s (drop nils the slot, never reuses the id); a monotonic catalog `version` lazily invalidates cached plans so a plan never runs against a changed table; DDL is WAL-logged before publish and replayed before the mutations that reference it, so runtime tables (including partitioned ones, with their directory + tail index) survive restart.
+- **v1 schema limits stated.** `CREATE` + `DROP` only — **no `ALTER`** (not a keyword → parse error; reshape via create-copy-drop). No "DROP while an active cursor holds the table" lock is needed: `Query()` fully materialises and deep-clones before returning, so there are no streaming cursors aliasing storage. Non-goal table updated ("No runtime schema migration" → "No `ALTER TABLE` in v1").
+- **Roadmap re-aligned to what shipped.** M4 = UUIDv7 PK + immutable order column + typed-mutation WAL (done); M5 = PartitionKey/`pkDirectory`/indexed scan **+ runtime catalog/DDL** (done); transactions are M6; multi-table + secondary indexes + the optional typed-struct wrapper move to post-1.0.
 
 **rev. 7 (2026-05-29) — WAL format settled by benchmark**
 
