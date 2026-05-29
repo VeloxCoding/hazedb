@@ -1,20 +1,20 @@
 <?php
-// bench.php — measure PHP-side SELECT throughput against hazedb via the
-// in-process cgo extension. This is the REALISTIC PHP number: it includes
-// json_encode of the args, the cgo crossing, the SQL statement-cache lookup +
-// key copy, JSON arg parse + UUID parse, the point read, and JSON result
-// encoding. (The raw in-Go point read is far cheaper; this is what a PHP caller
-// actually pays per hazedb_query call.)
+// bench.php — PHP SELECT throughput against hazedb via the in-process cgo
+// extension, the LEAN way: the id is known (as in real life — you clicked a
+// row, the id arrives in the request), passed DIRECTLY as the arg (no
+// json_encode), and the result is NOT decoded. This is the realistic hot-read
+// cost: cgo crossing + SQL stmtCache lookup + UUID parse + the point read +
+// JSON result build. (Inserts still use the JSON-array arg form for multi-arg.)
 //
 // Seeds N rows, warms, then times a point-read-by-PK loop. Prints qps + ns/op.
 
 header('Content-Type: text/plain');
 set_time_limit(0);
 
-$N     = (int)($_GET['n']    ?? 10000);   // rows seeded
-$iters = (int)($_GET['iter'] ?? 1000000); // timed SELECTs
+$N     = (int)($_GET['n']    ?? 10000);
+$iters = (int)($_GET['iter'] ?? 1000000);
 
-// --- seed ---
+// --- seed (writes use the JSON-array arg form: multiple typed values) ---
 hazedb_exec('CREATE TABLE users (id uuid primary key, name text, age int)', '');
 $ids = [];
 for ($i = 0; $i < $N; $i++) {
@@ -24,20 +24,18 @@ for ($i = 0; $i < $N; $i++) {
                 json_encode([$id, "user$i", $i % 100]));
 }
 
-// --- correctness sanity before timing ---
-$probe = json_decode(hazedb_query('SELECT name, age FROM users WHERE id = ?',
-                                  json_encode([$ids[0]])), true);
-echo 'sanity=', json_encode($probe['rows'][0] ?? null), "\n";
+// --- sanity (raw JSON string, no decode) ---
+echo 'sanity=', hazedb_query('SELECT name, age FROM users WHERE id = ?', $ids[0]), "\n";
 
-// --- warm ---
+// --- warm: id passed DIRECTLY, no json_encode ---
 for ($i = 0; $i < 50000; $i++) {
-    hazedb_query('SELECT name, age FROM users WHERE id = ?', json_encode([$ids[$i % $N]]));
+    hazedb_query('SELECT name, age FROM users WHERE id = ?', $ids[$i % $N]);
 }
 
-// --- measure ---
+// --- measure: id direct, no decode ---
 $t0 = microtime(true);
 for ($i = 0; $i < $iters; $i++) {
-    hazedb_query('SELECT name, age FROM users WHERE id = ?', json_encode([$ids[$i % $N]]));
+    hazedb_query('SELECT name, age FROM users WHERE id = ?', $ids[$i % $N]);
 }
 $dt = microtime(true) - $t0;
 

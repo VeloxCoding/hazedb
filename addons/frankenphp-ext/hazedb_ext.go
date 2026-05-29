@@ -7,16 +7,17 @@
 //
 // Three PHP functions:
 //
-//	hazedb_query(string $sql, string $args_json): ?string
+//	hazedb_query(string $sql, string $args): ?string
 //	    Run a SELECT. Returns {"columns":[...],"rows":[[...],...]} as a JSON
 //	    string, {"error":"..."} on a SQL error, or PHP null if no Caddy module
-//	    has registered a DB. args_json is a JSON array of positional args for
-//	    "?" placeholders, or "" / "[]" for none.
+//	    has registered a DB. $args (see QueryArgs): "" = none; a value starting
+//	    with '[' = a JSON array (multi-arg / typed); anything else = ONE arg
+//	    passed directly (a UUID string you already have → no json_encode).
 //
-//	hazedb_exec(string $sql, string $args_json): ?string
+//	hazedb_exec(string $sql, string $args): ?string
 //	    Run INSERT / UPDATE / DELETE / CREATE TABLE / DROP TABLE — the write
-//	    path (this is the "insert" function, generalised). Returns
-//	    {"affected":N}, an error envelope, or null (no DB).
+//	    path (this is the "insert" function, generalised). Same $args rule.
+//	    Returns {"affected":N}, an error envelope, or null (no DB).
 //
 //	hazedb_uuidv7(): string
 //	    A fresh UUIDv7 string — convenience for populating UUID primary keys,
@@ -88,13 +89,13 @@ func phpStringFromBytes(b []byte) unsafe.Pointer {
 
 // hazedb_query runs a SELECT and returns the rows envelope as a JSON string.
 //
-// export_php:function hazedb_query(string $sql, string $args_json): ?string
+// export_php:function hazedb_query(string $sql, string $args): ?string
 func hazedb_query(sql *C.zend_string, argsJSON *C.zend_string) unsafe.Pointer {
 	db := defaultSlot.Load()
 	if db == nil {
 		return nil
 	}
-	args, err := hazedb.ArgsFromJSON([]byte(zendStringView(argsJSON)))
+	args, err := hazedb.QueryArgs(zendStringView(argsJSON))
 	if err != nil {
 		return phpStringFromBytes(hazedb.ErrorJSON(err.Error()))
 	}
@@ -112,13 +113,13 @@ func hazedb_query(sql *C.zend_string, argsJSON *C.zend_string) unsafe.Pointer {
 // hazedb_exec runs a write (INSERT/UPDATE/DELETE/CREATE/DROP) and returns
 // {"affected":N} as a JSON string.
 //
-// export_php:function hazedb_exec(string $sql, string $args_json): ?string
+// export_php:function hazedb_exec(string $sql, string $args): ?string
 func hazedb_exec(sql *C.zend_string, argsJSON *C.zend_string) unsafe.Pointer {
 	db := defaultSlot.Load()
 	if db == nil {
 		return nil
 	}
-	args, err := hazedb.ArgsFromJSON([]byte(zendStringView(argsJSON)))
+	args, err := hazedb.QueryArgs(zendStringView(argsJSON))
 	if err != nil {
 		return phpStringFromBytes(hazedb.ErrorJSON(err.Error()))
 	}

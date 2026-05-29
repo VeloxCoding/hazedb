@@ -11,9 +11,9 @@
 // You may edit the file and remove this comment if you plan to manually maintain
 // this file going forward.
 
-function hazedb_query(string $sql, string $args_json): ?string {}
+function hazedb_query(string $sql, string $args): ?string {}
 
-function hazedb_exec(string $sql, string $args_json): ?string {}
+function hazedb_exec(string $sql, string $args): ?string {}
 
 function hazedb_uuidv7(): string {}
 

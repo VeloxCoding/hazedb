@@ -36,12 +36,12 @@ zend_module_entry hazedb_ext_module_entry = {STANDARD_MODULE_HEADER,
 PHP_FUNCTION(hazedb_query)
 {
     zend_string *sql = NULL;
-    zend_string *args_json = NULL;
+    zend_string *args = NULL;
     ZEND_PARSE_PARAMETERS_START(2, 2)
         Z_PARAM_STR(sql)
-        Z_PARAM_STR(args_json)
+        Z_PARAM_STR(args)
     ZEND_PARSE_PARAMETERS_END();
-    zend_string *result = go_hazedb_query(sql, args_json);
+    zend_string *result = go_hazedb_query(sql, args);
     if (result) {
         RETURN_STR(result);
     }
@@ -52,12 +52,12 @@ PHP_FUNCTION(hazedb_query)
 PHP_FUNCTION(hazedb_exec)
 {
     zend_string *sql = NULL;
-    zend_string *args_json = NULL;
+    zend_string *args = NULL;
     ZEND_PARSE_PARAMETERS_START(2, 2)
         Z_PARAM_STR(sql)
-        Z_PARAM_STR(args_json)
+        Z_PARAM_STR(args)
     ZEND_PARSE_PARAMETERS_END();
-    zend_string *result = go_hazedb_exec(sql, args_json);
+    zend_string *result = go_hazedb_exec(sql, args);
     if (result) {
         RETURN_STR(result);
     }

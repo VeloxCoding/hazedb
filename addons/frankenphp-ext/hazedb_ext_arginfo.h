@@ -1,9 +1,9 @@
 /* This is a generated file, edit the .stub.php file instead.
- * Stub hash: 2a80cd56e808e4e9abb1f758defd4e0ff78769e9 */
+ * Stub hash: 8f1148f41723df748d095997036f5f38fa5243fc */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_hazedb_query, 0, 2, IS_STRING, 1)
 	ZEND_ARG_TYPE_INFO(0, sql, IS_STRING, 0)
-	ZEND_ARG_TYPE_INFO(0, args_json, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, args, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 
 #define arginfo_hazedb_exec arginfo_hazedb_query

@@ -24,6 +24,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // valueToAny converts a cell to a JSON-encodable Go value.
@@ -77,6 +78,31 @@ func ErrorJSON(msg string) []byte {
 		Error string `json:"error"`
 	}{msg})
 	return b
+}
+
+// QueryArgs parses an adapter's args parameter in either form:
+//
+//   - ""                  → no args
+//   - starts with '['     → a JSON array (ArgsFromJSON; multi-arg / typed / writes)
+//   - anything else       → ONE positional arg passed directly: a canonical
+//     UUID string → UUID, otherwise STRING
+//
+// The direct form lets a caller pass a key it already has — e.g. the UUID from
+// a clicked link — straight into `WHERE id = ?` with no json_encode wrapping,
+// the common single-key read. For integer args or several args, use the JSON
+// array form so types are unambiguous.
+func QueryArgs(s string) ([]any, error) {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return nil, nil
+	}
+	if t[0] == '[' {
+		return ArgsFromJSON([]byte(t))
+	}
+	if u, err := ParseUUID(t); err == nil {
+		return []any{u}, nil
+	}
+	return []any{t}, nil
 }
 
 // ArgsFromJSON parses a JSON array of positional SQL args into the []any
