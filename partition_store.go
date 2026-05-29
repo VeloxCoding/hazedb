@@ -227,7 +227,9 @@ func (t *table) updateByPKOneJournaledPartitioned(pk UUID, ord int, compute func
 	return true, nil
 }
 
-// updatePartitioned is the replay-path update (no journal).
+// updatePartitioned is the replay-path update (no journal). Same invariant
+// guard as update(): mutate must return a non-nil row with an unchanged PK, or
+// it returns false (→ ErrWALCorrupt) rather than corrupting the directory.
 func (t *table) updatePartitioned(pk UUID, mutate func(Row) Row) bool {
 	t.pkDir.mu.RLock()
 	defer t.pkDir.mu.RUnlock()
@@ -241,7 +243,11 @@ func (t *table) updatePartitioned(pk UUID, mutate func(Row) Row) bool {
 	if loc.rowID >= uint64(len(s.rows)) {
 		return false
 	}
-	s.rows[loc.rowID] = mutate(s.rows[loc.rowID])
+	nr := mutate(s.rows[loc.rowID])
+	if nr == nil || nr[t.def.pkOrdinal].U != pk {
+		return false
+	}
+	s.rows[loc.rowID] = nr
 	return true
 }
 
@@ -279,35 +285,43 @@ func (t *table) deleteByPKPartitioned(pk UUID) bool {
 
 // deleteWhereAllPartitioned tombstones every matching row across the table,
 // holding the directory write lock and every shard lock for the whole
-// operation (same serializability requirement as the non-partitioned
-// deleteWhereAll), and removes each deleted PK from the directory. journal
-// runs under the locks, before each tombstone.
-func (t *table) deleteWhereAllPartitioned(match func(Row) bool, journal func(pk Value) error) (int, error) {
+// operation, and removes each deleted PK from the directory. Two-pass with a
+// single TXN envelope, same atomicity as deleteWhereAll: collect → journal once
+// → apply. A WAL failure aborts with nothing applied.
+func (t *table) deleteWhereAllPartitioned(match func(Row) bool, encode func(pk Value) []byte, journalAll func([][]byte) error) (int, error) {
 	pkOrd := t.def.pkOrdinal
 	t.pkDir.mu.Lock()
 	defer t.pkDir.mu.Unlock()
 	t.lockAllShards()
 	defer t.unlockAllShards()
-	count := 0
+	type pendingDelete struct {
+		s  *tableShard
+		j  int
+		pk UUID
+	}
+	var pending []pendingDelete
+	var bodies [][]byte
 	for i := range t.shards {
 		s := &t.shards[i]
 		for j, r := range s.rows {
-			if r == nil {
+			if r == nil || !match(r) {
 				continue
 			}
-			if !match(r) {
-				continue
+			pending = append(pending, pendingDelete{s, j, r[pkOrd].U})
+			if encode != nil {
+				bodies = append(bodies, encode(r[pkOrd]))
 			}
-			if journal != nil {
-				if err := journal(r[pkOrd]); err != nil {
-					return count, err
-				}
-			}
-			delete(t.pkDir.idx, r[pkOrd].U)
-			s.rows[j] = nil
-			s.live--
-			count++
 		}
 	}
-	return count, nil
+	if journalAll != nil && len(bodies) > 0 {
+		if err := journalAll(bodies); err != nil {
+			return 0, err
+		}
+	}
+	for _, p := range pending {
+		p.s.rows[p.j] = nil
+		p.s.live--
+		delete(t.pkDir.idx, p.pk)
+	}
+	return len(pending), nil
 }

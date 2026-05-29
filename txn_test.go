@@ -98,6 +98,95 @@ func TestTxnEnvelopeTornTailDiscarded(t *testing.T) {
 	}
 }
 
+// --- Broad UPDATE/DELETE atomicity (one TXN envelope, all-or-nothing) ---
+
+// A broad predicate UPDATE/DELETE writes exactly ONE WAL record (a TXN
+// envelope), not one per matched row — so it is crash-atomic (the envelope is
+// all-or-nothing on replay).
+func TestBroadWriteIsSingleWALRecord(t *testing.T) {
+	db, _ := openDBWithWAL(t)
+	for i := 0; i < 6; i++ {
+		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i+1), "u", 20+i)
+	}
+	for _, op := range []struct {
+		name string
+		sql  string
+	}{
+		{"update", "UPDATE users SET age = ? WHERE age >= ?"},
+		{"delete", "DELETE FROM users WHERE age >= ?"},
+	} {
+		before := db.wal.lsn
+		var err error
+		if op.name == "update" {
+			_, err = db.Exec(op.sql, 99, 0) // matches all 6
+		} else {
+			_, err = db.Exec(op.sql, 0) // matches remaining rows
+		}
+		if err != nil {
+			t.Fatalf("%s: %v", op.name, err)
+		}
+		if d := db.wal.lsn - before; d != 1 {
+			t.Fatalf("%s wrote %d WAL records, want 1 (single TXN envelope)", op.name, d)
+		}
+	}
+}
+
+// On a WAL failure mid-statement, a broad UPDATE applies NOTHING — the envelope
+// is written before any row is touched, so a failed write leaves the table
+// unchanged.
+func TestBroadUpdateAtomicOnWALFailure(t *testing.T) {
+	db, _ := openDBWithWAL(t)
+	for i := 0; i < 5; i++ {
+		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i+1), "u", 10)
+	}
+	db.wal.failWrites = true // inject: the next WAL write fails
+	if _, err := db.Exec("UPDATE users SET age = ? WHERE age = ?", 999, 10); err == nil {
+		t.Fatal("expected WAL failure error")
+	}
+	db.wal.failWrites = false
+	// The sticky WAL error blocks further writes, but reads still work: no row
+	// should have age 999.
+	_, rows, err := db.Query("SELECT id FROM users WHERE age = ?", 999)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("broad update partially applied on WAL failure: %d rows changed", len(rows))
+	}
+}
+
+// A broad UPDATE / DELETE survives a restart as one unit (TXN envelope replay).
+func TestBroadWriteSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "broad.wal")
+	db, err := Open(Options{Schema: testSchema(), WALPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i+1), "u", i)
+	}
+	db.Exec("UPDATE users SET name = ? WHERE age >= ?", "hi", 5) // 5 rows -> name "hi"
+	db.Exec("DELETE FROM users WHERE age < ?", 2)                // remove 2 rows
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(Options{Schema: testSchema(), WALPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	_, rows, _ := db2.Query("SELECT id FROM users WHERE name = ?", "hi")
+	if len(rows) != 5 {
+		t.Fatalf("broad update lost after restart: %d/5", len(rows))
+	}
+	_, rows, _ = db2.Query("SELECT id FROM users WHERE age < ?", 2)
+	if len(rows) != 0 {
+		t.Fatalf("broad delete lost after restart: %d rows remain", len(rows))
+	}
+}
+
 // --- Step 2: Tx + db.Transaction commit engine ---
 
 func acct(t *testing.T, db *DB, id UUID) int64 {

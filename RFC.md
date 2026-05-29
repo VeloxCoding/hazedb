@@ -2,7 +2,7 @@
 
 **Status:** M1–M6 implemented (store, SQL, WAL durability, UUIDv7 PK, partitioning, runtime catalog + `CREATE`/`DROP TABLE`, single-table transactions); M7–M8 open. See *Implementation status* for what is running vs designed.  
 **Module:** `github.com/VeloxCoding/hazedb`  
-**Updated:** 2026-05-29 (rev. 14 — alloc-lean write/scan paths; benchmarks re-measured)
+**Updated:** 2026-05-29 (rev. 16 — replay-apply guards PK-immutability/non-nil)
 
 ---
 
@@ -246,6 +246,8 @@ The asymmetry between op-bodies is the whole point of the format: INSERT carries
 
 Parameters are serialised as typed values (UUIDv7, int64, string, bool, bytes, null) — **always the concrete, resolved values that were actually applied**, never the caller's original unresolved arguments. Auto-generated values (the UUIDv7 PK when the caller omits it, any server-side defaults) are resolved before the WAL record is written.
 
+**Input `[]byte` is cloned at the write boundary.** A `[]byte` argument (or a caller-built `Value` carrying one) is deep-copied when it is converted to a stored value, so storage never aliases a slice the caller still holds and could mutate after the call returns — that would corrupt the stored row and diverge it from the already-written WAL record. Strings are immutable and int/bool/UUID are value types, so this applies only to `bytes` columns. (Reads are already detached by the clone-under-lock path; this makes the write side symmetric.)
+
 **Atomicity comes from the envelope, not a separate COMMIT token.** A TXN record is one self-delimiting envelope holding all of the transaction's statements; it is durable iff the whole envelope is present with a valid CRC. A torn or truncated TXN envelope (interrupted mid-write) fails the CRC / length check during tail recovery and is discarded in its entirety — there is no such thing as a half-applied transaction in the WAL. This replaces the earlier "pairs followed by a `COMMIT` marker" framing: the commit boundary is the envelope boundary.
 
 **Execution pipeline for every write (mandatory order — follows global lock ordering):**
@@ -470,7 +472,9 @@ The one-shard-at-a-time pattern above is neither and is a bug. See *Settled deci
 
 **What is atomic today:** PK-based operations (`WHERE id = ?`) on non-partitioned tables hit exactly one shard under that shard's lock — fully atomic. On partitioned tables, `WHERE id = ?` acquires pkDirectory lock then shard lock in that fixed order — also fully atomic (no other operation acquires them in reverse order).
 
-**Multi-statement atomicity** is provided by `db.Transaction()` (M6, v1 scope below): a group of PK-pinned statements on one table commits or rolls back together under a single `TXN` WAL envelope. **Still not atomic:** multi-shard `WHERE` operations not run under option 1 or 2 (non-serialisable writes *and* torn reads — must not be used), and cross-table or non-PK-pinned statement groups (out of v1 transaction scope).
+**Broad single-statement writes are atomic too.** A predicate `UPDATE`/`DELETE` spanning shards (`updateWhereAll`/`deleteWhereAll`) runs in two passes under all shard locks: collect + validate every matched row's new image, journal the whole batch as **one `TXN` envelope**, then apply. A WAL failure aborts with nothing applied; a crash leaves the whole statement in the WAL or none of it. So such a statement is all-or-nothing, not partially applied. (The single-row-per-WAL-record form it replaced could half-apply on a mid-statement WAL failure.)
+
+**Multi-statement atomicity** is provided by `db.Transaction()` (M6, v1 scope below): a group of PK-pinned statements on one table commits or rolls back together under a single `TXN` WAL envelope. **Still not atomic:** multi-shard `WHERE` operations run *one-shard-at-a-time* (the unsafe pattern — non-serialisable + torn reads; never used), and cross-table or non-PK-pinned statement *groups* (out of v1 transaction scope).
 
 ### Design decision — explicit opt-in
 

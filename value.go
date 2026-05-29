@@ -180,11 +180,19 @@ func (r Row) Clone() Row {
 
 func cloneValue(v Value) Value {
 	if v.Kind == KindBytes && v.B != nil {
-		b := make([]byte, len(v.B))
-		copy(b, v.B)
-		v.B = b
+		v.B = cloneBytes(v.B)
 	}
 	return v
+}
+
+// cloneBytes returns a fresh copy of b (nil stays nil).
+func cloneBytes(b []byte) []byte {
+	if b == nil {
+		return nil
+	}
+	c := make([]byte, len(b))
+	copy(c, b)
+	return c
 }
 
 func appendRowClone(dst []Value, r Row) []Value {

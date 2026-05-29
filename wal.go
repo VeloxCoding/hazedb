@@ -72,6 +72,10 @@ type wal struct {
 	// every subsequent write returns it; recovery is only via close+reopen.
 	err error
 
+	// failWrites is test-only fault injection: when set, writeRecord fails
+	// (and sets the sticky error), to exercise WAL-failure atomicity paths.
+	failWrites bool
+
 	// Background flush/sync ticker. stop is closed by close(); the loop
 	// signals done via wg. Both nil/zero until startTicker runs.
 	stop chan struct{}
@@ -159,6 +163,10 @@ func (w *wal) writeRecord(recType uint8, payload []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.err != nil {
+		return w.err
+	}
+	if w.failWrites {
+		w.err = fmt.Errorf("wal: injected write failure (test)")
 		return w.err
 	}
 

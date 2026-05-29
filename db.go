@@ -375,16 +375,33 @@ func toValue(a any, index int) (Value, error) {
 	case string:
 		return Str(x), nil
 	case []byte:
-		return Bytes(x), nil
+		// Clone at the write boundary: storage must not alias a caller slice
+		// the caller can mutate after the call returns — that would corrupt the
+		// stored row and diverge from the (already-written) WAL record.
+		return Value{Kind: KindBytes, B: cloneBytes(x)}, nil
 	case bool:
 		return Bool(x), nil
 	case UUID:
 		return UUIDVal(x), nil
 	case Value:
-		return x, nil
+		// A caller-built Value can also carry an aliased []byte; deep-copy it.
+		return cloneValue(x), nil
 	default:
 		return Value{}, fmt.Errorf("%w: unsupported arg type %T at %d", ErrTypeMismatch, a, index)
 	}
+}
+
+// journalTxnBodies writes a group of pre-encoded mutation bodies as ONE atomic
+// TXN WAL envelope. The broad UPDATE/DELETE paths use it so a multi-row
+// statement is all-or-nothing: the single record is written before any row is
+// applied (a WAL failure leaves nothing applied), and a torn envelope is
+// discarded whole on replay. Caller guarantees db.wal != nil.
+func (db *DB) journalTxnBodies(bodies [][]byte) error {
+	buf := db.scratch.get()
+	buf = encodeTxn(buf, bodies)
+	err := db.wal.writeRecord(recTxn, buf)
+	db.scratch.put(buf)
+	return err
 }
 
 // scratchPool hands out small []byte buffers for WAL record encoding.

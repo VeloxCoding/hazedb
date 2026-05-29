@@ -327,9 +327,16 @@ func (t *table) scanAll(fn func(Row) bool) {
 	}
 }
 
-// update mutates the row at pk using mutate. Returns false if the row
-// is absent. mutate runs under the shard write lock and must not call
-// back into the store.
+// update mutates the row at pk using mutate (the WAL-replay apply path).
+// Returns false if the row is absent, OR if mutate violates the storage
+// invariant: it must return a non-nil row whose PK is unchanged (PK and
+// PartitionKey are immutable). A violation returns false instead of silently
+// corrupting the index — s.pk still maps pk, so a changed-PK or nil result
+// would leave the index pointing at the wrong row or a tombstone. The replay
+// caller turns false into ErrWALCorrupt (a WAL update record never legitimately
+// changes a PK; the live plan rejects PK updates), so corruption fails Open
+// loudly rather than serving a broken index. mutate runs under the shard write
+// lock and must not call back into the store.
 func (t *table) update(pk UUID, mutate func(Row) Row) bool {
 	if t.pkDir != nil {
 		return t.updatePartitioned(pk, mutate)
@@ -341,7 +348,11 @@ func (t *table) update(pk UUID, mutate func(Row) Row) bool {
 	if !ok {
 		return false
 	}
-	s.rows[rowID] = mutate(s.rows[rowID])
+	nr := mutate(s.rows[rowID])
+	if nr == nil || nr[t.def.pkOrdinal].U != pk {
+		return false
+	}
+	s.rows[rowID] = nr
 	return true
 }
 
@@ -362,51 +373,57 @@ func (t *table) unlockAllShards() {
 }
 
 // updateWhereAll applies a predicate UPDATE across the whole table while
-// holding EVERY shard lock for the entire operation. This is mandatory for
-// correctness, not an optimisation choice: the one-shard-at-a-time pattern
-// (lock shard, journal, apply, unlock, next shard) is a write-serializability
-// + replay-divergence bug — two interleaved multi-shard writers can leave
-// RAM in a state no serial order produces, while the WAL's total order
-// replays to a different state. Holding all locks makes the journal appends
-// and the in-memory applies one serialisable unit.
+// holding EVERY shard lock for the entire operation — both for serializability
+// (the one-shard-at-a-time pattern is a write-serializability + replay-
+// divergence bug) AND for statement atomicity.
 //
-// For each matched row: compute(r) yields the new SET values (evaluated
-// against the live row, so arithmetic works); a clone of r with those values
-// applied is journaled, and only then stored. So a WAL-append failure aborts
-// before the row is applied (returns the count applied so far plus the
-// error). match and compute run under the locks and must be pure (no store
-// calls). The clone ensures the row is journaled before storage observes it.
-func (t *table) updateWhereAll(match func(Row) bool, ords []int, compute func(Row) ([]Value, error), journal func(Row) error) (int, error) {
+// It runs in two passes under the locks: pass 1 matches rows, computes each new
+// row image (compute sees the live row, so arithmetic works), and collects the
+// encoded mutation bodies; then the whole batch is journaled as ONE TXN
+// envelope (journalAll); only then does pass 2 apply the new rows to memory. So
+// a WAL failure aborts with NOTHING applied (return 0, err), and a crash leaves
+// either the whole statement in the WAL or none of it — the statement is
+// all-or-nothing, not partially applied. encode/journalAll are nil for a
+// memory-only DB (apply directly, no atomicity concern without a WAL).
+func (t *table) updateWhereAll(match func(Row) bool, ords []int, compute func(Row) ([]Value, error), encode func(Row) []byte, journalAll func([][]byte) error) (int, error) {
 	t.lockAllShards()
 	defer t.unlockAllShards()
-	count := 0
+	type pendingUpdate struct {
+		s  *tableShard
+		j  int
+		nr Row
+	}
+	var pending []pendingUpdate
+	var bodies [][]byte
 	for i := range t.shards {
 		s := &t.shards[i]
 		for j, r := range s.rows {
-			if r == nil {
-				continue
-			}
-			if !match(r) {
+			if r == nil || !match(r) {
 				continue
 			}
 			vals, err := compute(r)
 			if err != nil {
-				return count, err
+				return 0, err // nothing applied yet
 			}
 			nr := r.Clone()
 			for k, ord := range ords {
 				nr[ord] = vals[k]
 			}
-			if journal != nil {
-				if err := journal(nr); err != nil {
-					return count, err
-				}
+			pending = append(pending, pendingUpdate{s, j, nr})
+			if encode != nil {
+				bodies = append(bodies, encode(nr))
 			}
-			s.rows[j] = nr
-			count++
 		}
 	}
-	return count, nil
+	if journalAll != nil && len(bodies) > 0 {
+		if err := journalAll(bodies); err != nil {
+			return 0, err // atomic: WAL failed, apply nothing
+		}
+	}
+	for _, p := range pending {
+		p.s.rows[p.j] = p.nr
+	}
+	return len(pending), nil
 }
 
 // deleteByPK removes the row at pk. Returns false if absent.
@@ -429,40 +446,47 @@ func (t *table) deleteByPK(pk UUID) bool {
 }
 
 // deleteWhereAll tombstones all matching rows across the whole table while
-// holding EVERY shard lock for the entire operation — same correctness
-// requirement as updateWhereAll (the one-shard-at-a-time form diverges on
-// replay). For each match, journal(pk) appends the WAL record before the
-// tombstone is applied, so a WAL-append failure aborts before that row is
-// removed. Returns the count deleted (or applied-so-far plus the error).
-func (t *table) deleteWhereAll(match func(Row) bool, journal func(pk Value) error) (int, error) {
+// holding EVERY shard lock — same two-pass, single-TXN-envelope atomicity as
+// updateWhereAll. Pass 1 collects the matched rows + encoded delete bodies;
+// the batch is journaled as one TXN envelope; pass 2 tombstones. A WAL failure
+// aborts with nothing applied. encode/journalAll are nil for a memory-only DB.
+func (t *table) deleteWhereAll(match func(Row) bool, encode func(pk Value) []byte, journalAll func([][]byte) error) (int, error) {
 	if t.pkDir != nil {
-		return t.deleteWhereAllPartitioned(match, journal)
+		return t.deleteWhereAllPartitioned(match, encode, journalAll)
 	}
 	pkOrd := t.def.pkOrdinal
 	t.lockAllShards()
 	defer t.unlockAllShards()
-	count := 0
+	type pendingDelete struct {
+		s  *tableShard
+		j  int
+		pk UUID
+	}
+	var pending []pendingDelete
+	var bodies [][]byte
 	for i := range t.shards {
 		s := &t.shards[i]
 		for j, r := range s.rows {
-			if r == nil {
+			if r == nil || !match(r) {
 				continue
 			}
-			if !match(r) {
-				continue
+			pending = append(pending, pendingDelete{s, j, r[pkOrd].U})
+			if encode != nil {
+				bodies = append(bodies, encode(r[pkOrd]))
 			}
-			if journal != nil {
-				if err := journal(r[pkOrd]); err != nil {
-					return count, err
-				}
-			}
-			delete(s.pk, r[pkOrd].U)
-			s.rows[j] = nil
-			s.live--
-			count++
 		}
 	}
-	return count, nil
+	if journalAll != nil && len(bodies) > 0 {
+		if err := journalAll(bodies); err != nil {
+			return 0, err
+		}
+	}
+	for _, p := range pending {
+		delete(p.s.pk, p.pk)
+		p.s.rows[p.j] = nil
+		p.s.live--
+	}
+	return len(pending), nil
 }
 
 // liveCount returns the number of non-tombstoned rows across all

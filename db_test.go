@@ -208,6 +208,66 @@ func TestSelectLimitRowsDoNotAppendAlias(t *testing.T) {
 	}
 }
 
+// A []byte passed to INSERT/UPDATE must be cloned at the write boundary, so a
+// caller that mutates its slice after the call cannot corrupt stored state
+// (which would also diverge from the already-written WAL record).
+func TestWriteClonesByteInput(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE b (id uuid primary key, data bytes)")
+	id := tid(1)
+
+	buf := []byte("hello")
+	if _, err := db.Exec("INSERT INTO b (id, data) VALUES (?, ?)", id, buf); err != nil {
+		t.Fatal(err)
+	}
+	buf[0] = 'X' // mutate the caller slice after the insert
+	_, rows, _ := db.Query("SELECT data FROM b WHERE id = ?", id)
+	if len(rows) != 1 || string(rows[0][0].B) != "hello" {
+		t.Fatalf("insert aliased caller slice: got %q", rows[0][0].B)
+	}
+
+	ubuf := []byte("world")
+	db.Exec("UPDATE b SET data = ? WHERE id = ?", ubuf, id)
+	ubuf[0] = 'Y' // mutate after the update
+	_, rows, _ = db.Query("SELECT data FROM b WHERE id = ?", id)
+	if string(rows[0][0].B) != "world" {
+		t.Fatalf("update aliased caller slice: got %q", rows[0][0].B)
+	}
+}
+
+// The replay-apply mutator (update) must reject a mutate that changes the PK
+// or returns nil, leaving the row + index intact. This is what turns a
+// PK-changing WAL update record into ErrWALCorrupt on replay (caller maps the
+// false return) instead of a silently corrupt index. (Not triggerable via the
+// public API — the live plan rejects PK updates — so exercised directly.)
+func TestReplayUpdateRejectsBadMutate(t *testing.T) {
+	db := openMem(t)
+	id := tid(1)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", id, "alice", 30)
+	rt := db.cat.Load().byName["users"]
+	pkOrd := rt.def.pkOrdinal
+	ageOrd := rt.def.colByName["age"]
+
+	if rt.update(id, func(r Row) Row { nr := r.Clone(); nr[pkOrd] = UUIDVal(tid(999)); return nr }) {
+		t.Fatal("update accepted a PK-changing mutate")
+	}
+	if rt.update(id, func(Row) Row { return nil }) {
+		t.Fatal("update accepted a nil result")
+	}
+	// Row untouched, still found under the original PK.
+	_, rows, _ := db.Query("SELECT name FROM users WHERE id = ?", id)
+	if len(rows) != 1 || rows[0][0].S != "alice" {
+		t.Fatalf("rejected update corrupted the row: %v", rows)
+	}
+	// A legitimate non-PK mutate still applies.
+	if !rt.update(id, func(r Row) Row { r[ageOrd] = Int(31); return r }) {
+		t.Fatal("legitimate non-PK update was rejected")
+	}
+	if _, rows, _ := db.Query("SELECT age FROM users WHERE id = ?", id); rows[0][0].I != 31 {
+		t.Fatalf("legitimate update did not apply: %v", rows)
+	}
+}
+
 func TestUpdate(t *testing.T) {
 	db := openMem(t)
 	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "alice", 30)

@@ -903,19 +903,19 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		return 0, nil
 	}
 
-	// Multi-shard predicate path: updateWhereAll computes each row's new
-	// values, clones, journals the image, then stores it — all under every
-	// shard lock.
-	journal := func(nr Row) error {
-		if db.wal == nil {
-			return nil
+	// Multi-shard predicate path: updateWhereAll collects every matched row's
+	// new image under all shard locks, journals the batch as ONE TXN envelope,
+	// then applies — so the statement is atomic (all-or-nothing on WAL failure
+	// or crash). encode/journalAll are nil for a memory-only DB.
+	var encode func(Row) []byte
+	var journalAll func([][]byte) error
+	if db.wal != nil {
+		encode = func(nr Row) []byte {
+			return encodeUpdateMutation(nil, tbl.tableID, nr[tbl.def.pkOrdinal], pl.updateOrdinals, nr)
 		}
-		body := encodeUpdateMutation(db.scratch.get(), tbl.tableID, nr[tbl.def.pkOrdinal], pl.updateOrdinals, nr)
-		err := db.wal.writeRecord(recMutation, body)
-		db.scratch.put(body)
-		return err
+		journalAll = db.journalTxnBodies
 	}
-	return tbl.updateWhereAll(match, pl.updateOrdinals, compute, journal)
+	return tbl.updateWhereAll(match, pl.updateOrdinals, compute, encode, journalAll)
 }
 
 // execDelete dispatches on the WHERE shape, mirroring execUpdate. A
@@ -963,8 +963,9 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 		return 0, nil
 	}
 
-	// Multi-shard predicate path: match is pure; deleteWhereAll journals
-	// each PK before tombstoning, under every shard lock.
+	// Multi-shard predicate path: deleteWhereAll collects matched PKs under all
+	// shard locks, journals the batch as ONE TXN envelope, then tombstones — so
+	// the statement is atomic. encode/journalAll are nil for a memory-only DB.
 	match := func(r Row) bool {
 		if st.where == nil {
 			return true
@@ -976,14 +977,13 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 		}
 		return truthy(v)
 	}
-	journal := func(pk Value) error {
-		if db.wal == nil {
-			return nil
+	var encode func(Value) []byte
+	var journalAll func([][]byte) error
+	if db.wal != nil {
+		encode = func(pk Value) []byte {
+			return encodeDeleteMutation(nil, tbl.tableID, pk)
 		}
-		body := encodeDeleteMutation(db.scratch.get(), tbl.tableID, pk)
-		err := db.wal.writeRecord(recMutation, body)
-		db.scratch.put(body)
-		return err
+		journalAll = db.journalTxnBodies
 	}
-	return tbl.deleteWhereAll(match, journal)
+	return tbl.deleteWhereAll(match, encode, journalAll)
 }
