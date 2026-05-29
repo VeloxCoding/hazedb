@@ -161,6 +161,34 @@ func TestSelectOrderByLimit(t *testing.T) {
 	}
 }
 
+// LIMIT without ORDER BY takes the scan-and-stop path (stops at the limit,
+// projects under the lock). Order is undefined, so assert only counts.
+func TestSelectLimitNoOrderBy(t *testing.T) {
+	db := openMem(t)
+	for i := 0; i < 10; i++ {
+		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i+1), "u", 20+i)
+	}
+	cases := []struct {
+		sql  string
+		args []any
+		want int
+	}{
+		{"SELECT id FROM users LIMIT 3", nil, 3},          // stops early
+		{"SELECT id FROM users LIMIT 100", nil, 10},       // limit > rows → all
+		{"SELECT id FROM users LIMIT 0", nil, 0},          // empty
+		{"SELECT id FROM users WHERE age >= ? LIMIT 2", []any{20}, 2}, // WHERE + LIMIT
+	}
+	for _, c := range cases {
+		_, rows, err := db.Query(c.sql, c.args...)
+		if err != nil {
+			t.Fatalf("%q: %v", c.sql, err)
+		}
+		if len(rows) != c.want {
+			t.Errorf("%q: got %d rows, want %d", c.sql, len(rows), c.want)
+		}
+	}
+}
+
 func TestUpdate(t *testing.T) {
 	db := openMem(t)
 	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "alice", 30)

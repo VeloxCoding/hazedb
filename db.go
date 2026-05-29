@@ -166,12 +166,19 @@ func (db *DB) Query(sql string, args ...any) ([]string, []Row, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	if _, ok := pl.st.(*selectStmt); !ok {
+		return nil, nil, fmt.Errorf("fastsql: Query used with non-SELECT — use Exec instead")
+	}
+	if pl.pkLookup {
+		keyVal, err := evalLitOrParamAny(pl.pkSource, args)
+		if err != nil {
+			return nil, nil, err
+		}
+		return db.execSelectPK(pl, keyVal)
+	}
 	vargs, err := toValues(args)
 	if err != nil {
 		return nil, nil, err
-	}
-	if _, ok := pl.st.(*selectStmt); !ok {
-		return nil, nil, fmt.Errorf("fastsql: Query used with non-SELECT — use Exec instead")
 	}
 	return db.execSelect(pl, vargs)
 }
@@ -336,30 +343,38 @@ func (db *DB) applyMutation(rt *tableRT, op uint8, body []byte) error {
 func toValues(args []any) ([]Value, error) {
 	out := make([]Value, len(args))
 	for i, a := range args {
-		switch x := a.(type) {
-		case nil:
-			out[i] = Null()
-		case int:
-			out[i] = Int(int64(x))
-		case int64:
-			out[i] = Int(x)
-		case int32:
-			out[i] = Int(int64(x))
-		case string:
-			out[i] = Str(x)
-		case []byte:
-			out[i] = Bytes(x)
-		case bool:
-			out[i] = Bool(x)
-		case UUID:
-			out[i] = UUIDVal(x)
-		case Value:
-			out[i] = x
-		default:
-			return nil, fmt.Errorf("%w: unsupported arg type %T at %d", ErrTypeMismatch, a, i)
+		v, err := toValue(a, i)
+		if err != nil {
+			return nil, err
 		}
+		out[i] = v
 	}
 	return out, nil
+}
+
+func toValue(a any, index int) (Value, error) {
+	switch x := a.(type) {
+	case nil:
+		return Null(), nil
+	case int:
+		return Int(int64(x)), nil
+	case int64:
+		return Int(x), nil
+	case int32:
+		return Int(int64(x)), nil
+	case string:
+		return Str(x), nil
+	case []byte:
+		return Bytes(x), nil
+	case bool:
+		return Bool(x), nil
+	case UUID:
+		return UUIDVal(x), nil
+	case Value:
+		return x, nil
+	default:
+		return Value{}, fmt.Errorf("%w: unsupported arg type %T at %d", ErrTypeMismatch, a, index)
+	}
 }
 
 // scratchPool hands out small []byte buffers for WAL record encoding.

@@ -62,7 +62,8 @@ The remainder of this RFC describes the **target architecture** — the full des
 - **PartitionKey shard routing + table-wide `pkDirectory` + per-partition tail index** (M5) — partition-routed shards, `map[UUID]rowLocation` directory for table-wide PK uniqueness + O(1) `WHERE id = ?`, indexed `WHERE partkey = ?` scan
 - **Runtime catalog + first-class DDL** — `CREATE TABLE` / `DROP TABLE` over an `atomic.Pointer[catalog]` (RCU swap), durable append-only table IDs, catalog-version plan invalidation, WAL-logged and replayed before mutations; runtime tables are not second-class (insert/read benchmarks identical to predeclared)
 - The *Measured benchmarks* table predates M3/M4. M4 perf cost recorded in `bench/baseline_m4.txt`: the 16-byte UUID in every `Value` cell adds ~10-22% ns and +50-100 B/op vs M3; allocs flat-or-better. (An optional typed-struct wrapper could reclaim the `[]Value` overhead later, but is post-1.0 and not on the hot path.)
-- Read-path clone-under-lock: a PK/partition lookup clones the matched row while still holding the shard read lock, so a returned row never aliases storage a concurrent write could mutate. A projected `SELECT` (`getByPKProject`) clones only its projected columns under the lock — no full-row clone — so a point read is ~260 ns / 6 allocs (a 3-col table projecting 2); `SELECT *` still takes the full-row clone
+- Read-path clone-under-lock: a PK/partition lookup clones the matched row while still holding the shard read lock, so a returned row never aliases storage a concurrent write could mutate. A projected `SELECT` clones only its projected columns under the lock (no full-row clone), and a point-read `Query` evaluates just the PK argument from the raw args (no full `[]Value` conversion, no `evalCtx`) → ~198 ns / 4 allocs on a 3-col table projecting 2; `SELECT *` still takes the full-row clone
+- `LIMIT` without `ORDER BY` is applied during the scan (stop at the limit, project under the lock) instead of materialising the whole match set then truncating — fewer allocations and an early exit
 
 - **Transactions (M6, v1 scope)** — `db.Transaction(func(tx *Tx) error)` closure; `tx.Exec` only (write-only API), PK-pinned statements, single table per tx; staged overlay for read-your-writes; arithmetic `SET` evaluated under the commit locks; poison-on-first-error; one `TXN` WAL envelope (atomic across crash, replayed all-or-nothing). Commit locks only the shards the transaction touches, ascending (deadlock-safe against the all-shard acquirers).
 
@@ -766,6 +767,15 @@ hazedb compiles into your Go binary, keeps all data in RAM, writes a WAL for dur
 ---
 
 ## Changelog
+
+**rev. 12 (2026-05-29) — point-read fast path + LIMIT pushdown**
+
+Two read-path optimisations (originated as a Codex pass, reviewed and integrated):
+
+- **Point-read `Query` fast path.** For `WHERE id = ?`, `Query` now evaluates only the PK argument directly from the raw `args` (`evalLitOrParamAny` → `execSelectPK`) instead of converting every arg through `toValues` and building an `evalCtx`. Saves two allocations per point read. On a 3-col table projecting 2: ~260 ns → ~198 ns, 6 → 4 allocs, 376 → 232 B/op.
+- **`LIMIT` without `ORDER BY` pushdown.** The scan stops once `limit` rows are collected and projects each under the shard read lock, instead of materialising the full match set and truncating. Fewer allocations, early exit. The prealloc is capped (`min(limit, 1024)`) so a pathological huge `LIMIT` over a tiny result doesn't allocate a giant slice. New `TestSelectLimitNoOrderBy` pins the count semantics (exact limit, limit>rows, limit 0, WHERE+LIMIT).
+
+Refactors: `selectColNames`, `toValue` (single-arg), `evalCtx` passed by value. Full `-race` suite green.
 
 **rev. 11 (2026-05-29) — projected point reads clone only their columns**
 

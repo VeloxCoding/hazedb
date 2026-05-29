@@ -422,13 +422,7 @@ func truthy(v Value) bool {
 	return false
 }
 
-// execSelect runs the SELECT plan. Returns the columns and a slice of
-// projected rows. Rows are deep-cloned before returning so the caller
-// may mutate them without affecting storage.
-func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
-	st := pl.st.(*selectStmt)
-	tbl := pl.rt
-
+func selectColNames(st *selectStmt, tbl *tableRT) []string {
 	colNames := make([]string, 0, len(tbl.def.def.Columns))
 	if st.starAll {
 		for _, c := range tbl.def.def.Columns {
@@ -439,14 +433,64 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 			colNames = append(colNames, c.col)
 		}
 	}
+	return colNames
+}
 
-	ctx := &evalCtx{cols: tbl.def.colByName, args: args}
+func evalLitOrParamAny(e expr, args []any) (Value, error) {
+	switch x := e.(type) {
+	case *litValue:
+		return x.v, nil
+	case *paramRef:
+		if x.index < 0 || x.index >= len(args) {
+			return Value{}, fmt.Errorf("%w: param index %d out of range", ErrParamMismatch, x.index)
+		}
+		return toValue(args[x.index], x.index)
+	default:
+		return Value{}, fmt.Errorf("internal: expected literal or parameter, got %T", e)
+	}
+}
+
+func (db *DB) execSelectPK(pl *plan, keyVal Value) ([]string, []Row, error) {
+	st := pl.st.(*selectStmt)
+	tbl := pl.rt
+	colNames := selectColNames(st, tbl)
+	if keyVal.IsNull() {
+		return colNames, nil, nil
+	}
+	pk, err := coerceToUUID(keyVal)
+	if err != nil {
+		return nil, nil, err
+	}
+	if st.starAll {
+		r, ok := tbl.getByPK(pk)
+		if !ok {
+			return colNames, nil, nil
+		}
+		return colNames, []Row{r}, nil
+	}
+	pr, ok := tbl.getByPKProject(pk, pl.projOrdinals)
+	if !ok {
+		return colNames, nil, nil
+	}
+	return colNames, []Row{pr}, nil
+}
+
+// execSelect runs the SELECT plan. Returns the columns and a slice of
+// projected rows. Rows are deep-cloned before returning so the caller
+// may mutate them without affecting storage.
+func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
+	st := pl.st.(*selectStmt)
+	tbl := pl.rt
+
+	colNames := selectColNames(st, tbl)
+
+	ctx := evalCtx{cols: tbl.def.colByName, args: args}
 
 	// Fast path: PK equality — single map lookup, no scan, no sort.
 	// Project directly into the result row to skip the matched-list
 	// allocation and the full-row clone.
 	if pl.pkLookup {
-		keyVal, err := evalExpr(pl.pkSource, ctx)
+		keyVal, err := evalExpr(pl.pkSource, &ctx)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -477,7 +521,7 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 	// reads only that partition's rows; otherwise scan every shard.
 	scan := tbl.scanAll
 	if pl.partLookup {
-		pv, err := evalExpr(pl.partSource, ctx)
+		pv, err := evalExpr(pl.partSource, &ctx)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -490,11 +534,44 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 		}
 		scan = func(fn func(Row) bool) { tbl.scanPartition(part, fn) }
 	}
+
+	// No ORDER BY means LIMIT can be applied during the scan. Copy only rows
+	// that will be returned, while the shard read lock is still held.
+	if pl.orderOrdinal < 0 && st.limit >= 0 {
+		if st.limit == 0 {
+			return colNames, nil, nil
+		}
+		// Cap the prealloc: a huge LIMIT over a small result must not allocate a
+		// giant slice up front. The scan still stops at st.limit; append grows
+		// past the hint only if that many rows actually match.
+		capHint := st.limit
+		if capHint > 1024 {
+			capHint = 1024
+		}
+		out := make([]Row, 0, capHint)
+		scan(func(r Row) bool {
+			if st.where != nil {
+				ctx.row = r
+				v, err := evalExpr(st.where, &ctx)
+				if err != nil || !truthy(v) {
+					return true
+				}
+			}
+			if st.starAll {
+				out = append(out, r.Clone())
+			} else {
+				out = append(out, projectClone(r, pl.projOrdinals))
+			}
+			return len(out) < st.limit
+		})
+		return colNames, out, nil
+	}
+
 	var matched []Row
 	scan(func(r Row) bool {
 		if st.where != nil {
 			ctx.row = r
-			v, err := evalExpr(st.where, ctx)
+			v, err := evalExpr(st.where, &ctx)
 			if err != nil || !truthy(v) {
 				return true
 			}
