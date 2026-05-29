@@ -578,49 +578,57 @@ Cross-table transactions (debit one table, credit another) require locking shard
 
 ## Measured benchmarks
 
-> **Scope:** these measurements apply to the M1+M2 implementation — physical binary WAL, runtime SQL interpreter, integer PK. They do not reflect the target architecture (logical WAL, codegen, UUIDv7 PK). Benchmarks for the target architecture will be taken as milestones complete.
+> **Scope:** measured on the **M5 implementation** — UUIDv7 PK, partitioned tables, logical typed-mutation WAL, runtime SQL interpreter. The interpreter path still carries per-row overhead that the planned codegen step removes, so treat hazedb's single-thread numbers as a **floor** (they get faster, not slower). All on AMD Ryzen AI MAX+ 395 (32 threads), Docker, golang:1.22; medians of count≥3.
 
-All on AMD Ryzen AI MAX+ 395 (32 threads), Docker container, golang:1.22.
+### Point operations vs SQLite and Bolt (single-thread, fair 16-byte UUID keys)
 
-### Point-operation comparison (single-thread, stmt cache warm)
+All three stores key by the same 16-byte UUID, so the comparison is fair on key width.
 
-| Operation | hazedb | SQLite (cgo+database/sql) | Bolt (per-tx) |
-|---|---:|---:|---:|
-| INSERT | 0.58 µs | 10.5 µs | 1 443 µs* |
-| SELECT WHERE pk=? | 0.22 µs | 2.65 µs | 0.52 µs |
-| UPDATE WHERE pk=? | 0.19 µs | 2.26 µs | 1 411 µs* |
-| DELETE WHERE pk=? | 0.40 µs | 10.7 µs | 1 422 µs* |
+| Operation | hazedb (mem) | hazedb (+WAL) | SQLite (cgo) | Bolt |
+|---|---:|---:|---:|---:|
+| INSERT | **0.52 µs** | 0.62 µs | 20 µs | 1 500 µs † |
+| SELECT WHERE id=? | **0.25 µs** | — | 2.8 µs | 0.52 µs |
+| UPDATE WHERE id=? | **0.20 µs** | — | 2.5 µs | 1 400 µs † |
+| DELETE WHERE id=? | **0.39 µs** | — | 20–49 µs | 4 000 µs † |
 
-*Bolt: fsync per transaction — unfair for writes. Reads are fair.
+Reads are the like-for-like comparison: hazedb ~11× SQLite and ~2× Bolt. † Writes are **not** like-for-like on durability — hazedb-mem is in-memory, Bolt fsyncs per transaction, SQLite syncs per its journal mode; read the write rows as "memory vs durable-to-disk", not a pure engine race. Allocations/op: hazedb 2–6, SQLite 9–25, Bolt 49–66.
 
-### Parallel scaling (32 goroutines)
+### Parallel scaling (32 cores)
 
-| Operation | Single | Parallel | Speedup |
-|---|---:|---:|---:|
-| SELECT WHERE pk=? | 0.22 µs | 0.08 µs | 2.8× |
-| INSERT (memory) | 0.58 µs | 0.08 µs | 7.0× |
-| INSERT (WAL) | 0.58 µs | 0.41 µs | 1.4× ← walMu bottleneck |
-| UPDATE WHERE pk=? | 0.19 µs | 0.07 µs | 2.7× |
+| Operation | Single | Parallel |
+|---|---:|---:|
+| SELECT WHERE id=? | 0.25 µs | **0.09 µs** |
+| INSERT (memory) | 0.52 µs | **0.10 µs** |
+
+### Durability ladder — INSERT (relative; overlay FS, not a real-disk fsync SLA)
+
+| Mode | INSERT |
+|---|---:|
+| flush only (default ticker) | 0.62 µs |
+| flush + fsync on ticker (`WALSync`) | 0.95 µs |
+| flush + fsync every write (`WALSyncPerWrite`) | ~1 650 µs |
+
+### Indexed partition scan vs full-table scan
+
+`SELECT … WHERE partitionkey=? ORDER BY … LIMIT n` reads only the matching partition.
+
+| Scan | Time | Allocs |
+|---|---:|---:|
+| One partition (~100 rows) of a 10k-row table | **31 µs** | 128 |
+| Full unindexed range scan of 10k rows | 770 µs | 4 932 |
+
+~25× faster, and the gap widens with table size (O(partition) vs O(table)).
 
 ### Mixed workload — 4 writers + 16 readers, 2 s, WAL on
 
 | | Value |
 |---|---:|
-| Insert throughput | 690k/sec |
-| Read throughput | 7.64M/sec |
-| SELECT WHERE pk=? p50 | 0.71 µs |
-| SELECT WHERE pk=? p99 | **10.7 µs** |
-| SELECT WHERE pk=? p99.9 | 242 µs |
-
-### Tail-scan (spike, hand-written, messages table)
-
-| Workload | p50 | p99 | p99.9 |
-|---|---:|---:|---:|
-| Uniform (8 writers + 24 scanners) | 0.80 µs | 11 µs | 54 µs |
-| Skewed 90% → 10% threads | 0.85 µs | 19 µs | 67 µs |
-| Skewed 99% → 10% threads | 0.71 µs | 16 µs | 56 µs |
-
-**p99 < 50 µs holds under all skew levels tested.**
+| Insert throughput | 0.72 M/sec |
+| Read throughput | 7.0 M/sec |
+| SELECT WHERE id=? p50 | 0.70 µs |
+| SELECT WHERE id=? p90 | 1.3 µs |
+| SELECT WHERE id=? p99 | **17 µs** |
+| SELECT WHERE id=? p99.9 | 259 µs |
 
 ---
 
