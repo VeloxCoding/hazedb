@@ -252,8 +252,13 @@ func (p *parser) parseDelete() (*deleteStmt, error) {
 //   or_expr  = and_expr (OR and_expr)*
 //   and_expr = not_expr (AND not_expr)*
 //   not_expr = NOT not_expr | cmp_expr
-//   cmp_expr = atom (( = | != | <> | < | <= | > | >= | IS [NOT] NULL ) atom)?
+//   cmp_expr = add_expr (( = | != | <> | < | <= | > | >= | IS [NOT] NULL ) add_expr)?
+//   add_expr = mul_expr ((+ | -) mul_expr)*
+//   mul_expr = atom (* atom)*
 //   atom     = '(' or_expr ')' | column | literal | parameter
+//
+// Arithmetic (+, -, *) binds tighter than comparison. It is what makes
+// `UPDATE ... SET col = col - ?` work; it is also accepted in WHERE.
 
 func (p *parser) parseExpr() (expr, error) {
 	return p.parseOr()
@@ -304,14 +309,14 @@ func (p *parser) parseNot() (expr, error) {
 }
 
 func (p *parser) parseCmp() (expr, error) {
-	lhs, err := p.parseAtom()
+	lhs, err := p.parseAddSub()
 	if err != nil {
 		return nil, err
 	}
 	switch p.peek().kind {
 	case tkEq, tkNeq, tkLt, tkLte, tkGt, tkGte:
 		op := p.advance().kind
-		rhs, err := p.parseAtom()
+		rhs, err := p.parseAddSub()
 		if err != nil {
 			return nil, err
 		}
@@ -327,6 +332,38 @@ func (p *parser) parseCmp() (expr, error) {
 			return nil, err
 		}
 		return &isNullExpr{e: lhs, not: not}, nil
+	}
+	return lhs, nil
+}
+
+func (p *parser) parseAddSub() (expr, error) {
+	lhs, err := p.parseMulDiv()
+	if err != nil {
+		return nil, err
+	}
+	for p.peek().kind == tkPlus || p.peek().kind == tkMinus {
+		op := p.advance().kind
+		rhs, err := p.parseMulDiv()
+		if err != nil {
+			return nil, err
+		}
+		lhs = &binOp{op: op, lhs: lhs, rhs: rhs}
+	}
+	return lhs, nil
+}
+
+func (p *parser) parseMulDiv() (expr, error) {
+	lhs, err := p.parseAtom()
+	if err != nil {
+		return nil, err
+	}
+	for p.peek().kind == tkStar {
+		p.advance()
+		rhs, err := p.parseAtom()
+		if err != nil {
+			return nil, err
+		}
+		lhs = &binOp{op: tkStar, lhs: lhs, rhs: rhs}
 	}
 	return lhs, nil
 }

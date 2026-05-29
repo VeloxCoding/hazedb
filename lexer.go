@@ -20,6 +20,8 @@ const (
 	tkRParen
 	tkSemi
 	tkStar
+	tkPlus       // +
+	tkMinus      // -
 	tkEq         // =
 	tkNeq        // != or <>
 	tkLt
@@ -122,6 +124,16 @@ func tokenize(s string) ([]token, error) {
 			continue
 		case '*':
 			out = append(out, token{kind: tkStar, pos: i})
+			i++
+			continue
+		case '+':
+			out = append(out, token{kind: tkPlus, pos: i})
+			i++
+			continue
+		case '-':
+			// A '--' comment was already handled above; a lone '-' is the
+			// subtraction operator (arithmetic SET, e.g. col - ?).
+			out = append(out, token{kind: tkMinus, pos: i})
 			i++
 			continue
 		case '?':

@@ -64,6 +64,10 @@ type plan struct {
 	insertOrdinals []int
 	// UPDATE SET column ordinals matching the sets list.
 	updateOrdinals []int
+	// setRowDependent is true when any SET right-hand side references a
+	// column (e.g. col = col - ?), so the value must be evaluated per row
+	// instead of once up front.
+	setRowDependent bool
 
 	// pkLookup is true when the WHERE clause is a single equality of
 	// the PK column against a literal or parameter. The executor can
@@ -139,6 +143,14 @@ func (db *DB) plan(st stmt) (*plan, error) {
 				return nil, fmt.Errorf("%w: %q.%q", ErrPKUpdate, tname, a.col)
 			}
 			pl.updateOrdinals = append(pl.updateOrdinals, ord)
+			// Validate the right-hand side (catches unknown columns in
+			// arithmetic like SET x = bogus - ?) and note row dependence.
+			if err := validateExpr(a.val, rt); err != nil {
+				return nil, err
+			}
+			if exprRefsColumn(a.val) {
+				pl.setRowDependent = true
+			}
 		}
 		if err := validateExpr(s.where, rt); err != nil {
 			return nil, err
@@ -190,6 +202,22 @@ func isLitOrParam(e expr) bool {
 	switch e.(type) {
 	case *litValue, *paramRef:
 		return true
+	}
+	return false
+}
+
+// exprRefsColumn reports whether e reads any column (vs only literals and
+// parameters). Used to decide if a SET value must be evaluated per row.
+func exprRefsColumn(e expr) bool {
+	switch x := e.(type) {
+	case *colRef:
+		return true
+	case *binOp:
+		return exprRefsColumn(x.lhs) || exprRefsColumn(x.rhs)
+	case *notExpr:
+		return exprRefsColumn(x.e)
+	case *isNullExpr:
+		return exprRefsColumn(x.e)
 	}
 	return false
 }
@@ -276,6 +304,28 @@ func evalExpr(e expr, ctx *evalCtx) (Value, error) {
 			return Value{}, err
 		}
 		switch x.op {
+		case tkPlus, tkMinus, tkStar:
+			// Integer arithmetic. NULL propagates (any null operand -> null),
+			// matching SQL semantics. int64 wraps on overflow.
+			if lv.IsNull() || rv.IsNull() {
+				return Null(), nil
+			}
+			a, err := lv.AsInt()
+			if err != nil {
+				return Value{}, err
+			}
+			b, err := rv.AsInt()
+			if err != nil {
+				return Value{}, err
+			}
+			switch x.op {
+			case tkPlus:
+				return Int(a + b), nil
+			case tkMinus:
+				return Int(a - b), nil
+			default:
+				return Int(a * b), nil
+			}
 		case tkEq:
 			return Bool(lv.Equal(rv)), nil
 		case tkNeq:
@@ -496,20 +546,35 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		return truthy(v)
 	}
 
-	// Pre-evaluate SET values that don't depend on the row (literals
-	// and parameters). Re-evaluating per row would be wasteful since
-	// v1 SET expressions don't reference other columns.
-	setVals := make([]Value, len(st.sets))
-	for i, a := range st.sets {
-		v, err := evalExpr(a.val, &evalCtx{args: args})
-		if err != nil {
+	// SET right-hand sides evaluate into a reused buffer. evalSet validates
+	// each result against its column. For constant SETs (no column ref) we
+	// evaluate once up front and hand back the same buffer for every row
+	// (allocation-free hot path); for row-dependent SETs (col = col - ?) we
+	// re-evaluate per row with the row in context.
+	buf := make([]Value, len(st.sets))
+	cols := tbl.def.def.Columns
+	evalSet := func(r Row) ([]Value, error) {
+		ctx.row = r
+		for i, a := range st.sets {
+			v, err := evalExpr(a.val, ctx)
+			if err != nil {
+				return nil, err
+			}
+			if err := validateValue(cols[pl.updateOrdinals[i]], v); err != nil {
+				return nil, err
+			}
+			buf[i] = v
+		}
+		return buf, nil
+	}
+	var compute func(Row) ([]Value, error)
+	if pl.setRowDependent {
+		compute = evalSet
+	} else {
+		if _, err := evalSet(nil); err != nil { // constant: evaluate once
 			return 0, err
 		}
-		col := tbl.def.def.Columns[pl.updateOrdinals[i]]
-		if err := validateValue(col, v); err != nil {
-			return 0, err
-		}
-		setVals[i] = v
+		compute = func(Row) ([]Value, error) { return buf, nil }
 	}
 
 	// Fast path: PK equality — single shard, journal-before-apply under that
@@ -532,7 +597,7 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 				return werr
 			}
 		}
-		ok, err := tbl.updateByPKJournaled(keyVal.AsString(), pl.updateOrdinals, setVals, journal)
+		ok, err := tbl.updateByPKJournaled(keyVal.AsString(), pl.updateOrdinals, compute, journal)
 		if err != nil {
 			return 0, err
 		}
@@ -542,18 +607,9 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		return 0, nil
 	}
 
-	// Multi-shard predicate path: build each post-update image without
-	// mutating storage, journal it, then store it — all under every shard
-	// lock (updateWhereAll). The clone here is acceptable: bulk predicate
-	// updates are not the hot path, and correctness requires journaling the
-	// image before it is applied.
-	newImage := func(r Row) Row {
-		nr := r.Clone()
-		for i, ord := range pl.updateOrdinals {
-			nr[ord] = setVals[i]
-		}
-		return nr
-	}
+	// Multi-shard predicate path: updateWhereAll computes each row's new
+	// values, clones, journals the image, then stores it — all under every
+	// shard lock.
 	journal := func(nr Row) error {
 		if db.wal == nil {
 			return nil
@@ -563,7 +619,7 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		db.scratch.put(body)
 		return err
 	}
-	return tbl.updateWhereAll(match, newImage, journal)
+	return tbl.updateWhereAll(match, pl.updateOrdinals, compute, journal)
 }
 
 // execDelete dispatches on the WHERE shape, mirroring execUpdate. A

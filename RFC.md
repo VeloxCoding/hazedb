@@ -36,22 +36,22 @@ directly into a Caddy module, FrankenPHP extension, or standalone Go binary.
 
 The remainder of this RFC describes the **target architecture** — the full design hazedb is being built toward. Not all of it is implemented. This section is the single source of truth on what runs today vs what is planned.
 
-### Running today (M1 + M2)
+### Running today (M1 + M2 + M3)
 
 - Sharded RWMutex storage: `[]Value` typed rows, append-only arena, tombstone deletes, per-shard `pk` map keyed by string
-- Physical binary WAL: length-prefixed records with CRC32, 64 KB bufio buffer, tail-recovery on open
-- Runtime SQL interpreter: parse → plan → execute for `SELECT` / `INSERT` / `UPDATE` / `DELETE`
+- Physical binary WAL: length-prefixed records with CRC32, 64 KB bufio buffer, tail-recovery on open (length-bounds-checked against bytes-remaining)
+- Write pipeline enforces validate → WAL append → apply, all under the relevant shard lock(s); multi-shard predicate writes hold every shard lock so WAL order == in-memory order
+- WAL durability modes (M3): background flush ticker (`WALFlushInterval`), `WALSync` (ticker fsync, keyed off a `dirtySinceSync` flag), `WALSyncPerWrite` (fsync every record), and a sticky WAL error state that blocks further writes
+- Runtime SQL interpreter: parse → plan → execute for `SELECT` / `INSERT` / `UPDATE` / `DELETE`, including arithmetic in `SET` and `WHERE` (`col +/-/* ?`) (M3)
 - Statement cache (`sync.Map`) and PK fast path (`WHERE pk = ?` → direct shard map lookup)
 - Integer or string PK — **UUIDv7 enforcement is not yet implemented**
-- All benchmarks in *Measured benchmarks* were taken on this implementation
+- The *Measured benchmarks* table predates the M3 work; M3 left the memory-only hot paths flat and added ~5% to Insert_WAL (append now under the shard lock)
 
-### Designed, not yet implemented (M3+)
+### Designed, not yet implemented (M4+)
 
 | Feature | Milestone |
 |---|---|
-| WAL ticker flush + fsync modes (`WALFlushInterval`, `WALSync`, `WALSyncPerWrite`) | M3 |
-| Arithmetic expressions in `SET` clauses | M3 |
-| UUIDv7-enforced PK with auto-generation | M3 |
+| UUIDv7-enforced PK with auto-generation + `[16]byte` keys + `uint64` rowID | M4 |
 | Logical WAL — replaces physical binary WAL | M4 |
 | PartitionKey shard routing + table-wide `pkDirectory` | M4 |
 | Compiled query API: `go generate` → `*Queries` typed methods + strict mode | M4 |
@@ -278,7 +278,7 @@ Four practical modes:
 
 | Mode | Process-crash loss window | Power-loss guarantee |
 |---|---|---|
-| buffered only (`WALFlushInterval: 0`) | until next manual `FlushWAL()` | none |
+| buffered only (`WALFlushInterval < 0`) | until next manual `FlushWAL()` | none |
 | **flush every N s** *(default, `WALFlushInterval: 1s`)* | ≤ flush interval | none |
 | flush + sync every N s (`WALSync: true`) | ≤ flush interval | ≤ flush interval |
 | flush + sync per write (`WALSyncPerWrite: true`) | none | strongest — flush then fsync after every WAL write, under WAL lock |
@@ -290,7 +290,7 @@ The ticker-based fsync is amortised — one `f.Sync()` per ticker fire regardles
 Configured via `Options`:
 
 ```go
-WALFlushInterval time.Duration  // default 1s; 0 = manual FlushWAL() only
+WALFlushInterval time.Duration  // 0 = safe 1s default; <0 = manual FlushWAL() only
 WALSync          bool           // flush then fsync after each ticker fire; default false
 WALSyncPerWrite  bool           // flush then fsync after every individual WAL write; default false
 ```
@@ -299,7 +299,7 @@ A background goroutine started in `Open()` wakes every `WALFlushInterval` and, *
 
 **The sync decision uses a `dirtySinceSync` flag, not `bw.Buffered()`.** It is tempting to skip work when `bw.Buffered() == 0`, but that is wrong for the fsync decision: `bufio.Writer` auto-flushes to the underlying fd whenever its buffer fills, so a large or bursty write can have already pushed data into the kernel page cache while leaving `Buffered() == 0`. If the ticker keyed `f.Sync()` off `Buffered() > 0`, that auto-flushed data would never be synced until some later write happened to leave the buffer non-empty at a tick — so after a quiet period the newest records sit unsynced indefinitely, breaking the "≤ flush interval" power-loss guarantee of `WALSync` mode. Track a `dirtySinceSync bool` set on every `bw.Write` (and on any auto-flush) and cleared only after a successful `f.Sync()`. The ticker flushes if the buffer is non-empty, and syncs if `dirtySinceSync` — independent conditions.
 
-**`WALFlushInterval <= 0` starts no ticker.** `0` means manual-only (`FlushWAL()` is the only flush path), so the goroutine must not be started at all — `time.NewTicker(0)` panics ("non-positive interval"). `Open()` guards on the interval and only spawns the ticker goroutine when `WALFlushInterval > 0`.
+**Interval semantics (implemented).** `WALFlushInterval == 0` selects the safe **1s default** (a zero-value `Options` should not silently disable durability flushing); a **negative** value is manual-only (`FlushWAL()` is the only flush path) and starts no goroutine. `startTicker` only spawns the goroutine for a strictly positive interval, so `time.NewTicker` never sees a non-positive value. (This resolves the earlier draft's contradiction between "default 1s" and "0 = manual": 0 is the default, negative is manual.) The ticker is started **after** WAL replay so it never races the replay reader on the shared file handle, and `close()` is idempotent (`sync.Once`).
 
 **WAL error handling:** if `bw.Write` (the record append), `bw.Flush()`, or `f.Sync()` returns an error — whether from the execution pipeline, the background goroutine, or an inline `WALSyncPerWrite` call — the DB must enter a permanent error state. **The append error matters as much as flush/sync:** `bw.Write` can fail (notably when it triggers an auto-flush of a full buffer whose underlying write to the fd fails), and step 6 of the execution pipeline must check it. If the WAL append fails, the pipeline must abort *before* step 7 — the in-memory mutation is never applied — otherwise RAM holds a change that is not (and may never be) in the WAL, diverging from any replay. In the error state all subsequent write calls return the WAL error immediately without touching in-memory state. Read-only queries may continue (subject to the usual async loss window: already-applied-but-unsynced writes remain visible and will be lost on restart if they were never synced). The error state is not recoverable without closing and reopening the DB (which triggers WAL replay from the last successfully flushed record).
 
@@ -663,7 +663,7 @@ github.com/VeloxCoding/hazedb   (package hazedb)
 |---|---|---|
 | **M1** | Single-table store, WAL, tail-recovery, CI bench gate | ✅ done |
 | **M2** | SQL parser + interpreter (SELECT/INSERT/UPDATE/DELETE) | ✅ done |
-| **M3** | WAL ticker flush + optional fsync (`WALFlushInterval`, `WALSync`); arithmetic expressions in `SET` clauses (`col = col + ?`, `col = col - ?`, `col = col * ?`) | open |
+| **M3** | WAL ticker flush + optional fsync (`WALFlushInterval`, `WALSync`, `WALSyncPerWrite`, sticky error state); arithmetic expressions in `SET`/`WHERE` (`col + ?`, `col - ?`, `col * ?`) | ✅ done |
 | **M4** | Codegen: `go generate` reads `.sql` query files → `*Queries` struct with one typed method per query + pre-compiled plan; strict mode (`StrictMode` option); generated cgo wrappers per query for FrankenPHP; generic `hazedb_sql` fallback | open |
 | **M5** | Single-table transactions: `db.Transaction(func)` Go API + staged overlay (read-your-writes) + atomic `TXN` WAL envelope + torn-envelope discard on replay | open |
 | **M6** | Multi-table support, secondary indexes on non-PK columns (note: `pkDirectory` for partitioned tables is a primary-key directory, not a secondary index — it is required from M4 onward, not deferred here) | open |

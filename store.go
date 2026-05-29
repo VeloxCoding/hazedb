@@ -122,13 +122,14 @@ func (t *table) insertJournaled(row Row, journal func() error) error {
 }
 
 // updateByPKJournaled is the live PK-pinned update: under the one shard
-// lock it applies the SET values, journals the new row image, and on a WAL
-// failure reverts — so a row is never applied without a durable record.
+// lock it computes the SET values (compute sees the current row, so
+// arithmetic like col = col - ? works), journals the new row image, and on a
+// WAL failure reverts — so a row is never applied without a durable record.
 // The hot path allocates nothing: the pre-update values of the touched
 // columns are saved in a small stack array (heap only if >8 columns are
 // set, which is rare). journal may be nil (memory-only), in which case the
 // values are simply applied with no save/revert overhead.
-func (t *table) updateByPKJournaled(pk string, ords []int, vals []Value, journal func(Row) error) (bool, error) {
+func (t *table) updateByPKJournaled(pk string, ords []int, compute func(Row) ([]Value, error), journal func(Row) error) (bool, error) {
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -137,6 +138,10 @@ func (t *table) updateByPKJournaled(pk string, ords []int, vals []Value, journal
 		return false, nil
 	}
 	r := s.rows[rowID]
+	vals, err := compute(r)
+	if err != nil {
+		return false, err
+	}
 	if journal == nil {
 		for i, ord := range ords {
 			r[ord] = vals[i]
@@ -265,13 +270,13 @@ func (t *table) unlockAllShards() {
 // replays to a different state. Holding all locks makes the journal appends
 // and the in-memory applies one serialisable unit.
 //
-// For each matched row: newImage(r) builds the post-update row image WITHOUT
-// touching storage; journal(image) appends the WAL record; only then is the
-// image stored. So a WAL-append failure aborts before the row is applied
-// (returns the count applied so far plus the error). match and newImage run
-// under the locks and must be pure (no store calls). newImage must not
-// mutate r in place — it is journaled before it is stored.
-func (t *table) updateWhereAll(match func(Row) bool, newImage func(Row) Row, journal func(Row) error) (int, error) {
+// For each matched row: compute(r) yields the new SET values (evaluated
+// against the live row, so arithmetic works); a clone of r with those values
+// applied is journaled, and only then stored. So a WAL-append failure aborts
+// before the row is applied (returns the count applied so far plus the
+// error). match and compute run under the locks and must be pure (no store
+// calls). The clone ensures the row is journaled before storage observes it.
+func (t *table) updateWhereAll(match func(Row) bool, ords []int, compute func(Row) ([]Value, error), journal func(Row) error) (int, error) {
 	t.lockAllShards()
 	defer t.unlockAllShards()
 	count := 0
@@ -284,7 +289,14 @@ func (t *table) updateWhereAll(match func(Row) bool, newImage func(Row) Row, jou
 			if !match(r) {
 				continue
 			}
-			nr := newImage(r)
+			vals, err := compute(r)
+			if err != nil {
+				return count, err
+			}
+			nr := r.Clone()
+			for k, ord := range ords {
+				nr[ord] = vals[k]
+			}
 			if journal != nil {
 				if err := journal(nr); err != nil {
 					return count, err
