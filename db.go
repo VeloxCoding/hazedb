@@ -1,6 +1,7 @@
 package hazedb
 
 import (
+	"encoding/binary"
 	"fmt"
 	"sync"
 	"time"
@@ -205,19 +206,47 @@ func (db *DB) replayWAL(w *wal) error {
 			}
 			return rt.insert(row)
 		case opUpdate:
-			row, err := decodeRow(rec.Body)
+			// op-body: pk-cell | nsets:1 | (ordinal:2 | cell) × nsets.
+			b := rec.Body
+			pk, n, err := decodeCell(b)
 			if err != nil {
 				return err
 			}
-			pk := row[rt.def.pkOrdinal].U
-			if !rt.update(pk, func(_ Row) Row { return row }) {
-				// Replay may see an UPDATE before the INSERT if the WAL was
-				// rewound mid-write; treat as fresh insert.
-				return rt.insert(row)
+			b = b[n:]
+			if len(b) < 1 {
+				return fmt.Errorf("%w: update missing nsets", ErrWALCorrupt)
+			}
+			nsets := int(b[0])
+			b = b[1:]
+			ords := make([]int, nsets)
+			vals := make([]Value, nsets)
+			for i := 0; i < nsets; i++ {
+				if len(b) < 2 {
+					return fmt.Errorf("%w: update ordinal truncated", ErrWALCorrupt)
+				}
+				ords[i] = int(binary.LittleEndian.Uint16(b[0:2]))
+				b = b[2:]
+				v, m, err := decodeCell(b)
+				if err != nil {
+					return err
+				}
+				vals[i] = v
+				b = b[m:]
+			}
+			// A logical update can only re-apply onto an existing row; in a
+			// consistent WAL the insert always precedes it. An absent target
+			// is corruption (the delta cannot reconstruct a full row).
+			if !rt.update(pk.U, func(r Row) Row {
+				for i := range ords {
+					r[ords[i]] = vals[i]
+				}
+				return r
+			}) {
+				return fmt.Errorf("%w: update for absent pk during replay", ErrWALCorrupt)
 			}
 			return nil
 		case opDelete:
-			pk, err := decodePK(rec.Body)
+			pk, _, err := decodeCell(rec.Body)
 			if err != nil {
 				return err
 			}

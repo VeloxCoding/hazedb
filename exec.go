@@ -550,8 +550,8 @@ func (db *DB) execInsert(pl *plan, args []Value) (int, error) {
 		if db.wal == nil {
 			return nil
 		}
-		body := encodeRow(db.scratch.get(), row)
-		werr := db.wal.writeRecord(opInsert, tbl.tableID, body)
+		body := encodeInsertMutation(db.scratch.get(), tbl.tableID, row)
+		werr := db.wal.writeRecord(recMutation, body)
 		db.scratch.put(body)
 		return werr
 	})
@@ -629,8 +629,8 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		var journal func(Row) error
 		if db.wal != nil {
 			journal = func(nr Row) error {
-				body := encodeRow(db.scratch.get(), nr)
-				werr := db.wal.writeRecord(opUpdate, tbl.tableID, body)
+				body := encodeUpdateMutation(db.scratch.get(), tbl.tableID, nr[tbl.def.pkOrdinal], pl.updateOrdinals, nr)
+				werr := db.wal.writeRecord(recMutation, body)
 				db.scratch.put(body)
 				return werr
 			}
@@ -656,8 +656,8 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		if db.wal == nil {
 			return nil
 		}
-		body := encodeRow(db.scratch.get(), nr)
-		err := db.wal.writeRecord(opUpdate, tbl.tableID, body)
+		body := encodeUpdateMutation(db.scratch.get(), tbl.tableID, nr[tbl.def.pkOrdinal], pl.updateOrdinals, nr)
+		err := db.wal.writeRecord(recMutation, body)
 		db.scratch.put(body)
 		return err
 	}
@@ -693,8 +693,8 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 		var journal func() error
 		if db.wal != nil {
 			journal = func() error {
-				body := encodePK(db.scratch.get(), pkVal)
-				werr := db.wal.writeRecord(opDelete, tbl.tableID, body)
+				body := encodeDeleteMutation(db.scratch.get(), tbl.tableID, pkVal)
+				werr := db.wal.writeRecord(recMutation, body)
 				db.scratch.put(body)
 				return werr
 			}
@@ -726,8 +726,8 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 		if db.wal == nil {
 			return nil
 		}
-		body := encodePK(db.scratch.get(), pk)
-		err := db.wal.writeRecord(opDelete, tbl.tableID, body)
+		body := encodeDeleteMutation(db.scratch.get(), tbl.tableID, pk)
+		err := db.wal.writeRecord(recMutation, body)
 		db.scratch.put(body)
 		return err
 	}
