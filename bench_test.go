@@ -122,6 +122,19 @@ func BenchmarkSelectByPK_Mem(b *testing.B) {
 	}
 }
 
+func BenchmarkSelectByPKRow_Mem(b *testing.B) {
+	const N = 10000
+	db := newBenchDB(b, N)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _, err := db.QueryRow("SELECT name, age FROM users WHERE id = ?", tid(i%N))
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkSelectRange_Mem(b *testing.B) {
 	const N = 10000
 	db := newBenchDB(b, N)

@@ -184,6 +184,40 @@ func (db *DB) Query(sql string, args ...any) ([]string, []Row, error) {
 	return db.execSelect(pl, vargs)
 }
 
+// QueryRow runs a SELECT expected to yield a single row and returns the first
+// matching row, or a nil Row if there is none — without allocating the []Row
+// result slice that Query needs. For a PK-pinned query (WHERE id = ?) it goes
+// straight through the point-read path (the common case); for an unpinned query
+// it returns the first row of the scan, so constrain such queries with LIMIT 1
+// to avoid scanning more rows than needed. The returned row is deep-cloned, as
+// with Query.
+func (db *DB) QueryRow(sql string, args ...any) ([]string, Row, error) {
+	cat := db.cat.Load()
+	pl, err := db.prepare(sql, cat)
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, ok := pl.st.(*selectStmt); !ok {
+		return nil, nil, fmt.Errorf("fastsql: QueryRow used with non-SELECT — use Exec instead")
+	}
+	if pl.pkLookup {
+		keyVal, err := evalLitOrParamAny(pl.pkSource, args)
+		if err != nil {
+			return nil, nil, err
+		}
+		return db.execSelectPKOne(pl, keyVal)
+	}
+	vargs, err := toValues(args)
+	if err != nil {
+		return nil, nil, err
+	}
+	cols, rows, err := db.execSelect(pl, vargs)
+	if err != nil || len(rows) == 0 {
+		return cols, nil, err
+	}
+	return cols, rows[0], nil
+}
+
 // prepare returns a plan bound against cat. A cached plan is reused only if it
 // was bound against the same catalog version; otherwise it is re-parsed and
 // re-bound so it never references a table that has since changed.

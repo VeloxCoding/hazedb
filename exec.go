@@ -478,6 +478,27 @@ func (db *DB) execSelectPK(pl *plan, keyVal Value) ([]string, []Row, error) {
 	return colNames, []Row{pr}, nil
 }
 
+// execSelectPKOne is execSelectPK for QueryRow: it returns the single matched
+// row directly (nil if none), skipping the []Row result slice Query allocates.
+func (db *DB) execSelectPKOne(pl *plan, keyVal Value) ([]string, Row, error) {
+	st := pl.st.(*selectStmt)
+	tbl := pl.rt
+	colNames := pl.colNames
+	if keyVal.IsNull() {
+		return colNames, nil, nil
+	}
+	pk, err := coerceToUUID(keyVal)
+	if err != nil {
+		return nil, nil, err
+	}
+	if st.starAll {
+		r, _ := tbl.getByPK(pk)
+		return colNames, r, nil
+	}
+	pr, _ := tbl.getByPKProject(pk, pl.projOrdinals)
+	return colNames, pr, nil
+}
+
 // execSelect runs the SELECT plan. Returns the columns and a slice of
 // projected rows. Rows are deep-cloned before returning so the caller
 // may mutate them without affecting storage.

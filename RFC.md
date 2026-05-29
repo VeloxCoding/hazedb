@@ -2,7 +2,7 @@
 
 **Status:** M1–M6 implemented (store, SQL, WAL durability, UUIDv7 PK, partitioning, runtime catalog + `CREATE`/`DROP TABLE`, single-table transactions); M7–M8 open. See *Implementation status* for what is running vs designed.  
 **Module:** `github.com/VeloxCoding/hazedb`  
-**Updated:** 2026-05-29 (rev. 18 — bounded top-N for ORDER BY + LIMIT scans)
+**Updated:** 2026-05-29 (rev. 19 — QueryRow single-row read, no result-slice alloc)
 
 ---
 
@@ -357,9 +357,15 @@ WHERE supports: `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IS N
 rows, err := db.Query("SELECT body FROM messages WHERE id = ?", id)
 // rows is []Row; the plan for this SQL string is parsed once and cached
 
+_, row, err := db.QueryRow("SELECT body FROM messages WHERE id = ?", id)
+// row is a single Row (nil if no match) — no []Row result slice is allocated;
+// for a PK-pinned lookup this is the leanest read (2 allocs: the row + arg box)
+
 n, err := db.Exec("INSERT INTO messages (id, body) VALUES (?, ?)", id, "hello")
 // n is rows affected
 ```
+
+`QueryRow` returns the first matching row without the `[]Row` slice `Query` allocates; for a PK lookup it goes straight through the point-read path. For an unpinned query it returns the first row of the scan, so add `LIMIT 1`.
 
 ### Prepared plans and the catalog version
 
@@ -586,7 +592,7 @@ All four stores key by the same 16-byte UUID, so the comparison is fair on key w
 | UPDATE WHERE id=? | **0.15 µs** | — | 1.0 µs | 2.5 µs | 1 400 µs † |
 | DELETE WHERE id=? | **0.34 µs** | — | — | 20–49 µs | 4 000 µs † |
 
-**Even RAM-vs-RAM, hazedb leads:** vs SQLite `:memory:` it is ~12× on reads, ~3.5× on inserts, ~6× on updates. Allocations per op are now 1 (update/delete), 2 (insert), 3 (point read), 4 (range scan).
+**Even RAM-vs-RAM, hazedb leads:** vs SQLite `:memory:` it is ~12× on reads, ~3.5× on inserts, ~6× on updates. Allocations per op are now 1 (update/delete), 2 (insert), 3 (point read via `Query`, or **2 via `QueryRow`** — no result slice), 4 (range scan).
 
 **What the gap is — and isn't.** It is mostly the Go *access layer*, and it is **not** the cgo crossing. Evidence: swapping the cgo driver for **pure-Go SQLite** (`modernc.org/sqlite`, no cgo, same `database/sql`) made it *slower*, not faster — read **4.3 µs**, insert **14.9 µs**, update **3.4 µs** vs the cgo build's 2.0 / 1.7 / 1.0 µs. So removing cgo costs speed; the crossing was never the bottleneck. What a Go program actually pays to use SQLite is the `database/sql` layer (reflection, interface conversions, ~25 allocations per read vs hazedb's 3) on top of a general-purpose engine. hazedb is faster because it skips that layer — typed rows returned in-process, no SQL dispatch per call — which is the project thesis, **not** a claim that its lookup beats SQLite's B-tree. † Write rows for SQLite-disk and Bolt are **not** like-for-like on durability (they fsync/journal to disk; hazedb-mem does not). Allocations/op: hazedb 1–4, SQLite 9–26, Bolt 49–66.
 

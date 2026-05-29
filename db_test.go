@@ -211,6 +211,38 @@ func TestSelectLimitRowsDoNotAppendAlias(t *testing.T) {
 // A []byte passed to INSERT/UPDATE must be cloned at the write boundary, so a
 // caller that mutates its slice after the call cannot corrupt stored state
 // (which would also diverge from the already-written WAL record).
+// QueryRow returns a single row (nil if none) without the []Row result slice.
+func TestQueryRow(t *testing.T) {
+	db := openMem(t)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "alice", 30)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(2), "bob", 40)
+
+	cols, row, err := db.QueryRow("SELECT name, age FROM users WHERE id = ?", tid(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cols) != 2 || row == nil || row[0].S != "alice" || row[1].I != 30 {
+		t.Fatalf("PK hit: cols=%v row=%v", cols, row)
+	}
+
+	if _, row, err := db.QueryRow("SELECT name FROM users WHERE id = ?", tid(999)); err != nil || row != nil {
+		t.Fatalf("PK miss should give nil row: row=%v err=%v", row, err)
+	}
+
+	if _, row, _ := db.QueryRow("SELECT * FROM users WHERE id = ?", tid(2)); row == nil || row[0].U != tid(2) || row[1].S != "bob" {
+		t.Fatalf("SELECT *: %v", row)
+	}
+
+	// Non-PK: first matching row.
+	if _, row, err := db.QueryRow("SELECT name FROM users WHERE age > ? LIMIT 1", 25); err != nil || row == nil {
+		t.Fatalf("non-PK: row=%v err=%v", row, err)
+	}
+
+	if _, _, err := db.QueryRow("INSERT INTO users (id) VALUES (?)", tid(3)); err == nil {
+		t.Fatal("QueryRow on non-SELECT should error")
+	}
+}
+
 func TestWriteClonesByteInput(t *testing.T) {
 	db := openEmpty(t)
 	db.Exec("CREATE TABLE b (id uuid primary key, data bytes)")
