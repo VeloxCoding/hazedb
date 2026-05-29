@@ -1,0 +1,10 @@
+# Local AI overlay files — may contain secrets, never commit
+/CLAUDE.md
+/CLAUDE_*.md
+.claude/
+
+# Go build/test artifacts
+*.test
+*.prof
+*.out
+/bin/

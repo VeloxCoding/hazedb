@@ -1,0 +1,73 @@
+package hazedb
+
+// AST node types for the SELECT/INSERT/UPDATE/DELETE subset.
+
+type stmt interface{ isStmt() }
+
+type selectStmt struct {
+	cols     []resultCol // empty means *
+	starAll  bool
+	table    string
+	where    expr
+	orderCol string // empty means no ORDER BY
+	orderDesc bool
+	limit    int    // -1 means no LIMIT
+}
+
+type insertStmt struct {
+	table string
+	cols  []string
+	vals  []expr
+}
+
+type updateStmt struct {
+	table  string
+	sets   []setAssign
+	where  expr
+}
+
+type deleteStmt struct {
+	table string
+	where expr
+}
+
+type setAssign struct {
+	col string
+	val expr
+}
+
+type resultCol struct {
+	col string
+}
+
+func (*selectStmt) isStmt() {}
+func (*insertStmt) isStmt() {}
+func (*updateStmt) isStmt() {}
+func (*deleteStmt) isStmt() {}
+
+// Expression AST. Kept tiny for v1: column refs, literals, parameters,
+// comparison ops, AND/OR/NOT, IS NULL, IS NOT NULL.
+type expr interface{ isExpr() }
+
+type colRef struct{ name string }
+type litValue struct{ v Value }
+type paramRef struct{ index int } // zero-based into args slice
+
+type binOp struct {
+	op       tokenKind // tkEq, tkNeq, tkLt, tkLte, tkGt, tkGte, tkAnd, tkOr
+	lhs, rhs expr
+}
+
+type notExpr struct{ e expr }
+
+type isNullExpr struct {
+	e   expr
+	not bool
+}
+
+func (*colRef) isExpr()     {}
+func (*litValue) isExpr()   {}
+func (*paramRef) isExpr()   {}
+func (*binOp) isExpr()      {}
+func (*notExpr) isExpr()    {}
+func (*isNullExpr) isExpr() {}
