@@ -3,6 +3,7 @@ package hazedb
 import (
 	"errors"
 	"fmt"
+	"unicode/utf8"
 )
 
 // ColumnType is the declared type of a column. Generic v1 supports a
@@ -145,6 +146,11 @@ func validateValue(c ColumnDef, v Value) error {
 	case TypeString:
 		if v.Kind != KindString {
 			return fmt.Errorf("column %q expects STRING, got %v", c.Name, v.Kind)
+		}
+		// STRING is text: valid UTF-8 only. Arbitrary bytes belong in a BYTES
+		// column. Checked on the write path; reads never re-validate.
+		if !utf8.ValidString(v.Str()) {
+			return fmt.Errorf("column %q expects valid UTF-8", c.Name)
 		}
 	case TypeBytes:
 		if v.Kind != KindBytes {
