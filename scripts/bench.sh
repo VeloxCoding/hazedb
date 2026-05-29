@@ -5,7 +5,7 @@
 #
 #   docker run --rm -v "$PWD":/src \
 #     -v hazedb-gocache:/root/.cache/go-build -v hazedb-gomod:/go/pkg/mod \
-#     -w /src golang:1.22 scripts/bench.sh [name-regex] [count]
+#     -w /src golang:1.25 scripts/bench.sh [name-regex] [count]
 #
 # Examples:
 #   scripts/bench.sh                         # all benchmarks, count=6
