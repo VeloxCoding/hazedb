@@ -85,10 +85,10 @@ func TestInsertAndSelect(t *testing.T) {
 		t.Fatalf("rows: got %d", len(rows))
 	}
 	sort.Slice(rows, func(i, j int) bool { c, _ := rows[i][0].Compare(rows[j][0]); return c < 0 })
-	if rows[0][1].S != "alice" || rows[0][2].I != 30 {
+	if rows[0][1].Str() != "alice" || rows[0][2].Int() != 30 {
 		t.Errorf("row 0: %v", rows[0])
 	}
-	if rows[1][1].S != "bob" || rows[1][2].I != 25 {
+	if rows[1][1].Str() != "bob" || rows[1][2].Int() != 25 {
 		t.Errorf("row 1: %v", rows[1])
 	}
 }
@@ -103,7 +103,7 @@ func TestSelectStar(t *testing.T) {
 	if len(cols) != 4 {
 		t.Fatalf("cols: %v", cols)
 	}
-	if len(rows) != 1 || rows[0][0].U != tid(1) || rows[0][1].S != "alice" {
+	if len(rows) != 1 || rows[0][0].UUID() != tid(1) || rows[0][1].Str() != "alice" {
 		t.Errorf("row: %v", rows[0])
 	}
 }
@@ -126,7 +126,7 @@ func TestSelectWhere(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
-	if len(rows) != 1 || rows[0][0].U != tid(1) {
+	if len(rows) != 1 || rows[0][0].UUID() != tid(1) {
 		t.Errorf("expected alice row, got %v", rows)
 	}
 
@@ -151,12 +151,12 @@ func TestSelectOrderByLimit(t *testing.T) {
 	if len(rows) != 2 {
 		t.Fatalf("limit: %d", len(rows))
 	}
-	if rows[0][1].I != 35 || rows[1][1].I != 30 {
+	if rows[0][1].Int() != 35 || rows[1][1].Int() != 30 {
 		t.Errorf("order desc: got %v", rows)
 	}
 
 	_, rows, _ = db.Query("SELECT id, age FROM users ORDER BY age LIMIT 1")
-	if len(rows) != 1 || rows[0][1].I != 20 {
+	if len(rows) != 1 || rows[0][1].Int() != 20 {
 		t.Errorf("order asc default: %v", rows)
 	}
 }
@@ -221,7 +221,7 @@ func TestQueryRow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cols) != 2 || row == nil || row[0].S != "alice" || row[1].I != 30 {
+	if len(cols) != 2 || row == nil || row[0].Str() != "alice" || row[1].Int() != 30 {
 		t.Fatalf("PK hit: cols=%v row=%v", cols, row)
 	}
 
@@ -229,7 +229,7 @@ func TestQueryRow(t *testing.T) {
 		t.Fatalf("PK miss should give nil row: row=%v err=%v", row, err)
 	}
 
-	if _, row, _ := db.QueryRow("SELECT * FROM users WHERE id = ?", tid(2)); row == nil || row[0].U != tid(2) || row[1].S != "bob" {
+	if _, row, _ := db.QueryRow("SELECT * FROM users WHERE id = ?", tid(2)); row == nil || row[0].UUID() != tid(2) || row[1].Str() != "bob" {
 		t.Fatalf("SELECT *: %v", row)
 	}
 
@@ -254,16 +254,16 @@ func TestWriteClonesByteInput(t *testing.T) {
 	}
 	buf[0] = 'X' // mutate the caller slice after the insert
 	_, rows, _ := db.Query("SELECT data FROM b WHERE id = ?", id)
-	if len(rows) != 1 || string(rows[0][0].B) != "hello" {
-		t.Fatalf("insert aliased caller slice: got %q", rows[0][0].B)
+	if len(rows) != 1 || string(rows[0][0].Bytes()) != "hello" {
+		t.Fatalf("insert aliased caller slice: got %q", rows[0][0].Bytes())
 	}
 
 	ubuf := []byte("world")
 	db.Exec("UPDATE b SET data = ? WHERE id = ?", ubuf, id)
 	ubuf[0] = 'Y' // mutate after the update
 	_, rows, _ = db.Query("SELECT data FROM b WHERE id = ?", id)
-	if string(rows[0][0].B) != "world" {
-		t.Fatalf("update aliased caller slice: got %q", rows[0][0].B)
+	if string(rows[0][0].Bytes()) != "world" {
+		t.Fatalf("update aliased caller slice: got %q", rows[0][0].Bytes())
 	}
 }
 
@@ -288,14 +288,14 @@ func TestReplayUpdateRejectsBadMutate(t *testing.T) {
 	}
 	// Row untouched, still found under the original PK.
 	_, rows, _ := db.Query("SELECT name FROM users WHERE id = ?", id)
-	if len(rows) != 1 || rows[0][0].S != "alice" {
+	if len(rows) != 1 || rows[0][0].Str() != "alice" {
 		t.Fatalf("rejected update corrupted the row: %v", rows)
 	}
 	// A legitimate non-PK mutate still applies.
 	if !rt.update(id, func(r Row) Row { r[ageOrd] = Int(31); return r }) {
 		t.Fatal("legitimate non-PK update was rejected")
 	}
-	if _, rows, _ := db.Query("SELECT age FROM users WHERE id = ?", id); rows[0][0].I != 31 {
+	if _, rows, _ := db.Query("SELECT age FROM users WHERE id = ?", id); rows[0][0].Int() != 31 {
 		t.Fatalf("legitimate update did not apply: %v", rows)
 	}
 }
@@ -313,7 +313,7 @@ func TestUpdate(t *testing.T) {
 		t.Errorf("n=%d", n)
 	}
 	_, rows, _ := db.Query("SELECT age FROM users WHERE id = ?", tid(1))
-	if rows[0][0].I != 31 {
+	if rows[0][0].Int() != 31 {
 		t.Errorf("got %v", rows[0][0])
 	}
 
@@ -376,7 +376,7 @@ func TestNullHandling(t *testing.T) {
 
 	db.Exec("UPDATE users SET active = ? WHERE id = ?", true, tid(1))
 	_, rows, _ = db.Query("SELECT active FROM users WHERE active IS NOT NULL")
-	if len(rows) != 1 || rows[0][0].I != 1 {
+	if len(rows) != 1 || rows[0][0].Int() != 1 {
 		t.Errorf("IS NOT NULL: %v", rows)
 	}
 }
@@ -397,7 +397,7 @@ func TestWALRoundTrip(t *testing.T) {
 	}
 	defer db2.Close()
 	_, rows, _ := db2.Query("SELECT id, age FROM users")
-	if len(rows) != 1 || rows[0][0].U != tid(1) || rows[0][1].I != 31 {
+	if len(rows) != 1 || rows[0][0].UUID() != tid(1) || rows[0][1].Int() != 31 {
 		t.Errorf("after replay: got %v", rows)
 	}
 }

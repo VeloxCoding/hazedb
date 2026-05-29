@@ -7,9 +7,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	bolt "go.etcd.io/bbolt"
 	_ "github.com/mattn/go-sqlite3" // cgo driver: "sqlite3"
-	_ "modernc.org/sqlite"          // pure-Go driver: "sqlite"
+	bolt "go.etcd.io/bbolt"
+	_ "modernc.org/sqlite" // pure-Go driver: "sqlite"
 )
 
 // These benchmarks compare FASTSQL's interpreter path to two pure
@@ -112,7 +112,7 @@ func BenchmarkSelectByPK_SQLiteMem(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var name string
 		var age int64
-		stmt.QueryRow(key16(i % compareN)).Scan(&name, &age)
+		stmt.QueryRow(key16(i%compareN)).Scan(&name, &age)
 	}
 }
 
@@ -177,7 +177,7 @@ func BenchmarkSelectByPK_SQLitePureMem(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var name string
 		var age int64
-		stmt.QueryRow(key16(i % compareN)).Scan(&name, &age)
+		stmt.QueryRow(key16(i%compareN)).Scan(&name, &age)
 	}
 }
 
@@ -283,7 +283,7 @@ func BenchmarkSelectByPK_SQLite(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var name string
 		var age int64
-		stmt.QueryRow(key16(i % compareN)).Scan(&name, &age)
+		stmt.QueryRow(key16(i%compareN)).Scan(&name, &age)
 	}
 }
 

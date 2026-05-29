@@ -66,9 +66,9 @@ func TestUUIDParseRejectsGarbage(t *testing.T) {
 	bad := []string{
 		"", "not-a-uuid",
 		"0190f7e0-1234-7abc-8def-0123456789ab-extra",
-		"0190f7e012347abc8def0123456789ab",       // no hyphens
-		"0190f7e0-1234-7abc-8def-0123456789aZ",   // non-hex
-		"0190f7e0_1234_7abc_8def_0123456789ab",   // wrong separators
+		"0190f7e012347abc8def0123456789ab",     // no hyphens
+		"0190f7e0-1234-7abc-8def-0123456789aZ", // non-hex
+		"0190f7e0_1234_7abc_8def_0123456789ab", // wrong separators
 	}
 	for _, s := range bad {
 		if _, err := ParseUUID(s); err == nil {

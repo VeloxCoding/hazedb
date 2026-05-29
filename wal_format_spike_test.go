@@ -53,16 +53,18 @@ func putVal(buf []byte, v Value) []byte {
 	switch v.Kind {
 	case KindInt, KindBool:
 		var u [8]byte
-		binary.LittleEndian.PutUint64(u[:], uint64(v.I))
+		binary.LittleEndian.PutUint64(u[:], uint64(v.Int()))
 		buf = append(buf, u[:]...)
 	case KindString:
-		buf = putU32(buf, uint32(len(v.S)))
-		buf = append(buf, v.S...)
+		buf = putU32(buf, uint32(len(v.Str())))
+		buf = append(buf, v.Str()...)
 	case KindBytes:
-		buf = putU32(buf, uint32(len(v.B)))
-		buf = append(buf, v.B...)
+		b := v.Bytes()
+		buf = putU32(buf, uint32(len(b)))
+		buf = append(buf, b...)
 	case KindUUID:
-		buf = append(buf, v.U[:]...)
+		u := v.UUID()
+		buf = append(buf, u[:]...)
 	case KindNull:
 		// kind byte only
 	}
@@ -75,23 +77,26 @@ func getVal(b []byte) (Value, int) {
 	switch kind {
 	case KindInt, KindBool:
 		v := int64(binary.LittleEndian.Uint64(b[off : off+8]))
-		return Value{Kind: kind, I: v}, off + 8
+		if kind == KindBool {
+			return Bool(v == 1), off + 8
+		}
+		return Int(v), off + 8
 	case KindString:
 		ln := int(binary.LittleEndian.Uint32(b[off : off+4]))
 		off += 4
-		return Value{Kind: kind, S: string(b[off : off+ln])}, off + ln
+		return Str(string(b[off : off+ln])), off + ln
 	case KindBytes:
 		ln := int(binary.LittleEndian.Uint32(b[off : off+4]))
 		off += 4
 		cp := make([]byte, ln)
 		copy(cp, b[off:off+ln])
-		return Value{Kind: kind, B: cp}, off + ln
+		return Bytes(cp), off + ln
 	case KindUUID:
 		var u UUID
 		copy(u[:], b[off:off+16])
-		return Value{Kind: kind, U: u}, off + 16
+		return UUIDVal(u), off + 16
 	case KindNull:
-		return Value{Kind: KindNull}, off
+		return Null(), off
 	}
 	return Value{}, off
 }
@@ -353,7 +358,7 @@ func BenchmarkWALReplay_Insert_SQLStr(b *testing.B) {
 
 func applyPhysUpd(db *DB, rec []byte) {
 	row, _ := getRow(rec[3:])
-	pk := row[0].U
+	pk := row[0].UUID()
 	db.cat.Load().byName["messages"].update(pk, func(_ Row) Row { return row })
 }
 
@@ -372,7 +377,7 @@ func applyTypedUpd(db *DB, rec []byte) {
 		off += k
 		vals[i] = v
 	}
-	db.cat.Load().byName["messages"].update(pk.U, func(r Row) Row {
+	db.cat.Load().byName["messages"].update(pk.UUID(), func(r Row) Row {
 		for i := range ords {
 			r[ords[i]] = vals[i]
 		}
@@ -411,7 +416,7 @@ func BenchmarkWALReplay_UpdNarrow_SQLStr(b *testing.B) {
 
 func applyDirectDel(db *DB, rec []byte) {
 	pk, _ := getVal(rec[3:]) // skip op+tableID
-	db.cat.Load().byName["messages"].deleteByPK(pk.U)
+	db.cat.Load().byName["messages"].deleteByPK(pk.UUID())
 }
 
 func applySQLDel(db *DB, rec []byte) {

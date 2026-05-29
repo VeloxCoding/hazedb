@@ -96,7 +96,7 @@ func (t *table) insert(row Row) error {
 	if t.pkDir != nil {
 		return t.insertPartitioned(row, nil)
 	}
-	pk := row[t.def.pkOrdinal].U
+	pk := row[t.def.pkOrdinal].UUID()
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -128,7 +128,7 @@ func (t *table) insertJournaled(row Row, journal func() error) error {
 	if t.pkDir != nil {
 		return t.insertPartitioned(row, journal)
 	}
-	pk := row[t.def.pkOrdinal].U
+	pk := row[t.def.pkOrdinal].UUID()
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -349,7 +349,7 @@ func (t *table) update(pk UUID, mutate func(Row) Row) bool {
 		return false
 	}
 	nr := mutate(s.rows[rowID])
-	if nr == nil || nr[t.def.pkOrdinal].U != pk {
+	if nr == nil || nr[t.def.pkOrdinal].UUID() != pk {
 		return false
 	}
 	s.rows[rowID] = nr
@@ -470,7 +470,7 @@ func (t *table) deleteWhereAll(match func(Row) bool, encode func(pk Value) []byt
 			if r == nil || !match(r) {
 				continue
 			}
-			pending = append(pending, pendingDelete{s, j, r[pkOrd].U})
+			pending = append(pending, pendingDelete{s, j, r[pkOrd].UUID()})
 			if encode != nil {
 				bodies = append(bodies, encode(r[pkOrd]))
 			}

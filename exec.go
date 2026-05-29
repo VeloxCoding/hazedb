@@ -263,9 +263,9 @@ func isLitOrParam(e expr) bool {
 func coerceToUUID(v Value) (UUID, error) {
 	switch v.Kind {
 	case KindUUID:
-		return v.U, nil
+		return v.UUID(), nil
 	case KindString:
-		return ParseUUID(v.S)
+		return ParseUUID(v.Str())
 	}
 	return UUID{}, fmt.Errorf("%w: PK lookup expects UUID, got kind %d", ErrTypeMismatch, v.Kind)
 }
@@ -431,10 +431,10 @@ func evalExpr(e expr, ctx *evalCtx) (Value, error) {
 
 func truthy(v Value) bool {
 	if v.Kind == KindBool {
-		return v.I == 1
+		return v.Int() == 1
 	}
 	if v.Kind == KindInt {
-		return v.I != 0
+		return v.Int() != 0
 	}
 	return false
 }
@@ -822,7 +822,7 @@ func (db *DB) buildInsertRow(pl *plan, args []Value) (Row, error) {
 		// API-boundary coercion: a string destined for a UUID column is
 		// parsed into a UUID — storage only ever sees [16]byte.
 		if col.Type == TypeUUID && v.Kind == KindString {
-			u, perr := ParseUUID(v.S)
+			u, perr := ParseUUID(v.Str())
 			if perr != nil {
 				return nil, perr
 			}

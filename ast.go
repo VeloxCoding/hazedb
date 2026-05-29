@@ -5,13 +5,13 @@ package hazedb
 type stmt interface{ isStmt() }
 
 type selectStmt struct {
-	cols     []resultCol // empty means *
-	starAll  bool
-	table    string
-	where    expr
-	orderCol string // empty means no ORDER BY
+	cols      []resultCol // empty means *
+	starAll   bool
+	table     string
+	where     expr
+	orderCol  string // empty means no ORDER BY
 	orderDesc bool
-	limit    int    // -1 means no LIMIT
+	limit     int // -1 means no LIMIT
 }
 
 type insertStmt struct {
@@ -21,9 +21,9 @@ type insertStmt struct {
 }
 
 type updateStmt struct {
-	table  string
-	sets   []setAssign
-	where  expr
+	table string
+	sets  []setAssign
+	where expr
 }
 
 type deleteStmt struct {

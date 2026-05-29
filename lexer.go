@@ -14,16 +14,16 @@ const (
 	tkIdent
 	tkInt
 	tkString
-	tkParam      // ?
+	tkParam // ?
 	tkComma
 	tkLParen
 	tkRParen
 	tkSemi
 	tkStar
-	tkPlus       // +
-	tkMinus      // -
-	tkEq         // =
-	tkNeq        // != or <>
+	tkPlus  // +
+	tkMinus // -
+	tkEq    // =
+	tkNeq   // != or <>
 	tkLt
 	tkLte
 	tkGt
@@ -93,7 +93,7 @@ type token struct {
 
 // tokenize splits s into tokens. Whitespace and SQL comments
 // (-- to end-of-line) are skipped. Identifiers are lowercased; string
-// literals are single-quoted with '' as an escaped quote.
+// literals are single-quoted with ” as an escaped quote.
 func tokenize(s string) ([]token, error) {
 	var out []token
 	i := 0

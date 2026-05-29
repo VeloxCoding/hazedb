@@ -1,16 +1,13 @@
-// Package fastsql is a memory-resident SQL store for embedded Go
-// applications with single-process deployment and latency-sensitive
-// reads. See FASTSQL_v1_RFC.md and FASTSQL_PITCH.md at the repo root.
-//
-// This is the v1 first-cut: generic Value-based execution.
-// Codegen for typed-Go hot paths arrives in M3.
+// Package hazedb is a memory-resident SQL store for embedded Go applications
+// with single-process deployment and latency-sensitive reads.
 package hazedb
 
 import (
-	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"strconv"
+	"unsafe"
 )
 
 // ValueKind discriminates the union below.
@@ -25,39 +22,94 @@ const (
 	KindUUID
 )
 
-// Value is the runtime cell type. Generic and slow-ish vs a typed struct;
-// appropriate for the interpreter path (codegen replaces []Value with typed
-// structs per table on the eventual hot path).
+// Value is the runtime cell type: a packed 32-byte tagged union (versus the
+// 72 bytes a struct with separate int/string/bytes/uuid fields would take).
+// Kind is the public tag; the payload is overlapped across two words and a
+// pointer, since a cell is only ever one kind at a time:
 //
-//   - KindInt:    I holds the value
-//   - KindString: S holds the value
-//   - KindBytes:  B holds the value (avoid allocs by reusing slices upstream)
-//   - KindBool:   I == 0 false, I == 1 true
-//   - KindUUID:   U holds the 16 bytes (no heap alloc; usable as a map key)
-//   - KindNull:   all zero
+//   - KindInt / KindBool : the value lives in w0
+//   - KindUUID           : the 16 bytes live inline in (w0, w1), big-endian so
+//                          comparing the words equals byte-lexicographic order
+//   - KindString/KindBytes: ptr is the backing-data pointer, w0 the length
+//   - KindNull           : all zero
 //
-// U is a fixed [16]byte rather than living in B so a UUID PK is a comparable,
-// allocation-free map key. It costs 16 bytes on every cell; if that proves to
-// matter it can be packed into two uint64 — measure first.
+// ptr is ALWAYS nil or a real Go pointer (a string/[]byte backing) — never a
+// reinterpreted non-pointer — so the garbage collector scans it correctly and
+// keeps the backing alive. Read payloads through the typed accessors below;
+// never touch the private fields.
 type Value struct {
 	Kind ValueKind
-	I    int64
-	S    string
-	B    []byte
-	U    UUID
+	w0   uint64
+	w1   uint64
+	ptr  unsafe.Pointer
 }
 
-func Int(v int64) Value    { return Value{Kind: KindInt, I: v} }
-func Str(v string) Value   { return Value{Kind: KindString, S: v} }
-func Bytes(v []byte) Value { return Value{Kind: KindBytes, B: v} }
-func Bool(v bool) Value    { return Value{Kind: KindBool, I: boolToInt(v)} }
-func UUIDVal(u UUID) Value { return Value{Kind: KindUUID, U: u} }
-func Null() Value          { return Value{Kind: KindNull} }
-func boolToInt(b bool) int64 {
+func Int(v int64) Value { return Value{Kind: KindInt, w0: uint64(v)} }
+func Bool(v bool) Value { return Value{Kind: KindBool, w0: boolToWord(v)} }
+
+func Str(v string) Value {
+	if len(v) == 0 {
+		return Value{Kind: KindString}
+	}
+	return Value{Kind: KindString, w0: uint64(len(v)), ptr: unsafe.Pointer(unsafe.StringData(v))}
+}
+
+func Bytes(v []byte) Value {
+	if len(v) == 0 {
+		return Value{Kind: KindBytes}
+	}
+	return Value{Kind: KindBytes, w0: uint64(len(v)), ptr: unsafe.Pointer(&v[0])}
+}
+
+func UUIDVal(u UUID) Value {
+	return Value{
+		Kind: KindUUID,
+		w0:   binary.BigEndian.Uint64(u[0:8]),
+		w1:   binary.BigEndian.Uint64(u[8:16]),
+	}
+}
+
+func Null() Value { return Value{Kind: KindNull} }
+
+func boolToWord(b bool) uint64 {
 	if b {
 		return 1
 	}
 	return 0
+}
+
+// Typed accessors — read a cell's payload for a known Kind (checked first, or
+// known from the schema). These are the stable read API; the field layout is
+// private/packed, so always read through these.
+//
+//   - Int   — KindInt value, or a KindBool as 0/1
+//   - Bool  — KindBool value
+//   - Str   — KindString value (shares the backing; immutable, so safe)
+//   - Bytes — KindBytes value (the live backing slice; clone before escaping a lock)
+//   - UUID  — KindUUID value
+
+func (v Value) Int() int64 { return int64(v.w0) }
+func (v Value) Bool() bool { return v.w0 == 1 }
+
+func (v Value) Str() string {
+	if v.ptr == nil {
+		return ""
+	}
+	return unsafe.String((*byte)(v.ptr), int(v.w0))
+}
+
+func (v Value) Bytes() []byte {
+	if v.ptr == nil {
+		return nil
+	}
+	return unsafe.Slice((*byte)(v.ptr), int(v.w0))
+}
+
+func (v Value) UUID() UUID {
+	var u UUID
+	binary.BigEndian.PutUint64(u[0:8], v.w0)
+	binary.BigEndian.PutUint64(u[8:16], v.w1)
+	return u
 }
 
 func (v Value) IsNull() bool { return v.Kind == KindNull }
@@ -69,15 +121,16 @@ func (v Value) AsString() string {
 	case KindNull:
 		return ""
 	case KindInt:
-		return strconv.FormatInt(v.I, 10)
+		return strconv.FormatInt(v.Int(), 10)
 	case KindString:
-		return v.S
+		return v.Str()
 	case KindBytes:
-		return string(v.B)
+		return string(v.Bytes())
 	case KindUUID:
-		return v.U.String()
+		u := v.UUID()
+		return u.String()
 	case KindBool:
-		if v.I == 1 {
+		if v.Bool() {
 			return "true"
 		}
 		return "false"
@@ -90,9 +143,9 @@ func (v Value) AsString() string {
 func (v Value) AsInt() (int64, error) {
 	switch v.Kind {
 	case KindInt, KindBool:
-		return v.I, nil
+		return v.Int(), nil
 	case KindString:
-		return strconv.ParseInt(v.S, 10, 64)
+		return strconv.ParseInt(v.Str(), 10, 64)
 	case KindNull:
 		return 0, errors.New("null cannot be coerced to int")
 	}
@@ -106,27 +159,32 @@ func (v Value) Compare(o Value) (int, bool) {
 	if v.Kind == KindNull || o.Kind == KindNull {
 		return 0, false
 	}
-	if v.Kind == KindInt && o.Kind == KindInt {
+	if (v.Kind == KindInt && o.Kind == KindInt) || (v.Kind == KindBool && o.Kind == KindBool) {
+		a, b := v.Int(), o.Int()
 		switch {
-		case v.I < o.I:
+		case a < b:
 			return -1, true
-		case v.I > o.I:
-			return 1, true
-		}
-		return 0, true
-	}
-	if v.Kind == KindBool && o.Kind == KindBool {
-		switch {
-		case v.I < o.I:
-			return -1, true
-		case v.I > o.I:
+		case a > b:
 			return 1, true
 		}
 		return 0, true
 	}
 	if v.Kind == KindUUID && o.Kind == KindUUID {
-		// Byte order == creation-time order for UUIDv7. No alloc.
-		return bytes.Compare(v.U[:], o.U[:]), true
+		// UUID is stored big-endian in (w0, w1), so unsigned word comparison
+		// equals byte-lexicographic order (= creation order for UUIDv7). No alloc.
+		switch {
+		case v.w0 != o.w0:
+			if v.w0 < o.w0 {
+				return -1, true
+			}
+			return 1, true
+		case v.w1 != o.w1:
+			if v.w1 < o.w1 {
+				return -1, true
+			}
+			return 1, true
+		}
+		return 0, true
 	}
 	// Fall through to string compare. Lexicographic is correct for strings;
 	// for mixed int/string callers should not rely on the result.
@@ -151,13 +209,13 @@ func (v Value) Equal(o Value) bool {
 	case KindNull:
 		return true
 	case KindInt, KindBool:
-		return v.I == o.I
+		return v.w0 == o.w0
 	case KindString:
-		return v.S == o.S
+		return v.Str() == o.Str()
 	case KindBytes:
-		return string(v.B) == string(o.B)
+		return string(v.Bytes()) == string(o.Bytes())
 	case KindUUID:
-		return v.U == o.U
+		return v.w0 == o.w0 && v.w1 == o.w1
 	}
 	return false
 }
@@ -171,16 +229,18 @@ type Row []Value
 func (r Row) Clone() Row {
 	c := make(Row, len(r))
 	copy(c, r)
-	// Strings and ints are value-copied. Bytes need a fresh slice.
 	for i := range c {
 		c[i] = cloneValue(c[i])
 	}
 	return c
 }
 
+// cloneValue returns a Value that aliases nothing mutable: a KindBytes payload
+// is deep-copied; strings are immutable and ints/uuids are inline, so they are
+// copied by value.
 func cloneValue(v Value) Value {
-	if v.Kind == KindBytes && v.B != nil {
-		v.B = cloneBytes(v.B)
+	if v.Kind == KindBytes && v.ptr != nil {
+		return Bytes(cloneBytes(v.Bytes()))
 	}
 	return v
 }

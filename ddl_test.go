@@ -31,7 +31,7 @@ func TestRuntimeCreateTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0][0].S != "alice" || rows[0][1].I != 30 {
+	if len(rows) != 1 || rows[0][0].Str() != "alice" || rows[0][1].Int() != 30 {
 		t.Fatalf("got %v", rows)
 	}
 	if _, err := db.Exec("CREATE TABLE users (id uuid primary key)"); !errors.Is(err, ErrTableExists) {
@@ -64,7 +64,7 @@ func TestRuntimeCreateSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("table gone after restart: %v", err)
 	}
-	if len(rows) != 1 || rows[0][0].I != 7 {
+	if len(rows) != 1 || rows[0][0].Int() != 7 {
 		t.Fatalf("data lost after restart: %v", rows)
 	}
 }
@@ -113,7 +113,7 @@ func TestRuntimePartitionedTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 2 || rows[0][0].I != 4 || rows[1][0].I != 3 {
+	if len(rows) != 2 || rows[0][0].Int() != 4 || rows[1][0].Int() != 3 {
 		t.Fatalf("partition scan on runtime table: %v", rows)
 	}
 	if _, err := db.Exec("UPDATE msgs SET seq = ? WHERE thread = ?", 0, th); err == nil {
@@ -134,7 +134,7 @@ func TestPlanRebindAcrossCreate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0][0].I != 1 {
+	if len(rows) != 1 || rows[0][0].Int() != 1 {
 		t.Fatalf("plan rebind after CREATE failed: %v", rows)
 	}
 }
@@ -196,7 +196,7 @@ func TestRuntimeRecreateTable(t *testing.T) {
 	if _, rows, _ := db.Query("SELECT n FROM t WHERE id = ?", a); len(rows) != 0 {
 		t.Fatalf("pre-drop row resurrected: %v", rows)
 	}
-	if _, rows, _ := db.Query("SELECT n FROM t WHERE id = ?", b); len(rows) != 1 || rows[0][0].I != 2 {
+	if _, rows, _ := db.Query("SELECT n FROM t WHERE id = ?", b); len(rows) != 1 || rows[0][0].Int() != 2 {
 		t.Fatalf("post-recreate row wrong: %v", rows)
 	}
 	if err := db.Close(); err != nil {
@@ -211,7 +211,7 @@ func TestRuntimeRecreateTable(t *testing.T) {
 	if _, rows, _ := db2.Query("SELECT n FROM t WHERE id = ?", a); len(rows) != 0 {
 		t.Fatalf("pre-drop row resurrected after restart: %v", rows)
 	}
-	if _, rows, err := db2.Query("SELECT n FROM t WHERE id = ?", b); err != nil || len(rows) != 1 || rows[0][0].I != 2 {
+	if _, rows, err := db2.Query("SELECT n FROM t WHERE id = ?", b); err != nil || len(rows) != 1 || rows[0][0].Int() != 2 {
 		t.Fatalf("recreate did not survive restart: rows=%v err=%v", rows, err)
 	}
 }
@@ -262,7 +262,7 @@ func TestRuntimePartitionedSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 2 || rows[0][0].I != 4 || rows[1][0].I != 3 {
+	if len(rows) != 2 || rows[0][0].Int() != 4 || rows[1][0].Int() != 3 {
 		t.Fatalf("partition scan broken after restart: %v", rows)
 	}
 }

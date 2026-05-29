@@ -48,7 +48,7 @@ func TestTxnEnvelopeReplays(t *testing.T) {
 		n  int64
 	}{{a, 10}, {b, 20}} {
 		_, rows, err := db2.Query("SELECT n FROM t WHERE id = ?", tc.id)
-		if err != nil || len(rows) != 1 || rows[0][0].I != tc.n {
+		if err != nil || len(rows) != 1 || rows[0][0].Int() != tc.n {
 			t.Fatalf("txn member not replayed: id=%v rows=%v err=%v", tc.id, rows, err)
 		}
 	}
@@ -195,7 +195,7 @@ func acct(t *testing.T, db *DB, id UUID) int64 {
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("read balance %v: rows=%v err=%v", id, rows, err)
 	}
-	return rows[0][0].I
+	return rows[0][0].Int()
 }
 
 // The canonical transfer: two arithmetic UPDATEs on different rows commit
@@ -298,7 +298,7 @@ func TestTransactionReadYourWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, rows, _ := db.Query("SELECT n FROM t WHERE id = ?", id)
-	if len(rows) != 1 || rows[0][0].I != 15 {
+	if len(rows) != 1 || rows[0][0].Int() != 15 {
 		t.Fatalf("read-your-writes failed: %v", rows)
 	}
 }
@@ -319,7 +319,7 @@ func TestTransactionPartitioned(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, rows, err := db.Query("SELECT n FROM msgs WHERE thread = ? ORDER BY seq", th)
-	if err != nil || len(rows) != 2 || rows[0][0].I != 1 || rows[1][0].I != 102 {
+	if err != nil || len(rows) != 2 || rows[0][0].Int() != 1 || rows[1][0].Int() != 102 {
 		t.Fatalf("partitioned tx result wrong: rows=%v err=%v", rows, err)
 	}
 }
@@ -394,7 +394,7 @@ func TestTransactionDuplicatePKAtCommit(t *testing.T) {
 	if !errors.Is(err, ErrDuplicatePK) {
 		t.Fatalf("expected ErrDuplicatePK at commit, got %v", err)
 	}
-	if _, rows, _ := db.Query("SELECT n FROM t WHERE id = ?", a); len(rows) != 1 || rows[0][0].I != 1 {
+	if _, rows, _ := db.Query("SELECT n FROM t WHERE id = ?", a); len(rows) != 1 || rows[0][0].Int() != 1 {
 		t.Fatalf("existing row disturbed by failed tx: %v", rows)
 	}
 }

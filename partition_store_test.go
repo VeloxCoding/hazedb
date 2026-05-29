@@ -33,14 +33,14 @@ func TestPartitionedCRUD(t *testing.T) {
 		insMsg(t, db, ids[i], thread, i, "m")
 	}
 	_, rows, _ := db.Query("SELECT body FROM messages WHERE id = ?", ids[2])
-	if len(rows) != 1 || rows[0][0].S != "m" {
+	if len(rows) != 1 || rows[0][0].Str() != "m" {
 		t.Fatalf("get by pk: %v", rows)
 	}
 	if _, err := db.Exec("UPDATE messages SET body = ? WHERE id = ?", "edited", ids[2]); err != nil {
 		t.Fatal(err)
 	}
 	_, rows, _ = db.Query("SELECT body FROM messages WHERE id = ?", ids[2])
-	if rows[0][0].S != "edited" {
+	if rows[0][0].Str() != "edited" {
 		t.Fatalf("update by pk: %v", rows)
 	}
 	if n, _ := db.Exec("DELETE FROM messages WHERE id = ?", ids[2]); n != 1 {
@@ -80,7 +80,7 @@ func TestPartitionedDeleteReinsertSamePK(t *testing.T) {
 	}
 	insMsg(t, db, id, th, 2, "new")
 	_, rows, _ := db.Query("SELECT body FROM messages WHERE id = ?", id)
-	if len(rows) != 1 || rows[0][0].S != "new" {
+	if len(rows) != 1 || rows[0][0].Str() != "new" {
 		t.Fatalf("after delete+reinsert: %v", rows)
 	}
 }
@@ -106,7 +106,7 @@ func TestPartitionedMultiShardDelete(t *testing.T) {
 	}
 	// Every surviving row must still resolve by PK (directory consistent).
 	for _, r := range all {
-		_, got, _ := db.Query("SELECT id FROM messages WHERE id = ?", r[0].U)
+		_, got, _ := db.Query("SELECT id FROM messages WHERE id = ?", r[0].UUID())
 		if len(got) != 1 {
 			t.Fatalf("survivor not addressable by pk after multi-shard delete")
 		}
@@ -136,12 +136,12 @@ func TestPartitionedWALRoundTrip(t *testing.T) {
 	}
 	defer db2.Close()
 	_, rows, _ := db2.Query("SELECT id, body FROM messages")
-	if len(rows) != 1 || rows[0][1].S != "kept" {
+	if len(rows) != 1 || rows[0][1].Str() != "kept" {
 		t.Fatalf("after replay: %v", rows)
 	}
 	// Replayed row is addressable by PK (directory rebuilt on replay).
 	_, r2, _ := db2.Query("SELECT body FROM messages WHERE id = ?", keep)
-	if len(r2) != 1 || r2[0][0].S != "kept" {
+	if len(r2) != 1 || r2[0][0].Str() != "kept" {
 		t.Fatalf("pk lookup after replay: %v", r2)
 	}
 }
@@ -172,7 +172,7 @@ func TestPartitionedConcurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, r := range all {
-		_, got, _ := db.Query("SELECT id FROM messages WHERE id = ?", r[0].U)
+		_, got, _ := db.Query("SELECT id FROM messages WHERE id = ?", r[0].UUID())
 		if len(got) != 1 {
 			t.Fatalf("surviving row not addressable by pk")
 		}
@@ -201,7 +201,7 @@ func TestPartitionScanQuery(t *testing.T) {
 		t.Fatalf("thread A: got %d rows, want 20", len(rows))
 	}
 	for _, r := range rows {
-		if r[0].S != "a" {
+		if r[0].Str() != "a" {
 			t.Fatalf("scan returned a row from another partition: %v", r)
 		}
 	}
@@ -209,7 +209,7 @@ func TestPartitionScanQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(top) != 3 || top[0][0].I != 19 || top[1][0].I != 18 || top[2][0].I != 17 {
+	if len(top) != 3 || top[0][0].Int() != 19 || top[1][0].Int() != 18 || top[2][0].Int() != 17 {
 		t.Fatalf("ORDER BY seq DESC LIMIT 3: %v", top)
 	}
 	// Delete the whole partition; the scan must then skip the tombstones.

@@ -353,7 +353,7 @@ func (db *DB) applyMutation(rt *tableRT, op uint8, body []byte) error {
 			vals[i] = v
 			body = body[m:]
 		}
-		if !rt.update(pk.U, func(r Row) Row {
+		if !rt.update(pk.UUID(), func(r Row) Row {
 			for i := range ords {
 				r[ords[i]] = vals[i]
 			}
@@ -367,7 +367,7 @@ func (db *DB) applyMutation(rt *tableRT, op uint8, body []byte) error {
 		if err != nil {
 			return err
 		}
-		rt.deleteByPK(pk.U)
+		rt.deleteByPK(pk.UUID())
 		return nil
 	}
 	return fmt.Errorf("%w: unknown op %d", ErrWALCorrupt, op)
@@ -412,7 +412,7 @@ func toValue(a any, index int) (Value, error) {
 		// Clone at the write boundary: storage must not alias a caller slice
 		// the caller can mutate after the call returns — that would corrupt the
 		// stored row and diverge from the (already-written) WAL record.
-		return Value{Kind: KindBytes, B: cloneBytes(x)}, nil
+		return Bytes(cloneBytes(x)), nil
 	case bool:
 		return Bool(x), nil
 	case UUID:

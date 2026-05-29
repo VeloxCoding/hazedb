@@ -102,7 +102,7 @@ func (tx *Tx) stage(sql string, args ...any) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		tx.staged = append(tx.staged, stagedMut{kind: opInsert, pk: row[pl.rt.def.pkOrdinal].U, row: row})
+		tx.staged = append(tx.staged, stagedMut{kind: opInsert, pk: row[pl.rt.def.pkOrdinal].UUID(), row: row})
 		return 1, nil
 	case *updateStmt:
 		if !pl.pkLookup {
@@ -278,7 +278,7 @@ func (tx *Tx) collectShards(t *table, out []uint32) []uint32 {
 		case t.pkDir == nil:
 			idx = t.shardIdxOf(m.pk)
 		case m.kind == opInsert:
-			idx = t.shardIdxOf(m.row[t.def.partitionOrdinal].U)
+			idx = t.shardIdxOf(m.row[t.def.partitionOrdinal].UUID())
 		default:
 			loc, found := t.pkDir.idx[m.pk]
 			if !found {
@@ -350,7 +350,7 @@ func (t *table) txGetLocked(pk UUID) (Row, bool) {
 			return nil, false
 		}
 		r := s.rows[loc.rowID]
-		if r == nil || r[t.def.pkOrdinal].U != pk {
+		if r == nil || r[t.def.pkOrdinal].UUID() != pk {
 			return nil, false
 		}
 		return r, true
@@ -371,8 +371,8 @@ func (t *table) txGetLocked(pk UUID) (Row, bool) {
 // partitioned, per-shard pk map otherwise).
 func (t *table) txInsertLocked(row Row) {
 	if t.pkDir != nil {
-		pk := row[t.def.pkOrdinal].U
-		part := row[t.def.partitionOrdinal].U
+		pk := row[t.def.pkOrdinal].UUID()
+		part := row[t.def.partitionOrdinal].UUID()
 		idx := t.shardIdxOf(part)
 		s := &t.shards[idx]
 		rowID := uint64(len(s.rows))
@@ -382,7 +382,7 @@ func (t *table) txInsertLocked(row Row) {
 		t.pkDir.idx[pk] = rowLocation{shard: idx, rowID: rowID}
 		return
 	}
-	pk := row[t.def.pkOrdinal].U
+	pk := row[t.def.pkOrdinal].UUID()
 	s := t.shardOf(pk)
 	rowID := uint64(len(s.rows))
 	s.rows = append(s.rows, row)

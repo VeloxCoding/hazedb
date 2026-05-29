@@ -86,7 +86,7 @@ func TestWALErrorStateBlocksAndDoesNotApply(t *testing.T) {
 	// State must be exactly the original row, unchanged: id=2 never inserted,
 	// id=1 still age 30 (the update was reverted), id=1 not deleted.
 	_, rows, _ := db.Query("SELECT id, age FROM users")
-	if len(rows) != 1 || rows[0][0].U != tid(1) || rows[0][1].I != 30 {
+	if len(rows) != 1 || rows[0][0].UUID() != tid(1) || rows[0][1].Int() != 30 {
 		t.Errorf("error state must not apply writes; got rows=%v", rows)
 	}
 }

@@ -39,8 +39,8 @@ const pkRetryBudget = 8
 // duplicate is rejected before journaling; a WAL failure aborts before the
 // row is applied. journal may be nil (replay / memory-only).
 func (t *table) insertPartitioned(row Row, journal func() error) error {
-	pk := row[t.def.pkOrdinal].U
-	part := row[t.def.partitionOrdinal].U
+	pk := row[t.def.pkOrdinal].UUID()
+	part := row[t.def.partitionOrdinal].UUID()
 	idx := t.shardIdxOf(part)
 	s := &t.shards[idx]
 
@@ -102,7 +102,7 @@ func (t *table) getByPKPartitioned(pk UUID) (Row, bool) {
 		s.mu.RLock()
 		var cl Row
 		if loc.rowID < uint64(len(s.rows)) {
-			if r := s.rows[loc.rowID]; r != nil && r[t.def.pkOrdinal].U == pk {
+			if r := s.rows[loc.rowID]; r != nil && r[t.def.pkOrdinal].UUID() == pk {
 				cl = r.Clone() // validate + clone UNDER the lock
 			}
 		}
@@ -130,7 +130,7 @@ func (t *table) getByPKProjectPartitioned(pk UUID, ords []int) (Row, bool) {
 		s.mu.RLock()
 		var pr Row
 		if loc.rowID < uint64(len(s.rows)) {
-			if r := s.rows[loc.rowID]; r != nil && r[t.def.pkOrdinal].U == pk {
+			if r := s.rows[loc.rowID]; r != nil && r[t.def.pkOrdinal].UUID() == pk {
 				pr = projectClone(r, ords)
 			}
 		}
@@ -163,7 +163,7 @@ func (t *table) updateByPKJournaledPartitioned(pk UUID, ords []int, compute func
 		return false, nil
 	}
 	r := s.rows[loc.rowID]
-	if r == nil || r[t.def.pkOrdinal].U != pk {
+	if r == nil || r[t.def.pkOrdinal].UUID() != pk {
 		return false, nil
 	}
 	vals, err := compute(r)
@@ -207,7 +207,7 @@ func (t *table) updateByPKOneJournaledPartitioned(pk UUID, ord int, compute func
 		return false, nil
 	}
 	r := s.rows[loc.rowID]
-	if r == nil || r[t.def.pkOrdinal].U != pk {
+	if r == nil || r[t.def.pkOrdinal].UUID() != pk {
 		return false, nil
 	}
 	val, err := compute(r)
@@ -244,7 +244,7 @@ func (t *table) updatePartitioned(pk UUID, mutate func(Row) Row) bool {
 		return false
 	}
 	nr := mutate(s.rows[loc.rowID])
-	if nr == nil || nr[t.def.pkOrdinal].U != pk {
+	if nr == nil || nr[t.def.pkOrdinal].UUID() != pk {
 		return false
 	}
 	s.rows[loc.rowID] = nr
@@ -307,7 +307,7 @@ func (t *table) deleteWhereAllPartitioned(match func(Row) bool, encode func(pk V
 			if r == nil || !match(r) {
 				continue
 			}
-			pending = append(pending, pendingDelete{s, j, r[pkOrd].U})
+			pending = append(pending, pendingDelete{s, j, r[pkOrd].UUID()})
 			if encode != nil {
 				bodies = append(bodies, encode(r[pkOrd]))
 			}

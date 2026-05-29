@@ -407,18 +407,20 @@ func encodeCell(buf []byte, v Value) []byte {
 	switch v.Kind {
 	case KindInt:
 		var u [8]byte
-		binary.LittleEndian.PutUint64(u[:], uint64(v.I))
+		binary.LittleEndian.PutUint64(u[:], uint64(v.Int()))
 		buf = append(buf, u[:]...)
 	case KindString:
-		buf = appendU32LE(buf, uint32(len(v.S)))
-		buf = append(buf, v.S...)
+		buf = appendU32LE(buf, uint32(len(v.Str())))
+		buf = append(buf, v.Str()...)
 	case KindBytes:
-		buf = appendU32LE(buf, uint32(len(v.B)))
-		buf = append(buf, v.B...)
+		b := v.Bytes()
+		buf = appendU32LE(buf, uint32(len(b)))
+		buf = append(buf, b...)
 	case KindUUID:
-		buf = append(buf, v.U[:]...)
+		u := v.UUID()
+		buf = append(buf, u[:]...)
 	case KindBool:
-		buf = append(buf, byte(v.I))
+		buf = append(buf, byte(v.Int()))
 	case KindNull:
 		// kind byte only
 	}
@@ -435,12 +437,12 @@ func decodeCell(b []byte) (Value, int, error) {
 	off := 1
 	switch kind {
 	case KindNull:
-		return Value{Kind: KindNull}, off, nil
+		return Null(), off, nil
 	case KindInt:
 		if off+8 > len(b) {
 			return Value{}, 0, fmt.Errorf("%w: int cell truncated", ErrWALCorrupt)
 		}
-		return Value{Kind: KindInt, I: int64(binary.LittleEndian.Uint64(b[off : off+8]))}, off + 8, nil
+		return Int(int64(binary.LittleEndian.Uint64(b[off : off+8]))), off + 8, nil
 	case KindString:
 		if off+4 > len(b) {
 			return Value{}, 0, fmt.Errorf("%w: string len truncated", ErrWALCorrupt)
@@ -450,7 +452,7 @@ func decodeCell(b []byte) (Value, int, error) {
 		if ln < 0 || off+ln > len(b) {
 			return Value{}, 0, fmt.Errorf("%w: string body truncated", ErrWALCorrupt)
 		}
-		return Value{Kind: KindString, S: string(b[off : off+ln])}, off + ln, nil
+		return Str(string(b[off : off+ln])), off + ln, nil
 	case KindBytes:
 		if off+4 > len(b) {
 			return Value{}, 0, fmt.Errorf("%w: bytes len truncated", ErrWALCorrupt)
@@ -462,19 +464,19 @@ func decodeCell(b []byte) (Value, int, error) {
 		}
 		cp := make([]byte, ln)
 		copy(cp, b[off:off+ln])
-		return Value{Kind: KindBytes, B: cp}, off + ln, nil
+		return Bytes(cp), off + ln, nil
 	case KindUUID:
 		if off+16 > len(b) {
 			return Value{}, 0, fmt.Errorf("%w: uuid cell truncated", ErrWALCorrupt)
 		}
 		var u UUID
 		copy(u[:], b[off:off+16])
-		return Value{Kind: KindUUID, U: u}, off + 16, nil
+		return UUIDVal(u), off + 16, nil
 	case KindBool:
 		if off+1 > len(b) {
 			return Value{}, 0, fmt.Errorf("%w: bool cell truncated", ErrWALCorrupt)
 		}
-		return Value{Kind: KindBool, I: int64(b[off])}, off + 1, nil
+		return Bool(b[off] == 1), off + 1, nil
 	}
 	return Value{}, 0, fmt.Errorf("%w: unknown cell kind %d", ErrWALCorrupt, kind)
 }

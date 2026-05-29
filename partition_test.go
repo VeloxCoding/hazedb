@@ -23,7 +23,7 @@ func TestPartitionKeyImmutableAndUsable(t *testing.T) {
 	}
 	// Reads still work (routed by PK for now).
 	_, rows, err := db.Query("SELECT body FROM messages WHERE id = ?", id)
-	if err != nil || len(rows) != 1 || rows[0][0].S != "hi" {
+	if err != nil || len(rows) != 1 || rows[0][0].Str() != "hi" {
 		t.Fatalf("read failed: rows=%v err=%v", rows, err)
 	}
 }

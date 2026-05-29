@@ -81,7 +81,7 @@ func TestArithmeticInWhere(t *testing.T) {
 		t.Fatal(err)
 	}
 	// age+5 => {15, 25}; > 22 keeps only id=2.
-	if len(rows) != 1 || rows[0][0].U != tid(2) {
+	if len(rows) != 1 || rows[0][0].UUID() != tid(2) {
 		t.Fatalf("got %v, want only id=2", rows)
 	}
 }
@@ -95,5 +95,5 @@ func ageOf(t *testing.T, db *DB, id UUID) int64 {
 	if len(rows) != 1 {
 		t.Fatalf("id=%s: expected 1 row, got %d", id, len(rows))
 	}
-	return rows[0][0].I
+	return rows[0][0].Int()
 }

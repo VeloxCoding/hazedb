@@ -55,7 +55,7 @@ func TestPKAutoGenAndStringSupplied(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, rows, _ := db.Query("SELECT id FROM messages")
-	if len(rows) != 1 || !rows[0][0].U.IsV7() {
+	if len(rows) != 1 || !rows[0][0].UUID().IsV7() {
 		t.Fatalf("auto-gen PK should be a valid v7 UUID, got %v", rows)
 	}
 
@@ -65,7 +65,7 @@ func TestPKAutoGenAndStringSupplied(t *testing.T) {
 		t.Fatalf("string PK should parse: %v", err)
 	}
 	_, r2, _ := db.Query("SELECT body FROM messages WHERE id = ?", cid)
-	if len(r2) != 1 || r2[0][0].S != "b" {
+	if len(r2) != 1 || r2[0][0].Str() != "b" {
 		t.Fatalf("string-supplied PK lookup failed: %v", r2)
 	}
 }

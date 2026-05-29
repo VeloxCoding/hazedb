@@ -20,7 +20,7 @@ func dumpUsers(t *testing.T, db *DB) string {
 	}
 	var b strings.Builder
 	for _, r := range rows {
-		fmt.Fprintf(&b, "%s|%s|%d\n", r[0].AsString(), r[1].S, r[2].I)
+		fmt.Fprintf(&b, "%s|%s|%d\n", r[0].AsString(), r[1].Str(), r[2].Int())
 	}
 	return b.String()
 }
@@ -67,7 +67,7 @@ func TestRejectedDuplicateInsertDoesNotCorruptWAL(t *testing.T) {
 	}
 	// id=1 must still be "alice" (the duplicate "dup" was never applied).
 	_, r1, _ := db2.Query("SELECT name FROM users WHERE id = ?", tid(1))
-	if len(r1) != 1 || r1[0][0].S != "alice" {
+	if len(r1) != 1 || r1[0][0].Str() != "alice" {
 		t.Errorf("id=1 should be alice, got %v", r1)
 	}
 }
