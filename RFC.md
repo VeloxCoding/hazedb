@@ -8,13 +8,26 @@
 
 ## What it is
 
+hazedb is a **general-purpose embedded SQL database**, not a domain or
+application-specific store. It happens to be memory-resident with a WAL for
+durability, but the data model, query language, and features are generic —
+tables, columns, a primary key, optional partitioning and indexes, SQL.
+
+> **About the examples in this document.** Concrete tables like
+> `messages(thread_id, seq, body)`, sessions, or leaderboards are *only
+> illustrations* chosen to make a mechanism easy to picture. They are not
+> built-in features, a target domain, or a product focus. Read every example
+> as "for instance, a table shaped like this" — the feature it demonstrates
+> is always generic.
+
 An embedded, memory-resident SQL store for single-process Go applications.
 All reads come from RAM. Disk stores append-only WAL segments and log-derived snapshots — never table pages or a buffer pool. No network protocol, no separate
 process, no buffer pool.
 
-**Target:** latency-sensitive OLTP where the working set fits in RAM — chat
-feeds, session state, hot leaderboards, in-process caches. Compile it
-directly into a Caddy module, FrankenPHP extension, or standalone Go binary.
+**Target:** latency-sensitive OLTP where the working set fits in RAM. Compile
+it directly into a Caddy module, FrankenPHP extension, or standalone Go
+binary. (Workloads like session state, hot leaderboards, or append-and-scan
+tables are *examples* of that profile, not the scope.)
 
 ---
 
