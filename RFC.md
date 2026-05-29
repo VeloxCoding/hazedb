@@ -582,16 +582,16 @@ Cross-table transactions (debit one table, credit another) require locking shard
 
 ### Point operations vs SQLite and Bolt (single-thread, fair 16-byte UUID keys)
 
-All three stores key by the same 16-byte UUID, so the comparison is fair on key width.
+All four stores key by the same 16-byte UUID, so the comparison is fair on key width. SQLite appears twice: `:memory:` (RAM, no disk — the like-for-like in-memory comparison) and on-disk (WAL journal).
 
-| Operation | hazedb (mem) | hazedb (+WAL) | SQLite (cgo) | Bolt |
-|---|---:|---:|---:|---:|
-| INSERT | **0.52 µs** | 0.62 µs | 20 µs | 1 500 µs † |
-| SELECT WHERE id=? | **0.25 µs** | — | 2.8 µs | 0.52 µs |
-| UPDATE WHERE id=? | **0.20 µs** | — | 2.5 µs | 1 400 µs † |
-| DELETE WHERE id=? | **0.39 µs** | — | 20–49 µs | 4 000 µs † |
+| Operation | hazedb (mem) | hazedb (+WAL) | SQLite (mem) | SQLite (disk) | Bolt |
+|---|---:|---:|---:|---:|---:|
+| INSERT | **0.50 µs** | 0.62 µs | 1.8 µs | 20 µs | 1 500 µs † |
+| SELECT WHERE id=? | **0.25 µs** | — | 2.0 µs | 2.8 µs | 0.52 µs |
+| UPDATE WHERE id=? | **0.20 µs** | — | 1.0 µs | 2.5 µs | 1 400 µs † |
+| DELETE WHERE id=? | **0.39 µs** | — | — | 20–49 µs | 4 000 µs † |
 
-Reads are the like-for-like comparison: hazedb ~11× SQLite and ~2× Bolt. † Writes are **not** like-for-like on durability — hazedb-mem is in-memory, Bolt fsyncs per transaction, SQLite syncs per its journal mode; read the write rows as "memory vs durable-to-disk", not a pure engine race. Allocations/op: hazedb 2–6, SQLite 9–25, Bolt 49–66.
+**Even RAM-vs-RAM, hazedb leads:** vs SQLite `:memory:` it is ~8× on reads, ~3.5× on inserts, ~5× on updates. That gap is the in-process design — no cgo boundary, no per-call SQL dispatch or row marshalling — not merely "memory vs disk". † Write rows for SQLite-disk and Bolt are **not** like-for-like on durability (they fsync/journal to disk; hazedb-mem does not). Allocations/op: hazedb 2–6, SQLite 9–25, Bolt 49–66.
 
 ### Parallel scaling (32 cores)
 

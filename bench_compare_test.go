@@ -63,6 +63,70 @@ func setupSQLite(b *testing.B) (*sql.DB, func()) {
 	return d, func() { d.Close(); os.Remove(dsn) }
 }
 
+// setupSQLiteMem is the in-memory SQLite — RAM-vs-RAM with hazedb (no disk).
+// MaxOpenConns(1) pins one connection so all calls hit the same in-memory DB
+// (a fresh ":memory:" connection would otherwise be a separate empty DB).
+func setupSQLiteMem(b *testing.B) (*sql.DB, func()) {
+	b.Helper()
+	d, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		b.Fatal(err)
+	}
+	d.SetMaxOpenConns(1)
+	if _, err := d.Exec("CREATE TABLE users (id BLOB PRIMARY KEY, name TEXT, age INTEGER)"); err != nil {
+		b.Fatal(err)
+	}
+	stmt, err := d.Prepare("INSERT INTO users (id, name, age) VALUES (?, ?, ?)")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer stmt.Close()
+	for i := 0; i < compareN; i++ {
+		if _, err := stmt.Exec(key16(i), "name", i%100); err != nil {
+			b.Fatal(err)
+		}
+	}
+	return d, func() { d.Close() }
+}
+
+func BenchmarkInsert_SQLiteMem(b *testing.B) {
+	d, cleanup := setupSQLiteMem(b)
+	defer cleanup()
+	stmt, _ := d.Prepare("INSERT INTO users (id, name, age) VALUES (?, ?, ?)")
+	defer stmt.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		stmt.Exec(key16(compareN+i), "name", i%100)
+	}
+}
+
+func BenchmarkSelectByPK_SQLiteMem(b *testing.B) {
+	d, cleanup := setupSQLiteMem(b)
+	defer cleanup()
+	stmt, _ := d.Prepare("SELECT name, age FROM users WHERE id = ?")
+	defer stmt.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var name string
+		var age int64
+		stmt.QueryRow(key16(i % compareN)).Scan(&name, &age)
+	}
+}
+
+func BenchmarkUpdateByPK_SQLiteMem(b *testing.B) {
+	d, cleanup := setupSQLiteMem(b)
+	defer cleanup()
+	stmt, _ := d.Prepare("UPDATE users SET age = ? WHERE id = ?")
+	defer stmt.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		stmt.Exec((i%100)+1, key16(i%compareN))
+	}
+}
+
 func setupBolt(b *testing.B) (*bolt.DB, func()) {
 	b.Helper()
 	dir := b.TempDir()
