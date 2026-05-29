@@ -47,13 +47,18 @@ type Value struct {
 	U    UUID
 }
 
-func Int(v int64) Value       { return Value{Kind: KindInt, I: v} }
-func Str(v string) Value      { return Value{Kind: KindString, S: v} }
-func Bytes(v []byte) Value    { return Value{Kind: KindBytes, B: v} }
-func Bool(v bool) Value       { return Value{Kind: KindBool, I: boolToInt(v)} }
-func UUIDVal(u UUID) Value    { return Value{Kind: KindUUID, U: u} }
-func Null() Value             { return Value{Kind: KindNull} }
-func boolToInt(b bool) int64 { if b { return 1 }; return 0 }
+func Int(v int64) Value    { return Value{Kind: KindInt, I: v} }
+func Str(v string) Value   { return Value{Kind: KindString, S: v} }
+func Bytes(v []byte) Value { return Value{Kind: KindBytes, B: v} }
+func Bool(v bool) Value    { return Value{Kind: KindBool, I: boolToInt(v)} }
+func UUIDVal(u UUID) Value { return Value{Kind: KindUUID, U: u} }
+func Null() Value          { return Value{Kind: KindNull} }
+func boolToInt(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
+}
 
 func (v Value) IsNull() bool { return v.Kind == KindNull }
 
@@ -168,11 +173,30 @@ func (r Row) Clone() Row {
 	copy(c, r)
 	// Strings and ints are value-copied. Bytes need a fresh slice.
 	for i := range c {
-		if c[i].Kind == KindBytes && c[i].B != nil {
-			b := make([]byte, len(c[i].B))
-			copy(b, c[i].B)
-			c[i].B = b
-		}
+		c[i] = cloneValue(c[i])
 	}
 	return c
+}
+
+func cloneValue(v Value) Value {
+	if v.Kind == KindBytes && v.B != nil {
+		b := make([]byte, len(v.B))
+		copy(b, v.B)
+		v.B = b
+	}
+	return v
+}
+
+func appendRowClone(dst []Value, r Row) []Value {
+	for _, v := range r {
+		dst = append(dst, cloneValue(v))
+	}
+	return dst
+}
+
+func appendProjectClone(dst []Value, r Row, ords []int) []Value {
+	for _, ord := range ords {
+		dst = append(dst, cloneValue(r[ord]))
+	}
+	return dst
 }

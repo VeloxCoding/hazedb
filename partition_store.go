@@ -193,6 +193,40 @@ func (t *table) updateByPKJournaledPartitioned(pk UUID, ords []int, compute func
 	return true, nil
 }
 
+func (t *table) updateByPKOneJournaledPartitioned(pk UUID, ord int, compute func(Row) (Value, error), journal func(Row) error) (bool, error) {
+	t.pkDir.mu.RLock()
+	defer t.pkDir.mu.RUnlock()
+	loc, ok := t.pkDir.idx[pk]
+	if !ok {
+		return false, nil
+	}
+	s := &t.shards[loc.shard]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if loc.rowID >= uint64(len(s.rows)) {
+		return false, nil
+	}
+	r := s.rows[loc.rowID]
+	if r == nil || r[t.def.pkOrdinal].U != pk {
+		return false, nil
+	}
+	val, err := compute(r)
+	if err != nil {
+		return false, err
+	}
+	if journal == nil {
+		r[ord] = val
+		return true, nil
+	}
+	old := r[ord]
+	r[ord] = val
+	if err := journal(r); err != nil {
+		r[ord] = old
+		return false, err
+	}
+	return true, nil
+}
+
 // updatePartitioned is the replay-path update (no journal).
 func (t *table) updatePartitioned(pk UUID, mutate func(Row) Row) bool {
 	t.pkDir.mu.RLock()

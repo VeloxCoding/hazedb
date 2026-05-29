@@ -519,7 +519,8 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 
 	// Collect matching rows. A partition-pinned SELECT (WHERE partkey = ?)
 	// reads only that partition's rows; otherwise scan every shard.
-	scan := tbl.scanAll
+	var part UUID
+	partPinned := false
 	if pl.partLookup {
 		pv, err := evalExpr(pl.partSource, &ctx)
 		if err != nil {
@@ -528,11 +529,12 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 		if pv.IsNull() {
 			return colNames, nil, nil
 		}
-		part, err := coerceToUUID(pv)
+		u, err := coerceToUUID(pv)
 		if err != nil {
 			return nil, nil, err
 		}
-		scan = func(fn func(Row) bool) { tbl.scanPartition(part, fn) }
+		part = u
+		partPinned = true
 	}
 
 	// No ORDER BY means LIMIT can be applied during the scan. Copy only rows
@@ -549,22 +551,87 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 			capHint = 1024
 		}
 		out := make([]Row, 0, capHint)
-		scan(func(r Row) bool {
-			if st.where != nil {
-				ctx.row = r
-				v, err := evalExpr(st.where, &ctx)
-				if err != nil || !truthy(v) {
-					return true
+		width := len(pl.projOrdinals)
+		if st.starAll {
+			width = len(tbl.def.def.Columns)
+		}
+		var packed []Value
+		if partPinned {
+			s := tbl.shardOf(part)
+			s.mu.RLock()
+			for _, rowID := range s.tails[part] {
+				if rowID >= uint64(len(s.rows)) {
+					continue
+				}
+				r := s.rows[rowID]
+				if r == nil {
+					continue
+				}
+				if st.where != nil {
+					ctx.row = r
+					v, err := evalExpr(st.where, &ctx)
+					if err != nil || !truthy(v) {
+						continue
+					}
+				}
+				if packed == nil {
+					packed = make([]Value, 0, capHint*width)
+				}
+				start := len(packed)
+				if st.starAll {
+					packed = appendRowClone(packed, r)
+				} else {
+					packed = appendProjectClone(packed, r, pl.projOrdinals)
+				}
+				out = append(out, Row(packed[start:len(packed):len(packed)]))
+				if len(out) >= st.limit {
+					break
 				}
 			}
-			if st.starAll {
-				out = append(out, r.Clone())
-			} else {
-				out = append(out, projectClone(r, pl.projOrdinals))
+			s.mu.RUnlock()
+			return colNames, out, nil
+		}
+		for i := range tbl.shards {
+			s := &tbl.shards[i]
+			s.mu.RLock()
+			stop := false
+			for _, r := range s.rows {
+				if r == nil {
+					continue
+				}
+				if st.where != nil {
+					ctx.row = r
+					v, err := evalExpr(st.where, &ctx)
+					if err != nil || !truthy(v) {
+						continue
+					}
+				}
+				if packed == nil {
+					packed = make([]Value, 0, capHint*width)
+				}
+				start := len(packed)
+				if st.starAll {
+					packed = appendRowClone(packed, r)
+				} else {
+					packed = appendProjectClone(packed, r, pl.projOrdinals)
+				}
+				out = append(out, Row(packed[start:len(packed):len(packed)]))
+				if len(out) >= st.limit {
+					stop = true
+					break
+				}
 			}
-			return len(out) < st.limit
-		})
+			s.mu.RUnlock()
+			if stop {
+				break
+			}
+		}
 		return colNames, out, nil
+	}
+
+	scan := tbl.scanAll
+	if partPinned {
+		scan = func(fn func(Row) bool) { tbl.scanPartition(part, fn) }
 	}
 
 	var matched []Row
@@ -704,6 +771,60 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 	st := pl.st.(*updateStmt)
 	tbl := pl.rt
 	ctx := &evalCtx{cols: tbl.def.colByName, args: args}
+
+	// Common hot path: one-column PK update. Avoid materialising a []Value
+	// SET buffer; compute and apply the single cell directly under the shard
+	// lock.
+	if pl.pkLookup && len(pl.updateOrdinals) == 1 {
+		ord := pl.updateOrdinals[0]
+		col := tbl.def.def.Columns[ord]
+		computeOne := func(r Row) (Value, error) {
+			ctx.row = r
+			v, err := evalExpr(st.sets[0].val, ctx)
+			if err != nil {
+				return Value{}, err
+			}
+			if err := validateValue(col, v); err != nil {
+				return Value{}, err
+			}
+			return v, nil
+		}
+		if !pl.setRowDependent {
+			v, err := computeOne(nil)
+			if err != nil {
+				return 0, err
+			}
+			computeOne = func(Row) (Value, error) { return v, nil }
+		}
+		keyVal, err := evalExpr(pl.pkSource, &evalCtx{args: args})
+		if err != nil {
+			return 0, err
+		}
+		if keyVal.IsNull() {
+			return 0, nil
+		}
+		var journal func(Row) error
+		if db.wal != nil {
+			journal = func(nr Row) error {
+				body := encodeUpdateMutation(db.scratch.get(), tbl.tableID, nr[tbl.def.pkOrdinal], pl.updateOrdinals, nr)
+				werr := db.wal.writeRecord(recMutation, body)
+				db.scratch.put(body)
+				return werr
+			}
+		}
+		pk, err := coerceToUUID(keyVal)
+		if err != nil {
+			return 0, err
+		}
+		ok, err := tbl.updateByPKOneJournaled(pk, ord, computeOne, journal)
+		if err != nil {
+			return 0, err
+		}
+		if ok {
+			return 1, nil
+		}
+		return 0, nil
+	}
 
 	match := func(r Row) bool {
 		if st.where == nil {

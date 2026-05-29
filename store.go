@@ -194,6 +194,37 @@ func (t *table) updateByPKJournaled(pk UUID, ords []int, compute func(Row) ([]Va
 	return true, nil
 }
 
+// updateByPKOneJournaled is the one-column variant of updateByPKJournaled.
+// It avoids building a temporary []Value for the common point-update path.
+func (t *table) updateByPKOneJournaled(pk UUID, ord int, compute func(Row) (Value, error), journal func(Row) error) (bool, error) {
+	if t.pkDir != nil {
+		return t.updateByPKOneJournaledPartitioned(pk, ord, compute, journal)
+	}
+	s := t.shardOf(pk)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rowID, ok := s.pk[pk]
+	if !ok {
+		return false, nil
+	}
+	r := s.rows[rowID]
+	val, err := compute(r)
+	if err != nil {
+		return false, err
+	}
+	if journal == nil {
+		r[ord] = val
+		return true, nil
+	}
+	old := r[ord]
+	r[ord] = val
+	if err := journal(r); err != nil {
+		r[ord] = old
+		return false, err
+	}
+	return true, nil
+}
+
 // deleteByPKJournaled is the live PK-pinned delete: under the one shard lock
 // it journals (via journal) before tombstoning, so a WAL failure aborts
 // before the row is removed. journal may be nil (memory-only).
@@ -264,13 +295,7 @@ func (t *table) getByPKProject(pk UUID, ords []int) (Row, bool) {
 func projectClone(r Row, ords []int) Row {
 	pr := make(Row, len(ords))
 	for j, ord := range ords {
-		v := r[ord]
-		if v.Kind == KindBytes && v.B != nil {
-			b := make([]byte, len(v.B))
-			copy(b, v.B)
-			v.B = b
-		}
-		pr[j] = v
+		pr[j] = cloneValue(r[ord])
 	}
 	return pr
 }

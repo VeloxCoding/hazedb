@@ -173,9 +173,9 @@ func TestSelectLimitNoOrderBy(t *testing.T) {
 		args []any
 		want int
 	}{
-		{"SELECT id FROM users LIMIT 3", nil, 3},          // stops early
-		{"SELECT id FROM users LIMIT 100", nil, 10},       // limit > rows → all
-		{"SELECT id FROM users LIMIT 0", nil, 0},          // empty
+		{"SELECT id FROM users LIMIT 3", nil, 3},                      // stops early
+		{"SELECT id FROM users LIMIT 100", nil, 10},                   // limit > rows → all
+		{"SELECT id FROM users LIMIT 0", nil, 0},                      // empty
 		{"SELECT id FROM users WHERE age >= ? LIMIT 2", []any{20}, 2}, // WHERE + LIMIT
 	}
 	for _, c := range cases {
@@ -186,6 +186,25 @@ func TestSelectLimitNoOrderBy(t *testing.T) {
 		if len(rows) != c.want {
 			t.Errorf("%q: got %d rows, want %d", c.sql, len(rows), c.want)
 		}
+	}
+}
+
+func TestSelectLimitRowsDoNotAppendAlias(t *testing.T) {
+	db := openMem(t)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "a", 10)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(2), "b", 20)
+
+	_, rows, err := db.Query("SELECT age FROM users LIMIT 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows", len(rows))
+	}
+	second := rows[1][0]
+	rows[0] = append(rows[0], Int(999))
+	if !rows[1][0].Equal(second) {
+		t.Fatalf("append to first row changed second row: %v", rows)
 	}
 }
 

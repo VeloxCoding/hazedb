@@ -142,7 +142,8 @@ func (db *DB) Exec(sql string, args ...any) (int, error) {
 	case *dropStmt:
 		return 0, db.dropTable(s.name)
 	}
-	vargs, err := toValues(args)
+	var argBuf [8]Value
+	vargs, err := toValuesInto(args, argBuf[:])
 	if err != nil {
 		return 0, err
 	}
@@ -341,7 +342,16 @@ func (db *DB) applyMutation(rt *tableRT, op uint8, body []byte) error {
 // toValues converts variadic args into Value cells. Supports int, int64,
 // string, []byte, bool, nil, and Value pass-through.
 func toValues(args []any) ([]Value, error) {
-	out := make([]Value, len(args))
+	return toValuesInto(args, nil)
+}
+
+func toValuesInto(args []any, scratch []Value) ([]Value, error) {
+	var out []Value
+	if len(args) <= len(scratch) {
+		out = scratch[:len(args)]
+	} else {
+		out = make([]Value, len(args))
+	}
 	for i, a := range args {
 		v, err := toValue(a, i)
 		if err != nil {
