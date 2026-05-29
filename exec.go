@@ -539,9 +539,12 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 	return colNames, out, nil
 }
 
-// execInsert builds the row and appends. Returns the count (1 if
-// inserted) and an error.
-func (db *DB) execInsert(pl *plan, args []Value) (int, error) {
+// buildInsertRow materialises the full row for an INSERT plan: evaluates each
+// supplied value (with API-boundary string→UUID coercion), validates it,
+// auto-generates the PK when omitted, and enforces NOT NULL. The resolved row
+// is what both the single-statement path and the transaction path journal, so
+// replay reproduces the exact same row (including any auto-generated UUID).
+func (db *DB) buildInsertRow(pl *plan, args []Value) (Row, error) {
 	st := pl.st.(*insertStmt)
 	tbl := pl.rt
 	row := make(Row, len(tbl.def.def.Columns))
@@ -554,7 +557,7 @@ func (db *DB) execInsert(pl *plan, args []Value) (int, error) {
 	for i, ord := range pl.insertOrdinals {
 		v, err := evalExpr(st.vals[i], ctx)
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
 		col := tbl.def.def.Columns[ord]
 		// API-boundary coercion: a string destined for a UUID column is
@@ -562,12 +565,12 @@ func (db *DB) execInsert(pl *plan, args []Value) (int, error) {
 		if col.Type == TypeUUID && v.Kind == KindString {
 			u, perr := ParseUUID(v.S)
 			if perr != nil {
-				return 0, perr
+				return nil, perr
 			}
 			v = UUIDVal(u)
 		}
 		if err := validateValue(col, v); err != nil {
-			return 0, err
+			return nil, err
 		}
 		row[ord] = v
 		if ord == pkOrd {
@@ -582,14 +585,25 @@ func (db *DB) execInsert(pl *plan, args []Value) (int, error) {
 	// Check NOT NULL on omitted columns.
 	for ord, c := range tbl.def.def.Columns {
 		if row[ord].IsNull() && !c.Nullable {
-			return 0, fmt.Errorf("column %q is NOT NULL", c.Name)
+			return nil, fmt.Errorf("column %q is NOT NULL", c.Name)
 		}
+	}
+	return row, nil
+}
+
+// execInsert builds the row and appends. Returns the count (1 if
+// inserted) and an error.
+func (db *DB) execInsert(pl *plan, args []Value) (int, error) {
+	tbl := pl.rt
+	row, err := db.buildInsertRow(pl, args)
+	if err != nil {
+		return 0, err
 	}
 	// PK uniqueness + WAL append + apply run atomically under the shard
 	// lock (see insertJournaled). Ordering matters: a duplicate PK must be
 	// rejected before anything is journaled, and a WAL failure must abort
 	// before the row is applied.
-	err := tbl.insertJournaled(row, func() error {
+	if err := tbl.insertJournaled(row, func() error {
 		if db.wal == nil {
 			return nil
 		}
@@ -597,8 +611,7 @@ func (db *DB) execInsert(pl *plan, args []Value) (int, error) {
 		werr := db.wal.writeRecord(recMutation, body)
 		db.scratch.put(body)
 		return werr
-	})
-	if err != nil {
+	}); err != nil {
 		return 0, err
 	}
 	return 1, nil

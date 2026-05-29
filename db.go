@@ -228,19 +228,51 @@ func (db *DB) replayWAL(w *wal) error {
 		case recCheckpoint:
 			return nil // no row state — skip
 		case recMutation:
-			if len(payload) < 3 {
-				return fmt.Errorf("%w: short mutation payload", ErrWALCorrupt)
+			return db.applyMutationRecord(payload)
+		case recTxn:
+			// A transaction is a count-prefixed group of sub-mutations, applied
+			// in order. The whole group arrived as one CRC-valid envelope, so it
+			// is all-or-nothing by construction; a torn group was discarded by
+			// the tail check before reaching here.
+			if len(payload) < 2 {
+				return fmt.Errorf("%w: short txn payload", ErrWALCorrupt)
 			}
-			op := payload[0]
-			tableID := binary.LittleEndian.Uint16(payload[1:3])
-			cat := db.cat.Load()
-			if int(tableID) >= len(cat.byID) || cat.byID[tableID] == nil {
-				return fmt.Errorf("%w: mutation for unknown table id %d", ErrWALCorrupt, tableID)
+			n := int(binary.LittleEndian.Uint16(payload[0:2]))
+			off := 2
+			for i := 0; i < n; i++ {
+				if off+4 > len(payload) {
+					return fmt.Errorf("%w: txn sub-mutation length truncated", ErrWALCorrupt)
+				}
+				mlen := int(binary.LittleEndian.Uint32(payload[off : off+4]))
+				off += 4
+				if mlen < 0 || off+mlen > len(payload) {
+					return fmt.Errorf("%w: txn sub-mutation body truncated", ErrWALCorrupt)
+				}
+				if err := db.applyMutationRecord(payload[off : off+mlen]); err != nil {
+					return err
+				}
+				off += mlen
 			}
-			return db.applyMutation(cat.byID[tableID], op, payload[3:])
+			return nil
 		}
 		return fmt.Errorf("%w: unknown record type %d", ErrWALCorrupt, recType)
 	})
+}
+
+// applyMutationRecord decodes one op|tableID|op-body mutation record and
+// applies it through the table's apply path. Shared by recMutation (one per
+// envelope) and recTxn (many per envelope).
+func (db *DB) applyMutationRecord(payload []byte) error {
+	if len(payload) < 3 {
+		return fmt.Errorf("%w: short mutation payload", ErrWALCorrupt)
+	}
+	op := payload[0]
+	tableID := binary.LittleEndian.Uint16(payload[1:3])
+	cat := db.cat.Load()
+	if int(tableID) >= len(cat.byID) || cat.byID[tableID] == nil {
+		return fmt.Errorf("%w: mutation for unknown table id %d", ErrWALCorrupt, tableID)
+	}
+	return db.applyMutation(cat.byID[tableID], op, payload[3:])
 }
 
 // applyMutation re-applies one decoded mutation to a table during replay.

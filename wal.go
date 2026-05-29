@@ -14,7 +14,7 @@ import (
 // WAL record framing — a typed, versioned, self-delimiting envelope:
 //
 //	magic:2     (walMagic) — guards against reading non-WAL bytes
-//	type:1      (recMutation; recTxn/recCheckpoint reserved for M5/M7)
+//	type:1      (recMutation, recTxn; recCheckpoint reserved for M7)
 //	version:1   (walVersion) — replay aborts on a newer version
 //	length:4    (payload length, little-endian)
 //	payload     (length bytes)
@@ -34,7 +34,7 @@ const (
 	walVersion uint8  = 1
 
 	recMutation    uint8 = 1
-	recTxn         uint8 = 2 // reserved — transactions
+	recTxn         uint8 = 2 // transaction: a group of sub-mutations, atomic
 	recCheckpoint  uint8 = 3 // reserved — snapshot/checkpoint
 	recCreateTable uint8 = 4 // catalog: CREATE TABLE
 	recDropTable   uint8 = 5 // catalog: DROP TABLE
@@ -217,6 +217,23 @@ func encodeDeleteMutation(buf []byte, tableID uint16, pk Value) []byte {
 	buf = append(buf, opDelete)
 	buf = appendU16LE(buf, tableID)
 	return encodeCell(buf, pk)
+}
+
+// encodeTxn frames a transaction as one record payload: a count followed by
+// each sub-mutation length-prefixed. Each sub-mutation is the same
+// op|tableID|op-body the single-statement encoders above produce, so replay
+// reuses applyMutation per element. The whole group is one WAL envelope, so a
+// torn write discards the entire transaction (the commit boundary IS the
+// envelope boundary) and a complete, CRC-valid record replays all-or-nothing.
+//
+//	nmut:2 | (mlen:4 | op|tableID|op-body) × nmut
+func encodeTxn(buf []byte, muts [][]byte) []byte {
+	buf = appendU16LE(buf, uint16(len(muts)))
+	for _, m := range muts {
+		buf = appendU32LE(buf, uint32(len(m)))
+		buf = append(buf, m...)
+	}
+	return buf
 }
 
 // flushAndSyncLocked flushes the bufio buffer to the OS then fsyncs. Caller

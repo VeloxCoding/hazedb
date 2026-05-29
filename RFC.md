@@ -64,11 +64,12 @@ The remainder of this RFC describes the **target architecture** — the full des
 - The *Measured benchmarks* table predates M3/M4. M4 perf cost recorded in `bench/baseline_m4.txt`: the 16-byte UUID in every `Value` cell adds ~10-22% ns and +50-100 B/op vs M3; allocs flat-or-better. (An optional typed-struct wrapper could reclaim the `[]Value` overhead later, but is post-1.0 and not on the hot path.)
 - Read-path clone-under-lock: a PK/partition lookup clones the matched row while still holding the shard read lock, so a returned row never aliases storage a concurrent write could mutate (~85 ns on point reads; optimisable by projecting only the needed columns under the lock)
 
+- **Transactions (M6, v1 scope)** — `db.Transaction(func(tx *Tx) error)` closure; `tx.Exec` only (write-only API), PK-pinned statements, single table per tx; staged overlay for read-your-writes; arithmetic `SET` evaluated under the commit locks; poison-on-first-error; one `TXN` WAL envelope (atomic across crash, replayed all-or-nothing). Commit locks all shards of the table (subset-locking is the documented later optimisation).
+
 ### Designed, not yet implemented
 
 | Feature | Milestone |
 |---|---|
-| `db.Transaction()` Go closure API + WAL `TXN` envelope grouping | M6 |
 | WAL segments + snapshot checkpoint | M7 |
 | FrankenPHP cgo binding (`hazedb_exec`/`hazedb_query`, `hazedb_exec_transaction`) | M8 |
 | Optional typed-struct query wrapper (ergonomics; not a speed mechanism) | post-1.0 |
@@ -341,7 +342,7 @@ WHERE supports: `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IS N
 
 **Read consistency of multi-shard SELECT (explicit).** A `SELECT` pinned to a single shard — `WHERE id = ?` on a non-partitioned table, or any scan confined to one partition value on a partitioned table — reads under that shard's read lock and is a consistent point-in-time view. A `SELECT` whose `WHERE`/`ORDER BY`/`LIMIT` spans multiple shards (no PK/PartitionKey pin) does **not** read all shards under a single lock by default: it takes and releases each shard's read lock in turn, so concurrent writes between shard reads mean the assembled result can reflect a mix of moments and may represent no single instant that ever existed. This is the read-side counterpart of the multi-shard write rule. The contract is: **per-shard consistent, not globally point-in-time.** Callers needing a consistent cross-shard snapshot must either pin the query to one shard, or use the consistent path — read-lock all involved shards for the duration of the scan (correct, but an all-shard read-lock contention spike, same tradeoff as multi-shard writes). `ORDER BY` + `LIMIT` over a multi-shard scan inherits this: it merges per-shard results that were each consistent only at their own read instant. **And it must gather-then-sort: `LIMIT n` cannot be pushed down to each shard.** A correct multi-shard `ORDER BY col LIMIT n` collects all matching rows (or at least the top-n per shard) from every involved shard, merges, sorts globally, then applies `LIMIT n`. Taking `n` rows *per shard* and concatenating gives wrong results; even taking the per-shard top-n is only valid as an optimisation if each shard is individually sorted on `col` first. Document which mode a given query uses; do not assume snapshot semantics for unpinned scans.
 
-**Not yet supported:** arithmetic expressions in `SET` clauses (`balance = balance - ?`). The right-hand side of every `SET` assignment must be a literal or `?` parameter — the caller computes derived values before passing them. Arithmetic in SET is planned for M3.  Without it, in-transaction value updates require a prior read to compute the new value before the transaction opens.
+**Arithmetic in `SET` (`balance = balance - ?`) is supported** (M3): the right-hand side of a `SET` may reference a column, evaluated per row against the live value. This is what lets a transaction express read-modify-write without a prior read — the arithmetic is evaluated under the commit locks, so no lost-update window exists.
 
 ---
 
@@ -462,13 +463,13 @@ The fix is to hold **all** affected shard locks (in ascending shard-index order 
 1. Lock all affected shards simultaneously before the WAL write (guaranteed correct; possible all-shard contention spike), or
 2. Require the caller to wrap it in `db.Transaction()`.
 
-The one-shard-at-a-time pattern above is neither and is a bug. See *Settled decisions → Multi-shard non-PK writes* — this is **closed by correctness**, not an open tradeoff: the status quo third option is unsafe and one of the two safe options is mandatory. Until M5 lands `db.Transaction()`, multi-shard non-PK `UPDATE`/`DELETE` must take the lock-all-shards path (or be rejected at plan time).
+The one-shard-at-a-time pattern above is neither and is a bug. See *Settled decisions → Multi-shard non-PK writes* — this is **closed by correctness**, not an open tradeoff: the status quo third option is unsafe and one of the two safe options is mandatory. Multi-shard non-PK `UPDATE`/`DELETE` outside a transaction takes the lock-all-shards path (`updateWhereAll`/`deleteWhereAll`); inside a transaction, statements are PK-pinned by the v1 rule.
 
 **Crash safety (PK-pinned and single-shard writes)** is solved by the logical WAL combined with the lock-before-WAL-write ordering: the resolved statement is appended to the WAL buffer while holding the shard lock that serialises the mutation, and only then applied to memory (still under lock). For these writes WAL order and in-memory application order are identical by construction. Crash mid-execution → the statement is either fully in the WAL (replay re-executes it deterministically) or not in the WAL at all (nothing to replay) — no partial row state is possible. For multi-shard writes the same guarantee holds **only** under option 1 or 2 above.
 
 **What is atomic today:** PK-based operations (`WHERE id = ?`) on non-partitioned tables hit exactly one shard under that shard's lock — fully atomic. On partitioned tables, `WHERE id = ?` acquires pkDirectory lock then shard lock in that fixed order — also fully atomic (no other operation acquires them in reverse order).
 
-**What is not atomic:** multi-shard `WHERE` operations not run under option 1 or 2 (non-serialisable writes *and* torn reads — must not be used), and any sequence of statements that must succeed or fail together.
+**Multi-statement atomicity** is provided by `db.Transaction()` (M6, v1 scope below): a group of PK-pinned statements on one table commits or rolls back together under a single `TXN` WAL envelope. **Still not atomic:** multi-shard `WHERE` operations not run under option 1 or 2 (non-serialisable writes *and* torn reads — must not be used), and cross-table or non-PK-pinned statement groups (out of v1 transaction scope).
 
 ### Design decision — explicit opt-in
 
@@ -477,9 +478,9 @@ Non-transactional operations pay zero overhead. Atomicity is explicit opt-in. No
 ### Go API
 
 ```go
-// Arithmetic in SET (balance = balance - ?) is required here and is planned for M3,
-// before transactions land in M5. Pre-reading balances outside the transaction
-// creates a lost-update race — do not use that pattern.
+// Arithmetic in SET (balance = balance - ?) is evaluated under the commit lock.
+// Pre-reading balances outside the transaction creates a lost-update race — do
+// not use that pattern.
 err := db.Transaction(func(tx *Tx) error {
     if _, err := tx.Exec("UPDATE accounts SET balance = balance - ? WHERE id = ?", 100, fromID); err != nil {
         return err  // propagate → rollback
@@ -526,7 +527,7 @@ A Go closure cannot cross the cgo boundary. `START TRANSACTION` / `COMMIT` as se
 **The array form is strictly better:**
 
 ```php
-// Arithmetic in SET required here; planned for M3 before transactions land in M5.
+// Arithmetic in SET is evaluated under the commit lock.
 // Pre-reading balances outside the transaction creates a lost-update race.
 hazedb_exec_transaction([
     ["UPDATE accounts SET balance = balance - ? WHERE id = ?", [100, $fromID]],
@@ -635,6 +636,7 @@ github.com/VeloxCoding/hazedb   (package hazedb)
 ├── store.go         Sharded RWMutex storage: insert/getByPK/scanAll/update/delete (clone-under-lock reads)
 ├── partition_store.go  Partitioned-table storage: pkDirectory (UUID→location), tail index, two-lock insert, release-then-retry read
 ├── catalog.go       Runtime catalog (atomic snapshot, RCU swap), CREATE/DROP, durable table IDs, catalog WAL record codec
+├── txn.go           Transactions: Tx, db.Transaction closure, staged overlay, commit (lock-all-shards + one TXN envelope), lock-free apply helpers
 ├── wal.go           Logical typed-mutation WAL: versioned envelope (magic|type|version|length|payload|crc32c), MUTATION + CREATE/DROP catalog records, CRC32C, durability modes, bounds-checked tail recovery. Planned: TXN envelope grouping (M6), snapshot load (M7)
 ├── uuid.go          UUID [16]byte type + monotonic RFC-9562 UUIDv7 generator
 ├── lexer.go         Tokenizer
@@ -681,7 +683,7 @@ github.com/VeloxCoding/hazedb   (package hazedb)
 | **M3** | WAL ticker flush + optional fsync (`WALFlushInterval`, `WALSync`, `WALSyncPerWrite`, sticky error state); arithmetic expressions in `SET`/`WHERE` (`col + ?`, `col - ?`, `col * ?`) | ✅ done |
 | **M4** | UUIDv7 PK enforced (`[16]byte` inline, monotonic auto-gen) + immutable order column + logical typed-mutation WAL | ✅ done |
 | **M5** | PartitionKey routing + table-wide `pkDirectory` + indexed partition scan; **runtime catalog + first-class `CREATE`/`DROP TABLE`** (atomic RCU swap, durable table IDs, catalog-version plan invalidation, WAL-logged DDL) | ✅ done |
-| **M6** | Single-table transactions: `db.Transaction(func)` Go API + staged overlay (read-your-writes) + atomic `TXN` WAL envelope + torn-envelope discard on replay | open |
+| **M6** | Single-table transactions: `db.Transaction(func)` Go API + staged overlay (read-your-writes) + atomic `TXN` WAL envelope + torn-envelope discard on replay | ✅ done (v1 scope: tx.Exec only, PK-pinned, single-table) |
 | **M7** | WAL segments (each with a `base` global-offset header) + snapshot checkpoint with consistent cut: pause all writes → record current global LSN → dump all live rows as `INSERT` statements to snapshot file → fsync snapshot + dir → write `CHECKPOINT <file> <lsn>` to WAL → atomically update `MANIFEST{snapshot,lsn}` → resume writes; on restart read manifest (or two-pass scan) to find the newest *verified* checkpoint, load its snapshot, then replay WAL from its global LSN (resolved to `(segment, offset)` by base comparison); delete pre-checkpoint segments | open |
 | **M8** | CLI (`hazedb dump/verify/checkpoint`), Caddy module, FrankenPHP cgo binding (`hazedb_exec_transaction` array API) | open |
 | **post-1.0** | Multi-table support + secondary indexes on non-PK columns (note: `pkDirectory` for partitioned tables is a primary-key directory, not a secondary index — it is core, not deferred here); optional typed-struct query wrapper | open |
@@ -764,6 +766,16 @@ hazedb compiles into your Go binary, keeps all data in RAM, writes a WAL for dur
 ---
 
 ## Changelog
+
+**rev. 9 (2026-05-29) — M6 single-table transactions implemented (v1 scope)**
+
+`db.Transaction(func(tx *Tx) error)` lands at the deliberately narrow v1 scope, built and tested (transfer, rollback, restart, read-your-writes, partitioned, concurrent balance-conservation under `-race`, plus guardrail rejections):
+
+- **Write-only API** (`tx.Exec` only, no `tx.Query`), **PK-pinned statements**, **single table per transaction** — rejections surface as `ErrTxUnsupported`. This avoids pretending to offer snapshot isolation and closes the Go-side read-compute-write lost-update trap.
+- **Staged overlay** gives read-your-writes (statement N sees 1..N−1); **arithmetic `SET`** is (re-)evaluated under the commit locks against live + in-tx state, so the journaled values are the true committed-time results.
+- **Poison-on-first-error**: a failed `tx.Exec` forces rollback even if the closure returns nil.
+- **One `TXN` WAL envelope** (`recTxn`): `nmut:2 | (mlen:4 | op|tableID|op-body) × nmut`, reusing the single-statement mutation encoders and `applyMutation` on replay; torn envelope discarded whole, complete envelope replays all-or-nothing.
+- **Commit locks all shards of the table** (+ pkDirectory if partitioned), reusing the `updateWhereAll` lock-all pattern. Measured ~3.0 µs / 19 allocs for a 2-row transfer (vs ~0.5 µs for one insert) on a 128-shard box — the all-shard hold is the bulk of it. Acceptable for an opt-in path; **subset-locking the touched shards is the documented optimisation** (trivial for non-partitioned, needs a directory lookup for partitioned). Roadmap M6 marked done; stale `M3`/`M5` references in the Transactions section corrected (arithmetic SET shipped in M3; transactions are M6).
 
 **rev. 8 (2026-05-29) — runtime catalog is the primary architecture; codegen demoted to optional wrapper**
 
