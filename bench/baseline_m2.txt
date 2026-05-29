@@ -1,0 +1,33 @@
+# hazedb M1+M2 performance baseline
+
+Captured before RFC implementation work began (commit history: first import).
+Machine: AMD Ryzen AI MAX+ 395 (32 threads), golang:1.22 in Docker.
+Command: go test -run='^$' -bench=<core> -benchmem -count=6 .
+
+Every change from here may affect perf — compare against this with benchstat
+or the medians below. Non-zero alloc regressions count as regressions.
+
+## Medians (count=6)
+
+| Benchmark            | ns/op    | B/op      | allocs/op | notes                         |
+|----------------------|---------:|----------:|----------:|-------------------------------|
+| Insert_Mem           |   ~478   |     ~385  |     4     | memory-only insert            |
+| Insert_WAL           |   ~542   |     ~407  |     4     | + physical WAL append         |
+| SelectByPK_Mem       |   ~207   |     ~263  |     5     | PK fast path, one shard lock  |
+| SelectRange_Mem      | ~790000  | ~1373000  |  4929     | full scan of 10k, LIMIT 10    |
+| Update_Mem           |   ~181   |     ~191  |     3     | PK fast path                  |
+| Delete_Mem           |   ~390   |      ~79  |     2     | PK fast path                  |
+| ParseOnly            |   ~706   |    ~1376  |    14     | parse only (no plan/exec)     |
+
+## Reproduce
+
+    docker run --rm -v "$PWD":/src \
+      -v hazedb-gocache:/root/.cache/go-build -v hazedb-gomod:/go/pkg/mod \
+      -w /src golang:1.22 scripts/bench.sh
+
+Notes:
+- SelectRange is the unindexed scan path (no tail index yet — M5). Its huge
+  alloc count is expected; it clones every matching row. It is the headline
+  target for the M5 ordered/tail index.
+- ParseOnly's 14 allocs/700ns is why the statement cache exists; the hot path
+  must hit the cache, never re-parse.
