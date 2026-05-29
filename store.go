@@ -1,6 +1,7 @@
 package hazedb
 
 import (
+	"encoding/binary"
 	"math/bits"
 	"runtime"
 	"sync"
@@ -79,13 +80,16 @@ func newTable(def *resolvedTable, sizeHint int) *table {
 // shardIdxOf hashes the 16-byte UUID (FNV-1a 32-bit) to a shard index. For a
 // non-partitioned table the UUID is the PK; for a partitioned table it is the
 // PartitionKey value (so all rows of one partition land in one shard).
+// shardIdxOf maps a UUID to a shard: a multiplicative (Fibonacci) fold of both
+// 64-bit halves, returning high, well-mixed bits. Reads all 16 bytes so the
+// spread holds wherever the entropy sits — random low bytes of a real UUIDv7,
+// or the high timestamp bytes of a sequential key. Not persisted (the WAL
+// stores rows, never shard indices), so the constant can change freely.
 func (t *table) shardIdxOf(u UUID) uint32 {
-	var h uint32 = 2166136261
-	for i := 0; i < 16; i++ {
-		h ^= uint32(u[i])
-		h *= 16777619
-	}
-	return h & t.mask
+	a := binary.LittleEndian.Uint64(u[0:8])
+	b := binary.LittleEndian.Uint64(u[8:16])
+	h := (a ^ bits.RotateLeft64(b, 32)) * 0x9E3779B97F4A7C15
+	return uint32(h>>32) & t.mask
 }
 
 func (t *table) shardOf(u UUID) *tableShard { return &t.shards[t.shardIdxOf(u)] }
