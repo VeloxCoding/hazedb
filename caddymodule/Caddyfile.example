@@ -1,0 +1,33 @@
+# Example Caddyfile for the hazedb Caddy module.
+#
+# Build a Caddy binary with the module (see README.md), then:
+#   ./caddy run --config Caddyfile.example --adapter caddyfile
+#
+# Tables are created at runtime. Either POST DDL to /exec, or point
+# init_sql at a file of CREATE TABLE + seed statements run once at startup.
+
+{
+	# Optional global options here.
+}
+
+:8080 {
+	# Mount hazedb under /db/* so it doesn't swallow other routes.
+	handle /db/* {
+		hazedb {
+			# wal_path      /var/lib/hazedb/data.wal   # omit for memory-only
+			size_hint     100000
+			# wal_sync                                  # fsync on the flush ticker
+			# wal_flush_ms  1000
+			# init_sql      /etc/hazedb/schema.sql   # uncomment + provide the file
+			registry_name default
+		}
+	}
+
+	respond "hazedb caddy module" 200
+}
+
+# Endpoints (POST, JSON body {"sql": "...", "args": [...]}):
+#   POST /db/exec   {"sql":"CREATE TABLE users (id uuid primary key, name text, age int)"}
+#   POST /db/exec   {"sql":"INSERT INTO users (id,name,age) VALUES (?,?,?)","args":["<uuid>","alice",30]}
+#   POST /db/query  {"sql":"SELECT name, age FROM users WHERE id = ?","args":["<uuid>"]}
+#                   -> {"columns":["name","age"],"rows":[["alice",30]]}
