@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 )
 
 // WAL framing per record:
@@ -33,27 +34,111 @@ type wal struct {
 	bw      *bufio.Writer
 	scratch []byte // reused under mu; size grows as needed
 	lsn     uint64
+
+	// Durability config (immutable after openWAL).
+	sync         bool // fsync on each ticker fire (when dirty)
+	syncPerWrite bool // flush+fsync after every record, under mu
+
+	// dirtySinceSync is set on every record append and cleared only after a
+	// successful fsync. It is NOT derived from bw.Buffered(): bufio can
+	// auto-flush a full buffer into the page cache while leaving Buffered()
+	// at 0, so gating fsync on Buffered() would leave that data unsynced and
+	// break the "<= flush interval" power-loss bound of WALSync mode.
+	dirtySinceSync bool
+
+	// err is the sticky WAL error. Once set (a failed append/flush/sync),
+	// every subsequent write returns it; recovery is only via close+reopen.
+	err error
+
+	// Background flush/sync ticker. stop is closed by close(); the loop
+	// signals done via wg. Both nil/zero until startTicker runs.
+	stop chan struct{}
+	wg   sync.WaitGroup
+
+	// close() may be called more than once (explicit Close + t.Cleanup);
+	// closeOnce makes it idempotent and closeErr returns the same result.
+	closeOnce sync.Once
+	closeErr  error
 }
 
-func openWAL(path string) (*wal, error) {
+// openWAL opens (creating if needed) the WAL file and records the durability
+// config. It does NOT start the ticker and does NOT seek — the caller replays
+// first, then calls seekToEnd() and startTicker(), so the ticker never races
+// the replay reader on the shared file handle.
+func openWAL(path string, sync, syncPerWrite bool) (*wal, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("wal: open %q: %w", path, err)
 	}
 	return &wal{
-		f:       f,
-		bw:      bufio.NewWriterSize(f, 64<<10),
-		scratch: make([]byte, 0, 4096),
+		f:            f,
+		bw:           bufio.NewWriterSize(f, 64<<10),
+		scratch:      make([]byte, 0, 4096),
+		sync:         sync,
+		syncPerWrite: syncPerWrite,
 	}, nil
 }
 
-// writeRecord serialises one op + payload using the framing above.
-// Holds w.mu so the bufio.Writer sees one record at a time and the
-// scratch buffer is reusable across calls.
+// seekToEnd positions the file at EOF so appends land after replayed data.
+func (w *wal) seekToEnd() error {
+	_, err := w.f.Seek(0, io.SeekEnd)
+	return err
+}
+
+// startTicker launches the background flush/sync goroutine when interval > 0.
+// interval <= 0 leaves the WAL in manual-flush mode (FlushWAL() only).
+func (w *wal) startTicker(interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	w.stop = make(chan struct{})
+	w.wg.Add(1)
+	go w.tickerLoop(interval)
+}
+
+// tickerLoop runs until close() closes w.stop. On each fire it flushes any
+// buffered bytes and, when sync is enabled and data is dirty, fsyncs — all
+// under w.mu (bufio.Writer is not concurrent-safe; appenders hold the same
+// lock). The fsync decision keys off dirtySinceSync, never bw.Buffered().
+func (w *wal) tickerLoop(interval time.Duration) {
+	defer w.wg.Done()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-w.stop:
+			return
+		case <-t.C:
+			w.mu.Lock()
+			if w.err == nil {
+				if w.bw.Buffered() > 0 {
+					if err := w.bw.Flush(); err != nil {
+						w.err = fmt.Errorf("wal: flush (ticker): %w", err)
+					}
+				}
+				if w.sync && w.dirtySinceSync && w.err == nil {
+					if err := w.f.Sync(); err != nil {
+						w.err = fmt.Errorf("wal: sync (ticker): %w", err)
+					} else {
+						w.dirtySinceSync = false
+					}
+				}
+			}
+			w.mu.Unlock()
+		}
+	}
+}
+
+// writeRecord serialises one op + payload and appends it. Holds w.mu so the
+// bufio.Writer sees one record at a time and the scratch buffer is reusable.
+// A failed append sets the sticky error and reports it so the caller aborts
+// before applying the mutation to memory (RFC pipeline step 6).
 func (w *wal) writeRecord(op uint8, tableID uint16, body []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.lsn++
+	if w.err != nil {
+		return w.err
+	}
 
 	bodyLen := uint32(len(body))
 	innerLen := 1 + 2 + 4 + int(bodyLen) // opType + tableID + bodyLen + body
@@ -78,29 +163,74 @@ func (w *wal) writeRecord(op uint8, tableID uint16, body []byte) error {
 	crc := crc32.ChecksumIEEE(buf[4 : 4+innerLen])
 	binary.LittleEndian.PutUint32(buf[off:off+4], crc)
 
-	_, err := w.bw.Write(buf)
-	return err
+	if _, err := w.bw.Write(buf); err != nil {
+		w.err = fmt.Errorf("wal: append: %w", err)
+		return w.err
+	}
+	w.dirtySinceSync = true
+	w.lsn++
+
+	if w.syncPerWrite {
+		return w.flushAndSyncLocked()
+	}
+	return nil
 }
 
+// flushAndSyncLocked flushes the bufio buffer to the OS then fsyncs. Caller
+// holds w.mu. Any failure sets the sticky error and returns it. Both steps
+// happen under the one lock so no other writer can interleave between them.
+func (w *wal) flushAndSyncLocked() error {
+	if w.err != nil {
+		return w.err
+	}
+	if err := w.bw.Flush(); err != nil {
+		w.err = fmt.Errorf("wal: flush: %w", err)
+		return w.err
+	}
+	if err := w.f.Sync(); err != nil {
+		w.err = fmt.Errorf("wal: sync: %w", err)
+		return w.err
+	}
+	w.dirtySinceSync = false
+	return nil
+}
+
+// flush forces the bufio buffer to the OS (write syscall); it does not fsync.
+// Used by FlushWAL() and as a durability boundary in tests.
 func (w *wal) flush() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.err != nil {
+		return w.err
+	}
 	return w.bw.Flush()
 }
 
+// close stops the ticker, flushes, and closes the file. Idempotent (safe to
+// call more than once) and safe on a nil wal. The ticker is stopped (and
+// joined) BEFORE taking w.mu so it cannot be blocked on the lock while close
+// waits for it.
 func (w *wal) close() error {
 	if w == nil {
 		return nil
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.bw != nil {
-		if err := w.bw.Flush(); err != nil {
-			w.f.Close()
-			return err
+	w.closeOnce.Do(func() {
+		if w.stop != nil {
+			close(w.stop)
+			w.wg.Wait()
 		}
-	}
-	return w.f.Close()
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		if w.bw != nil && w.err == nil {
+			if err := w.bw.Flush(); err != nil {
+				w.f.Close()
+				w.closeErr = err
+				return
+			}
+		}
+		w.closeErr = w.f.Close()
+	})
+	return w.closeErr
 }
 
 // replayRecord is the per-record callback for replay. err on the

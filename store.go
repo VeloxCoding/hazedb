@@ -121,6 +121,67 @@ func (t *table) insertJournaled(row Row, journal func() error) error {
 	return nil
 }
 
+// updateByPKJournaled is the live PK-pinned update: under the one shard
+// lock it applies the SET values, journals the new row image, and on a WAL
+// failure reverts — so a row is never applied without a durable record.
+// The hot path allocates nothing: the pre-update values of the touched
+// columns are saved in a small stack array (heap only if >8 columns are
+// set, which is rare). journal may be nil (memory-only), in which case the
+// values are simply applied with no save/revert overhead.
+func (t *table) updateByPKJournaled(pk string, ords []int, vals []Value, journal func(Row) error) (bool, error) {
+	s := t.shardOf(pk)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rowID, ok := s.pk[pk]
+	if !ok {
+		return false, nil
+	}
+	r := s.rows[rowID]
+	if journal == nil {
+		for i, ord := range ords {
+			r[ord] = vals[i]
+		}
+		return true, nil
+	}
+	var saved [8]Value
+	old := saved[:0]
+	for _, ord := range ords {
+		old = append(old, r[ord])
+	}
+	for i, ord := range ords {
+		r[ord] = vals[i]
+	}
+	if err := journal(r); err != nil {
+		for i, ord := range ords {
+			r[ord] = old[i]
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// deleteByPKJournaled is the live PK-pinned delete: under the one shard lock
+// it journals (via journal) before tombstoning, so a WAL failure aborts
+// before the row is removed. journal may be nil (memory-only).
+func (t *table) deleteByPKJournaled(pk string, journal func() error) (bool, error) {
+	s := t.shardOf(pk)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rowID, ok := s.pk[pk]
+	if !ok {
+		return false, nil
+	}
+	if journal != nil {
+		if err := journal(); err != nil {
+			return false, err
+		}
+	}
+	s.rows[rowID] = nil
+	delete(s.pk, pk)
+	s.live--
+	return true, nil
+}
+
 // getByPK returns the row for pk, or (nil, false). The returned Row is
 // a shallow alias into the shard arena; callers that escape it past
 // the call must Clone.

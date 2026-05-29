@@ -512,9 +512,9 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		setVals[i] = v
 	}
 
-	// Fast path: PK equality — single shard. Mutate in place and journal
-	// inside that shard's write lock (WAL order == storage order for the
-	// one shard); no row clone on this hot path.
+	// Fast path: PK equality — single shard, journal-before-apply under that
+	// shard's lock (updateByPKJournaled). nil journal for memory-only keeps
+	// this hot path allocation-free.
 	if pl.pkLookup {
 		keyVal, err := evalExpr(pl.pkSource, &evalCtx{args: args})
 		if err != nil {
@@ -523,18 +523,20 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		if keyVal.IsNull() {
 			return 0, nil
 		}
-		mutate := func(r Row) Row {
-			for i, ord := range pl.updateOrdinals {
-				r[ord] = setVals[i]
-			}
-			if db.wal != nil {
-				body := encodeRow(db.scratch.get(), r)
-				db.wal.writeRecord(opUpdate, tbl.tableID, body)
+		var journal func(Row) error
+		if db.wal != nil {
+			journal = func(nr Row) error {
+				body := encodeRow(db.scratch.get(), nr)
+				werr := db.wal.writeRecord(opUpdate, tbl.tableID, body)
 				db.scratch.put(body)
+				return werr
 			}
-			return r
 		}
-		if tbl.update(keyVal.AsString(), mutate) {
+		ok, err := tbl.updateByPKJournaled(keyVal.AsString(), pl.updateOrdinals, setVals, journal)
+		if err != nil {
+			return 0, err
+		}
+		if ok {
 			return 1, nil
 		}
 		return 0, nil
@@ -574,7 +576,9 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 	tbl := db.t[pl.table.def.Name]
 	ctx := &evalCtx{cols: tbl.def.colByName, args: args}
 
-	// Fast path: PK equality — single map lookup, no scan.
+	// Fast path: PK equality — single shard, journal-before-tombstone under
+	// the shard lock (deleteByPKJournaled, which also closes the old
+	// getByPK→deleteByPK TOCTOU). nil journal for memory-only.
 	if pl.pkLookup {
 		keyVal, err := evalExpr(pl.pkSource, &evalCtx{args: args})
 		if err != nil {
@@ -583,19 +587,20 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 		if keyVal.IsNull() {
 			return 0, nil
 		}
-		pkStr := keyVal.AsString()
-		// Look up the row first so we can journal its PK before deletion.
-		// Concurrent deletes are fine: storage layer's deleteByPK is
-		// idempotent (returns false on absent).
-		if _, ok := tbl.getByPK(pkStr); !ok {
-			return 0, nil
-		}
+		var journal func() error
 		if db.wal != nil {
-			body := encodePK(db.scratch.get(), keyVal)
-			db.wal.writeRecord(opDelete, tbl.tableID, body)
-			db.scratch.put(body)
+			journal = func() error {
+				body := encodePK(db.scratch.get(), keyVal)
+				werr := db.wal.writeRecord(opDelete, tbl.tableID, body)
+				db.scratch.put(body)
+				return werr
+			}
 		}
-		if tbl.deleteByPK(pkStr) {
+		ok, err := tbl.deleteByPKJournaled(keyVal.AsString(), journal)
+		if err != nil {
+			return 0, err
+		}
+		if ok {
 			return 1, nil
 		}
 		return 0, nil

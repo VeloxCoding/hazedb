@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func benchSchema() Schema {
@@ -65,6 +66,44 @@ func BenchmarkInsert_WAL(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", i, "name", i%100)
 		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// Durability-cost ladder vs BenchmarkInsert_WAL (flush-only). WALSync fsyncs
+// on the ticker; WALSyncPerWrite fsyncs every record. Note: b.TempDir() in
+// the container sits on an overlay FS, so absolute fsync cost here is not a
+// real-disk number — read these as relative mode overhead, not latency SLAs.
+func BenchmarkInsert_WALSync(b *testing.B) {
+	dir := b.TempDir()
+	db, err := Open(Options{Schema: benchSchema(), SizeHint: b.N,
+		WALPath: filepath.Join(dir, "b.wal"), WALSync: true, WALFlushInterval: 5 * time.Millisecond})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", i, "name", i%100); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkInsert_WALSyncPerWrite(b *testing.B) {
+	dir := b.TempDir()
+	db, err := Open(Options{Schema: benchSchema(), SizeHint: b.N,
+		WALPath: filepath.Join(dir, "b.wal"), WALSyncPerWrite: true})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", i, "name", i%100); err != nil {
 			b.Fatal(err)
 		}
 	}

@@ -3,6 +3,7 @@ package hazedb
 import (
 	"fmt"
 	"sync"
+	"time"
 )
 
 // table is the runtime form of a resolvedTable with its storage attached.
@@ -41,6 +42,22 @@ type Options struct {
 	// SizeHint is a per-table row-count estimate for shard arena
 	// pre-allocation. Zero = use a small default.
 	SizeHint int
+
+	// WALFlushInterval is how often the background goroutine flushes the WAL
+	// buffer to the OS (and fsyncs when WALSync is set). Zero selects the
+	// safe default of 1s; a negative value disables the ticker entirely
+	// (manual FlushWAL() only). Ignored when WALPath is empty.
+	WALFlushInterval time.Duration
+
+	// WALSync makes the ticker fsync after flushing when anything is dirty,
+	// bounding power-loss to <= WALFlushInterval. Default false (flush only;
+	// survives process crash, not power loss).
+	WALSync bool
+
+	// WALSyncPerWrite flushes and fsyncs after every individual WAL record,
+	// under the WAL lock. Strongest durability (no acknowledged-loss window),
+	// highest per-write cost. Overrides the ticker's sync cadence.
+	WALSyncPerWrite bool
 }
 
 // Open prepares the database. If WALPath is non-empty, the file is
@@ -74,14 +91,26 @@ func Open(opts Options) (*DB, error) {
 		db.tableByID = append(db.tableByID, rt)
 	}
 	if opts.WALPath != "" {
-		w, err := openWAL(opts.WALPath)
+		w, err := openWAL(opts.WALPath, opts.WALSync, opts.WALSyncPerWrite)
 		if err != nil {
 			return nil, err
 		}
+		// Replay first (reads from the start), then position for appends and
+		// only then start the ticker — so the background goroutine never
+		// races the replay reader on the shared file handle.
 		if err := db.replayWAL(w); err != nil {
 			w.close()
 			return nil, err
 		}
+		if err := w.seekToEnd(); err != nil {
+			w.close()
+			return nil, err
+		}
+		flushInterval := opts.WALFlushInterval
+		if flushInterval == 0 {
+			flushInterval = time.Second // safe default
+		}
+		w.startTicker(flushInterval)
 		db.wal = w
 	}
 	return db, nil
