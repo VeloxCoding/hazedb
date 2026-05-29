@@ -2,7 +2,7 @@
 
 **Status:** M1–M6 implemented (store, SQL, WAL durability, UUIDv7 PK, partitioning, runtime catalog + `CREATE`/`DROP TABLE`, single-table transactions); M7–M8 open. See *Implementation status* for what is running vs designed.  
 **Module:** `github.com/VeloxCoding/hazedb`  
-**Updated:** 2026-05-29 (rev. 20 — Value packed to 32 bytes; ~half the row memory, faster reads/scans)
+**Updated:** 2026-05-29 (rev. 21 — gateway contract + output-boundary design note: db.go = Go API boundary, future `bridge/` = protocol boundary)
 
 ---
 
@@ -366,6 +366,46 @@ n, err := db.Exec("INSERT INTO messages (id, body) VALUES (?, ?)", id, "hello")
 ```
 
 `QueryRow` returns the first matching row without the `[]Row` slice `Query` allocates; for a PK lookup it goes straight through the point-read path. For an unpinned query it returns the first row of the scan, so add `LIMIT 1`.
+
+### The gateway — one official entry point
+
+`*DB` is the **single official entry point** — the gateway. Every consumer enters through it: Caddy calls these methods as native Go, and the FrankenPHP/PHP extension reaches them via cgo (`C → exported Go → the same methods`). **There is no second transport** — the PHP path is cgo calling the very same verbs, not a parallel API. This is the key difference from a network-fronted cache: both consumers bottom out in the same in-process Go call.
+
+The gateway verbs are `Open` / `Close` / `FlushWAL` / `Exec` / `Query` / `QueryRow`, plus `Transaction`. Every verb upholds three guarantees, so all consumers inherit them for free rather than re-implementing them per consumer:
+
+- **Validation.** SQL is parsed, planned, and bound to the live catalog (`prepare()`); args are type-coerced (`toValue`). Malformed SQL or args fail at the verb, identically for both consumers.
+- **Boundary clone.** `[]byte`/`Value` args are deep-copied on the way in, so storage never aliases caller memory; returned rows are deep-cloned on the way out, so callers may retain them past later writes.
+- **No bypass.** The storage types (`table`, `shard`, `catalog`, `wal`) are unexported, so no consumer can reach storage around the validated verbs.
+
+**Boundary rule.** Database semantics live behind the gateway (the core package). Cross-cutting concerns — auth, tenancy, logging, and the PHP↔Go marshalling the extension needs — live in the consumer/adapter, which then calls the same verbs. The cgo extension is therefore a *translation layer* (PHP zvals ↔ Go `Value`, result-set marshalling), not a second API surface; Caddy needs none of that translation and calls the verbs directly. Consumer-specific concerns never move into the core.
+
+This is why hazedb has **no separate `Gateway` type** the way a multi-transport cache does: with one transport, `*DB` already *is* the gateway. A second public type would only restate what `*DB`'s exported surface already guarantees.
+
+### Output boundaries — Go-native vs protocol (deferred, to build on later)
+
+A design thread worth recording before it's built, because "gateway" hides two different boundaries:
+
+**db.go is the Go API boundary.** It returns Go types — `[]string`, `[]Row`, `Value`, `UUID`, `error`. A Go consumer (Caddy serving hazedb directly) handles those natively and needs nothing more. *Caddy-as-Go is not a special case* — it only needs encoding when it writes an HTTP wire response, at which point it's just another wire consumer.
+
+**A non-Go consumer needs a protocol boundary** — Go `Value`s turned into bytes a caller can read stably. That is real code that has to live somewhere, but it is *not* a new layer between Go and the engine: it sits **beside** db.go, calls the same gateway verbs, and encodes their results. The engine never learns it exists. Deferred shape (small package, function-level, not a service — only when the first non-Go consumer lands):
+
+```
+bridge/            // protocol/encoding boundary — portable, shared by wire consumers
+  EncodeRowsJSON
+  EncodeRowsMsgPack
+  DecodeParams
+  MapError
+```
+
+So there are **three** things, not two:
+
+1. **db.go** — the Go API boundary (gateway). Shared by every consumer.
+2. **`bridge/`** — portable encoders (JSON/MsgPack). Shared by *wire* consumers (HTTP responses, Node over a socket, debug). Deferred.
+3. **The PHP extension's `Value` → zval translation** — PHP-specific (depends on PHP headers), therefore *unshareable*; it lives in the extension, not in `bridge/`.
+
+**Open, bench-decided question:** what format the *fast* FrankenPHP path uses. hazedb's whole pitch is in-process cgo with no serialization roundtrip, so JSON on that path may reintroduce exactly the cost the architecture removes — the maximal-speed alternative is `Value` → zval directly in the extension (item 3). The cgo section below currently defaults to JSON-with-optional-skip; whether that is fast *enough* relative to the ~200 ns cgo crossing is a `build.sh` + `bench.sh` measurement, not an assumption. `bridge/` is useful for the portable consumers either way; the question only governs whether the PHP fast path routes through it or goes zval-direct.
+
+The `Value` accessors (`Str`/`Int`/`Bytes`/`UUID`) are already the stable read surface all of the above build on — a JSON encoder and a zval translator are both just "loop rows, switch on `Kind`, call the accessor." The encoding sits on top of that surface; it is not a second safety layer.
 
 ### Prepared plans and the catalog version
 

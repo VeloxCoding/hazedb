@@ -14,6 +14,30 @@ type tableRT struct {
 	tableID uint16
 }
 
+// --- Gateway contract -------------------------------------------------------
+//
+// *DB is the single official entry point — the "gateway". Every consumer enters
+// through it: Caddy calls these methods as native Go, and the FrankenPHP/PHP
+// extension reaches them via cgo (C → exported Go → these same methods). There
+// is no second transport — the PHP path is cgo calling the very same verbs, not
+// a parallel API. The gateway verbs are Open/Close/FlushWAL/Exec/Query/QueryRow
+// here, plus Transaction (txn.go).
+//
+// Every verb upholds these guarantees, so all consumers inherit them for free:
+//
+//   - Validation. SQL is parsed, planned, and bound to the live catalog in
+//     prepare(); args are type-coerced in toValue. Bad SQL or args fail here.
+//   - Boundary clone. []byte/Value args are deep-copied on the way in (storage
+//     never aliases caller memory), and returned rows are deep-cloned on the way
+//     out (callers may retain them past later writes).
+//   - No bypass. table/shard/catalog/wal are unexported, so no consumer can
+//     reach storage around the validated verbs.
+//
+// Boundary rule: db semantics live behind the gateway (this package);
+// cross-cutting concerns — auth, tenancy, logging, and the PHP↔Go marshalling
+// the extension needs — live in the consumer/adapter, which then calls these
+// same verbs. Never push consumer-specific concerns into the core.
+//
 // DB is the embedded database handle. One DB per process per WAL
 // path. Open is goroutine-safe; Exec and Query are goroutine-safe.
 type DB struct {
