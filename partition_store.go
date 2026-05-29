@@ -115,6 +115,39 @@ func (t *table) getByPKPartitioned(pk UUID) (Row, bool) {
 	return nil, false
 }
 
+// getByPKProjectIntoPartitioned is the scan-into form of
+// getByPKProjectPartitioned: it appends projected cells into dst (caller-owned
+// and reused) instead of allocating a Row. Same resolve + stale-location retry.
+func (t *table) getByPKProjectIntoPartitioned(pk UUID, ords []int, dst []Value) ([]Value, bool) {
+	for retry := 0; retry < pkRetryBudget; retry++ {
+		t.pkDir.mu.RLock()
+		loc, ok := t.pkDir.idx[pk]
+		t.pkDir.mu.RUnlock()
+		if !ok {
+			return dst[:0], false
+		}
+		s := &t.shards[loc.shard]
+		s.mu.RLock()
+		out, found := dst[:0], false
+		if loc.rowID < uint64(len(s.rows)) {
+			if r := s.rows[loc.rowID]; r != nil && r[t.def.pkOrdinal].UUID() == pk {
+				if ords == nil {
+					out = appendRowClone(out, r)
+				} else {
+					out = appendProjectClone(out, r, ords)
+				}
+				found = true
+			}
+		}
+		s.mu.RUnlock()
+		if found {
+			return out, true
+		}
+		// Stale location (deleted or moved) → re-resolve via the directory.
+	}
+	return dst[:0], false
+}
+
 // getByPKProjectPartitioned is getByPKPartitioned for a projected SELECT:
 // same resolve + retry-on-stale-location loop, but it clones only the ords
 // columns under the shard read lock instead of the whole row.

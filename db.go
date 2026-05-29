@@ -155,11 +155,16 @@ func (db *DB) FlushWAL() error {
 // Exec runs an INSERT, UPDATE, DELETE, CREATE TABLE, or DROP TABLE. Returns
 // the affected row count (0 for DDL).
 func (db *DB) Exec(sql string, args ...any) (int, error) {
-	cat := db.cat.Load() // one snapshot for the whole call
-	pl, err := db.prepare(sql, cat)
+	pl, err := db.prepare(sql, db.cat.Load())
 	if err != nil {
 		return 0, err
 	}
+	return db.execPlan(pl, args)
+}
+
+// execPlan runs a non-SELECT plan against raw args. Shared by Exec (which looks
+// the plan up by SQL each call) and *Stmt.Exec (which holds a compiled plan).
+func (db *DB) execPlan(pl *plan, args []any) (int, error) {
 	switch s := pl.st.(type) {
 	case *createStmt:
 		return 0, db.createTable(s.def)
@@ -186,11 +191,15 @@ func (db *DB) Exec(sql string, args ...any) (int, error) {
 // and the rows. Rows are deep-cloned; callers may retain them past
 // future Exec calls without worrying about aliasing into storage.
 func (db *DB) Query(sql string, args ...any) ([]string, []Row, error) {
-	cat := db.cat.Load()
-	pl, err := db.prepare(sql, cat)
+	pl, err := db.prepare(sql, db.cat.Load())
 	if err != nil {
 		return nil, nil, err
 	}
+	return db.queryPlan(pl, args)
+}
+
+// queryPlan runs a SELECT plan against raw args. Shared by Query and *Stmt.Query.
+func (db *DB) queryPlan(pl *plan, args []any) ([]string, []Row, error) {
 	if _, ok := pl.st.(*selectStmt); !ok {
 		return nil, nil, fmt.Errorf("fastsql: Query used with non-SELECT — use Exec instead")
 	}
@@ -216,11 +225,16 @@ func (db *DB) Query(sql string, args ...any) ([]string, []Row, error) {
 // to avoid scanning more rows than needed. The returned row is deep-cloned, as
 // with Query.
 func (db *DB) QueryRow(sql string, args ...any) ([]string, Row, error) {
-	cat := db.cat.Load()
-	pl, err := db.prepare(sql, cat)
+	pl, err := db.prepare(sql, db.cat.Load())
 	if err != nil {
 		return nil, nil, err
 	}
+	return db.queryRowPlan(pl, args)
+}
+
+// queryRowPlan runs a single-row SELECT plan against raw args. Shared by
+// QueryRow and *Stmt.QueryRow.
+func (db *DB) queryRowPlan(pl *plan, args []any) ([]string, Row, error) {
 	if _, ok := pl.st.(*selectStmt); !ok {
 		return nil, nil, fmt.Errorf("fastsql: QueryRow used with non-SELECT — use Exec instead")
 	}

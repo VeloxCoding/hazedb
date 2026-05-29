@@ -293,6 +293,31 @@ func (t *table) getByPKProject(pk UUID, ords []int) (Row, bool) {
 	return pr, pr != nil
 }
 
+// getByPKProjectInto is the scan-into form of getByPKProject: it appends the
+// projected cells into dst (caller-owned and reused) rather than allocating a
+// fresh Row, so a projection without BYTES columns makes no allocation. ords
+// nil means all columns. Returns the grown slice and whether a row matched.
+func (t *table) getByPKProjectInto(pk UUID, ords []int, dst []Value) ([]Value, bool) {
+	if t.pkDir != nil {
+		return t.getByPKProjectIntoPartitioned(pk, ords, dst)
+	}
+	s := t.shardOf(pk)
+	s.mu.RLock()
+	out, found := dst[:0], false
+	if rowID, ok := s.pk[pk]; ok {
+		if r := s.rows[rowID]; r != nil {
+			if ords == nil {
+				out = appendRowClone(out, r)
+			} else {
+				out = appendProjectClone(out, r, ords)
+			}
+			found = true
+		}
+	}
+	s.mu.RUnlock()
+	return out, found
+}
+
 // projectClone copies the ords columns of r into a fresh Row, deep-copying any
 // []byte cells so the result aliases nothing in the arena. Caller holds the
 // shard read lock.
