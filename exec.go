@@ -63,6 +63,10 @@ type plan struct {
 	// SELECT projection: ordinals into the row, in output order. nil if
 	// SELECT *.
 	projOrdinals []int
+	// colNames is the SELECT's output column names, computed once at plan time
+	// and returned by every Query on this (cached) plan. Read-only: it is
+	// shared across concurrent callers, so callers must not mutate it.
+	colNames []string
 	// SELECT ORDER BY: ordinal of the order column. -1 if none.
 	orderOrdinal int
 	// INSERT column ordinals matching the values list.
@@ -125,6 +129,19 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 					return nil, fmt.Errorf("%w: %q.%q", ErrUnknownColumn, tname, c.col)
 				}
 				pl.projOrdinals = append(pl.projOrdinals, ord)
+			}
+		}
+		// Output column names, computed once and reused by every Query on this
+		// cached plan (read-only).
+		if s.starAll {
+			pl.colNames = make([]string, len(rt.def.Columns))
+			for i, c := range rt.def.Columns {
+				pl.colNames[i] = c.Name
+			}
+		} else {
+			pl.colNames = make([]string, len(s.cols))
+			for i, c := range s.cols {
+				pl.colNames[i] = c.col
 			}
 		}
 		if s.orderCol != "" {
@@ -422,20 +439,6 @@ func truthy(v Value) bool {
 	return false
 }
 
-func selectColNames(st *selectStmt, tbl *tableRT) []string {
-	colNames := make([]string, 0, len(tbl.def.def.Columns))
-	if st.starAll {
-		for _, c := range tbl.def.def.Columns {
-			colNames = append(colNames, c.Name)
-		}
-	} else {
-		for _, c := range st.cols {
-			colNames = append(colNames, c.col)
-		}
-	}
-	return colNames
-}
-
 func evalLitOrParamAny(e expr, args []any) (Value, error) {
 	switch x := e.(type) {
 	case *litValue:
@@ -453,7 +456,7 @@ func evalLitOrParamAny(e expr, args []any) (Value, error) {
 func (db *DB) execSelectPK(pl *plan, keyVal Value) ([]string, []Row, error) {
 	st := pl.st.(*selectStmt)
 	tbl := pl.rt
-	colNames := selectColNames(st, tbl)
+	colNames := pl.colNames
 	if keyVal.IsNull() {
 		return colNames, nil, nil
 	}
@@ -482,7 +485,7 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 	st := pl.st.(*selectStmt)
 	tbl := pl.rt
 
-	colNames := selectColNames(st, tbl)
+	colNames := pl.colNames
 
 	ctx := evalCtx{cols: tbl.def.colByName, args: args}
 

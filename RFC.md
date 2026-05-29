@@ -2,7 +2,7 @@
 
 **Status:** M1–M6 implemented (store, SQL, WAL durability, UUIDv7 PK, partitioning, runtime catalog + `CREATE`/`DROP TABLE`, single-table transactions); M7–M8 open. See *Implementation status* for what is running vs designed.  
 **Module:** `github.com/VeloxCoding/hazedb`  
-**Updated:** 2026-05-29 (rev. 16 — replay-apply guards PK-immutability/non-nil)
+**Updated:** 2026-05-29 (rev. 17 — cached SELECT column names; one fewer alloc per read)
 
 ---
 
@@ -582,13 +582,13 @@ All four stores key by the same 16-byte UUID, so the comparison is fair on key w
 | Operation | hazedb (mem) | hazedb (+WAL) | SQLite (mem) | SQLite (disk) | Bolt |
 |---|---:|---:|---:|---:|---:|
 | INSERT | **0.49 µs** | 0.62 µs | 1.8 µs | 20 µs | 1 500 µs † |
-| SELECT WHERE id=? | **0.19 µs** | — | 2.0 µs | 2.8 µs | 0.52 µs |
+| SELECT WHERE id=? | **0.16 µs** | — | 2.0 µs | 2.8 µs | 0.52 µs |
 | UPDATE WHERE id=? | **0.15 µs** | — | 1.0 µs | 2.5 µs | 1 400 µs † |
 | DELETE WHERE id=? | **0.34 µs** | — | — | 20–49 µs | 4 000 µs † |
 
-**Even RAM-vs-RAM, hazedb leads:** vs SQLite `:memory:` it is ~10× on reads, ~3.5× on inserts, ~6× on updates. Allocations per op are now 1 (update/delete), 2 (insert), 4 (point read).
+**Even RAM-vs-RAM, hazedb leads:** vs SQLite `:memory:` it is ~12× on reads, ~3.5× on inserts, ~6× on updates. Allocations per op are now 1 (update/delete), 2 (insert), 3 (point read), 4 (range scan).
 
-**What the gap is — and isn't.** It is mostly the Go *access layer*, and it is **not** the cgo crossing. Evidence: swapping the cgo driver for **pure-Go SQLite** (`modernc.org/sqlite`, no cgo, same `database/sql`) made it *slower*, not faster — read **4.3 µs**, insert **14.9 µs**, update **3.4 µs** vs the cgo build's 2.0 / 1.7 / 1.0 µs. So removing cgo costs speed; the crossing was never the bottleneck. What a Go program actually pays to use SQLite is the `database/sql` layer (reflection, interface conversions, ~25 allocations per read vs hazedb's 4) on top of a general-purpose engine. hazedb is faster because it skips that layer — typed rows returned in-process, no SQL dispatch per call — which is the project thesis, **not** a claim that its lookup beats SQLite's B-tree. † Write rows for SQLite-disk and Bolt are **not** like-for-like on durability (they fsync/journal to disk; hazedb-mem does not). Allocations/op: hazedb 1–4, SQLite 9–26, Bolt 49–66.
+**What the gap is — and isn't.** It is mostly the Go *access layer*, and it is **not** the cgo crossing. Evidence: swapping the cgo driver for **pure-Go SQLite** (`modernc.org/sqlite`, no cgo, same `database/sql`) made it *slower*, not faster — read **4.3 µs**, insert **14.9 µs**, update **3.4 µs** vs the cgo build's 2.0 / 1.7 / 1.0 µs. So removing cgo costs speed; the crossing was never the bottleneck. What a Go program actually pays to use SQLite is the `database/sql` layer (reflection, interface conversions, ~25 allocations per read vs hazedb's 3) on top of a general-purpose engine. hazedb is faster because it skips that layer — typed rows returned in-process, no SQL dispatch per call — which is the project thesis, **not** a claim that its lookup beats SQLite's B-tree. † Write rows for SQLite-disk and Bolt are **not** like-for-like on durability (they fsync/journal to disk; hazedb-mem does not). Allocations/op: hazedb 1–4, SQLite 9–26, Bolt 49–66.
 
 ### Transactions (single-table, v1)
 
@@ -602,7 +602,7 @@ Commit locks only the shards the staged statements touch (not all shards) and wr
 
 | Operation | Single | Parallel |
 |---|---:|---:|
-| SELECT WHERE id=? | 0.19 µs | **0.08 µs** |
+| SELECT WHERE id=? | 0.16 µs | **0.06 µs** |
 | INSERT (memory) | 0.49 µs | **0.10 µs** |
 | UPDATE WHERE id=? | 0.15 µs | **0.04 µs** |
 
@@ -622,7 +622,7 @@ A feed query `SELECT … WHERE partitionkey=? ORDER BY seq DESC LIMIT n` reads o
 |---|---:|---:|
 | One partition (~100 rows) of a 10k-row table, `ORDER BY … LIMIT` | **~34 µs** | 128 |
 
-The partition index earns its keep when `ORDER BY` forces gathering the whole matching set to sort. **Without `ORDER BY`, `LIMIT` now short-circuits the scan** (stop at the limit, project under the lock): an unindexed `SELECT id FROM users WHERE age > ? LIMIT 10` over 10k rows (≈4 900 match) is **~1.05 µs / 5 allocs** — versus **~770 µs / 4 932 allocs before the pushdown** (rev. 12), which cloned every matching row before truncating. So the index matters for ordered tail scans; for an unordered `LIMIT`, the short-circuit already makes a full scan cheap.
+The partition index earns its keep when `ORDER BY` forces gathering the whole matching set to sort. **Without `ORDER BY`, `LIMIT` now short-circuits the scan** (stop at the limit, project under the lock): an unindexed `SELECT id FROM users WHERE age > ? LIMIT 10` over 10k rows (≈4 900 match) is **~0.93 µs / 4 allocs** — versus **~770 µs / 4 932 allocs before the pushdown** (rev. 12), which cloned every matching row before truncating. So the index matters for ordered tail scans; for an unordered `LIMIT`, the short-circuit already makes a full scan cheap.
 
 ### Mixed workload — 4 writers + 16 readers, 2 s, WAL on
 
