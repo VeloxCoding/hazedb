@@ -142,6 +142,9 @@ func (db *DB) plan(st stmt) (*plan, error) {
 			if ord == rt.pkOrdinal {
 				return nil, fmt.Errorf("%w: %q.%q", ErrPKUpdate, tname, a.col)
 			}
+			if ord == rt.partitionOrdinal {
+				return nil, fmt.Errorf("%w: %q.%q is the PartitionKey (immutable; move via DELETE + INSERT)", ErrPKUpdate, tname, a.col)
+			}
 			if rt.def.Columns[ord].Immutable {
 				return nil, fmt.Errorf("%w: %q.%q is immutable", ErrPKUpdate, tname, a.col)
 			}

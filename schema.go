@@ -43,7 +43,12 @@ type ColumnDef struct {
 	// Immutable rejects UPDATE SET on this column at plan time. Used for an
 	// ordering column (e.g. seq) so a tail index can cache its order safely.
 	Immutable bool
-	Nullable  bool
+	// PartitionKey marks the column the table is sharded/ordered by (e.g.
+	// thread_id on a messages table). At most one per table; must be UUID in
+	// v1; implicitly immutable (a partition move is DELETE + INSERT). Storage
+	// routing + the ordered tail index build on it.
+	PartitionKey bool
+	Nullable     bool
 }
 
 // TableDef defines a table. Exactly one column must have PK=true.
@@ -61,10 +66,14 @@ type Schema struct {
 // resolvedTable is the internal, validated form of a TableDef. Holds
 // the column ordinal lookup map used by both parser and executor.
 type resolvedTable struct {
-	def      TableDef
-	colByName map[string]int
-	pkOrdinal int
+	def              TableDef
+	colByName        map[string]int
+	pkOrdinal        int
+	partitionOrdinal int // -1 if the table is not partitioned
 }
+
+// partitioned reports whether the table declares a PartitionKey.
+func (rt *resolvedTable) partitioned() bool { return rt.partitionOrdinal >= 0 }
 
 func resolveSchema(s Schema) (map[string]*resolvedTable, error) {
 	out := make(map[string]*resolvedTable, len(s.Tables))
@@ -76,9 +85,10 @@ func resolveSchema(s Schema) (map[string]*resolvedTable, error) {
 			return nil, fmt.Errorf("schema: duplicate table %q", t.Name)
 		}
 		rt := &resolvedTable{
-			def:       t,
-			colByName: make(map[string]int, len(t.Columns)),
-			pkOrdinal: -1,
+			def:              t,
+			colByName:        make(map[string]int, len(t.Columns)),
+			pkOrdinal:        -1,
+			partitionOrdinal: -1,
 		}
 		for i, c := range t.Columns {
 			if c.Name == "" {
@@ -97,9 +107,21 @@ func resolveSchema(s Schema) (map[string]*resolvedTable, error) {
 				}
 				rt.pkOrdinal = i
 			}
+			if c.PartitionKey {
+				if rt.partitionOrdinal >= 0 {
+					return nil, fmt.Errorf("schema: table %q has multiple PartitionKey columns", t.Name)
+				}
+				if c.Type != TypeUUID {
+					return nil, fmt.Errorf("schema: table %q PartitionKey column %q must be UUID, got %s", t.Name, c.Name, c.Type)
+				}
+				rt.partitionOrdinal = i
+			}
 		}
 		if rt.pkOrdinal < 0 {
 			return nil, fmt.Errorf("schema: table %q has no PK column", t.Name)
+		}
+		if rt.partitionOrdinal == rt.pkOrdinal {
+			return nil, fmt.Errorf("schema: table %q PartitionKey must be a different column than the PK", t.Name)
 		}
 		out[t.Name] = rt
 	}

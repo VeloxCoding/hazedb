@@ -10,7 +10,7 @@ func msgsSchema() Schema {
 		Name: "messages",
 		Columns: []ColumnDef{
 			{Name: "id", Type: TypeUUID, PK: true},
-			{Name: "thread", Type: TypeUUID},
+			{Name: "thread", Type: TypeUUID, PartitionKey: true},
 			{Name: "seq", Type: TypeInt, Immutable: true},
 			{Name: "body", Type: TypeString},
 		},
