@@ -55,7 +55,13 @@ func (*dropStmt) isStmt()   {}
 // comparison ops, AND/OR/NOT, IS NULL, IS NOT NULL.
 type expr interface{ isExpr() }
 
-type colRef struct{ name string }
+// colRef names a column; ord is its row ordinal, bound at plan time by
+// validateExpr (-1 until bound) so evalExpr can index the row directly instead
+// of a per-row name→ordinal map lookup. ord < 0 falls back to the name lookup.
+type colRef struct {
+	name string
+	ord  int
+}
 type litValue struct{ v Value }
 type paramRef struct{ index int } // zero-based into args slice
 

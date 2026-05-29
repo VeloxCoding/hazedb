@@ -292,9 +292,11 @@ func validateExpr(e expr, rt *resolvedTable) error {
 	}
 	switch x := e.(type) {
 	case *colRef:
-		if _, ok := rt.colByName[x.name]; !ok {
+		ord, ok := rt.colByName[x.name]
+		if !ok {
 			return fmt.Errorf("%w: %q.%q", ErrUnknownColumn, rt.def.Name, x.name)
 		}
+		x.ord = ord // bind once at plan time; evalExpr indexes by ord
 	case *binOp:
 		if err := validateExpr(x.lhs, rt); err != nil {
 			return err
@@ -322,6 +324,9 @@ func evalExpr(e expr, ctx *evalCtx) (Value, error) {
 	case nil:
 		return Bool(true), nil
 	case *colRef:
+		if x.ord >= 0 {
+			return ctx.row[x.ord], nil
+		}
 		return ctx.row[ctx.cols[x.name]], nil
 	case *litValue:
 		return x.v, nil

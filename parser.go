@@ -482,7 +482,7 @@ func (p *parser) parseAtom() (expr, error) {
 		return e, nil
 	case tkIdent:
 		p.advance()
-		return &colRef{name: t.text}, nil
+		return &colRef{name: t.text, ord: -1}, nil
 	case tkInt:
 		p.advance()
 		n, err := strconv.ParseInt(t.text, 10, 64)
