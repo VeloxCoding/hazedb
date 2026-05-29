@@ -1,0 +1,25 @@
+# hazedb M4 baseline — after the UUID PK hard-switch
+
+Machine: AMD Ryzen AI MAX+ 395 (32 threads), golang:1.22 in Docker.
+Command: go test -run='^$' -bench=<core> -benchmem -count=5 .
+
+Core path medians vs the M1+M2 baseline (bench/baseline_m2.txt):
+
+| Benchmark        | M2 ns | M4 ns | M2 B/op | M4 B/op | allocs (M2->M4) |
+|------------------|------:|------:|--------:|--------:|-----------------|
+| Insert_Mem       |  ~478 |  ~512 |    ~385 |    ~485 | 4 -> 3          |
+| Insert_WAL       |  ~542 |  ~657 |    ~407 |    ~500 | 4 -> 4          |
+| SelectByPK_Mem   |  ~207 |  ~227 |    ~263 |    ~312 | 5 -> 5          |
+| Update_Mem       |  ~181 |  ~208 |    ~191 |    ~240 | 3 -> 3          |
+| Delete_Mem       |  ~390 |  ~390 |     ~79 |     ~96 | 2 -> 2          |
+
+Why it moved: the PK is now a 16-byte UUID stored inline in every Value cell
+(KindUUID + [16]byte field), so each row carries +16 bytes per cell — that is
+the +10-22% ns and +50-100 B/op. allocs are flat or better because the UUID
+map key avoids the string allocation the integer PK incurred. This is the
+inherent cost of UUID PKs on the generic []Value interpreter path; the typed
+codegen path (later milestone) removes []Value entirely and reclaims it.
+
+Cross-store comparison (bench_compare_test.go) is NOT re-baselined: hazedb now
+uses 16-byte UUID keys while SQLite/Bolt still use 8-byte int keys, so those
+numbers are not apples-to-apples until all three use UUIDs (open decision).

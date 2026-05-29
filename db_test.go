@@ -7,14 +7,17 @@ import (
 	"testing"
 )
 
-// testSchema returns a small schema used across most tests.
+// testSchema returns a small schema used across most tests. The PK is a
+// UUID (hard requirement since M4); tests build deterministic ordered PKs
+// with tid(n) so query strings and ORDER BY id semantics carry over from the
+// old integer-PK tests unchanged.
 func testSchema() Schema {
 	return Schema{
 		Tables: []TableDef{
 			{
 				Name: "users",
 				Columns: []ColumnDef{
-					{Name: "id", Type: TypeInt, PK: true},
+					{Name: "id", Type: TypeUUID, PK: true},
 					{Name: "name", Type: TypeString},
 					{Name: "age", Type: TypeInt},
 					{Name: "active", Type: TypeBool, Nullable: true},
@@ -22,6 +25,22 @@ func testSchema() Schema {
 			},
 		},
 	}
+}
+
+// tid builds a deterministic, byte-ordered, valid-v7 UUID from an int — the
+// stand-in for the integer PKs the tests used before M4. Monotonic in n
+// (n lives in the 48-bit timestamp field), so ORDER BY id == order by n.
+func tid(n int) UUID {
+	var u UUID
+	u[0] = byte(n >> 40)
+	u[1] = byte(n >> 32)
+	u[2] = byte(n >> 24)
+	u[3] = byte(n >> 16)
+	u[4] = byte(n >> 8)
+	u[5] = byte(n)
+	u[6] = 0x70 // version 7
+	u[8] = 0x80 // variant 10
+	return u
 }
 
 func openMem(t *testing.T) *DB {
@@ -48,10 +67,10 @@ func openDBWithWAL(t *testing.T) (*DB, string) {
 
 func TestInsertAndSelect(t *testing.T) {
 	db := openMem(t)
-	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 1, "alice", 30); err != nil {
+	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "alice", 30); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 2, "bob", 25); err != nil {
+	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(2), "bob", 25); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 
@@ -65,7 +84,7 @@ func TestInsertAndSelect(t *testing.T) {
 	if len(rows) != 2 {
 		t.Fatalf("rows: got %d", len(rows))
 	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i][0].I < rows[j][0].I })
+	sort.Slice(rows, func(i, j int) bool { c, _ := rows[i][0].Compare(rows[j][0]); return c < 0 })
 	if rows[0][1].S != "alice" || rows[0][2].I != 30 {
 		t.Errorf("row 0: %v", rows[0])
 	}
@@ -76,7 +95,7 @@ func TestInsertAndSelect(t *testing.T) {
 
 func TestSelectStar(t *testing.T) {
 	db := openMem(t)
-	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 1, "alice", 30)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "alice", 30)
 	cols, rows, err := db.Query("SELECT * FROM users")
 	if err != nil {
 		t.Fatalf("query: %v", err)
@@ -84,16 +103,16 @@ func TestSelectStar(t *testing.T) {
 	if len(cols) != 4 {
 		t.Fatalf("cols: %v", cols)
 	}
-	if len(rows) != 1 || rows[0][0].I != 1 || rows[0][1].S != "alice" {
+	if len(rows) != 1 || rows[0][0].U != tid(1) || rows[0][1].S != "alice" {
 		t.Errorf("row: %v", rows[0])
 	}
 }
 
 func TestSelectWhere(t *testing.T) {
 	db := openMem(t)
-	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 1, "alice", 30)
-	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 2, "bob", 25)
-	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 3, "carol", 40)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "alice", 30)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(2), "bob", 25)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(3), "carol", 40)
 
 	_, rows, err := db.Query("SELECT id FROM users WHERE age > ?", 28)
 	if err != nil {
@@ -107,7 +126,7 @@ func TestSelectWhere(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
-	if len(rows) != 1 || rows[0][0].I != 1 {
+	if len(rows) != 1 || rows[0][0].U != tid(1) {
 		t.Errorf("expected alice row, got %v", rows)
 	}
 
@@ -123,7 +142,7 @@ func TestSelectWhere(t *testing.T) {
 func TestSelectOrderByLimit(t *testing.T) {
 	db := openMem(t)
 	for i, name := range []string{"alice", "bob", "carol", "dave"} {
-		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", i+1, name, 20+i*5)
+		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i+1), name, 20+i*5)
 	}
 	_, rows, err := db.Query("SELECT id, age FROM users ORDER BY age DESC LIMIT 2")
 	if err != nil {
@@ -144,17 +163,17 @@ func TestSelectOrderByLimit(t *testing.T) {
 
 func TestUpdate(t *testing.T) {
 	db := openMem(t)
-	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 1, "alice", 30)
-	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 2, "bob", 25)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "alice", 30)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(2), "bob", 25)
 
-	n, err := db.Exec("UPDATE users SET age = ? WHERE id = ?", 31, 1)
+	n, err := db.Exec("UPDATE users SET age = ? WHERE id = ?", 31, tid(1))
 	if err != nil {
 		t.Fatalf("update: %v", err)
 	}
 	if n != 1 {
 		t.Errorf("n=%d", n)
 	}
-	_, rows, _ := db.Query("SELECT age FROM users WHERE id = ?", 1)
+	_, rows, _ := db.Query("SELECT age FROM users WHERE id = ?", tid(1))
 	if rows[0][0].I != 31 {
 		t.Errorf("got %v", rows[0][0])
 	}
@@ -167,17 +186,17 @@ func TestUpdate(t *testing.T) {
 
 func TestUpdatePKRefused(t *testing.T) {
 	db := openMem(t)
-	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 1, "alice", 30)
-	if _, err := db.Exec("UPDATE users SET id = ? WHERE id = ?", 9, 1); err == nil {
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "alice", 30)
+	if _, err := db.Exec("UPDATE users SET id = ? WHERE id = ?", tid(9), tid(1)); err == nil {
 		t.Error("expected error on PK update")
 	}
 }
 
 func TestDelete(t *testing.T) {
 	db := openMem(t)
-	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 1, "alice", 30)
-	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 2, "bob", 25)
-	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 3, "carol", 40)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "alice", 30)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(2), "bob", 25)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(3), "carol", 40)
 
 	n, err := db.Exec("DELETE FROM users WHERE age < ?", 30)
 	if err != nil {
@@ -200,15 +219,15 @@ func TestDelete(t *testing.T) {
 
 func TestDuplicatePK(t *testing.T) {
 	db := openMem(t)
-	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 1, "alice", 30)
-	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 1, "alice2", 31); err == nil {
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "alice", 30)
+	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "alice2", 31); err == nil {
 		t.Error("expected duplicate PK error")
 	}
 }
 
 func TestNullHandling(t *testing.T) {
 	db := openMem(t)
-	if _, err := db.Exec("INSERT INTO users (id, name, age, active) VALUES (?, ?, ?, ?)", 1, "alice", 30, nil); err != nil {
+	if _, err := db.Exec("INSERT INTO users (id, name, age, active) VALUES (?, ?, ?, ?)", tid(1), "alice", 30, nil); err != nil {
 		t.Fatalf("insert null: %v", err)
 	}
 	_, rows, _ := db.Query("SELECT active FROM users WHERE active IS NULL")
@@ -216,7 +235,7 @@ func TestNullHandling(t *testing.T) {
 		t.Errorf("IS NULL: %d", len(rows))
 	}
 
-	db.Exec("UPDATE users SET active = ? WHERE id = ?", true, 1)
+	db.Exec("UPDATE users SET active = ? WHERE id = ?", true, tid(1))
 	_, rows, _ = db.Query("SELECT active FROM users WHERE active IS NOT NULL")
 	if len(rows) != 1 || rows[0][0].I != 1 {
 		t.Errorf("IS NOT NULL: %v", rows)
@@ -225,10 +244,10 @@ func TestNullHandling(t *testing.T) {
 
 func TestWALRoundTrip(t *testing.T) {
 	db, path := openDBWithWAL(t)
-	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 1, "alice", 30)
-	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 2, "bob", 25)
-	db.Exec("UPDATE users SET age = ? WHERE id = ?", 31, 1)
-	db.Exec("DELETE FROM users WHERE id = ?", 2)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "alice", 30)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(2), "bob", 25)
+	db.Exec("UPDATE users SET age = ? WHERE id = ?", 31, tid(1))
+	db.Exec("DELETE FROM users WHERE id = ?", tid(2))
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -239,14 +258,14 @@ func TestWALRoundTrip(t *testing.T) {
 	}
 	defer db2.Close()
 	_, rows, _ := db2.Query("SELECT id, age FROM users")
-	if len(rows) != 1 || rows[0][0].I != 1 || rows[0][1].I != 31 {
+	if len(rows) != 1 || rows[0][0].U != tid(1) || rows[0][1].I != 31 {
 		t.Errorf("after replay: got %v", rows)
 	}
 }
 
 func TestWALPartialTail(t *testing.T) {
 	db, path := openDBWithWAL(t)
-	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 1, "alice", 30)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "alice", 30)
 	db.Close()
 
 	// Append garbage that looks like the start of a record but is

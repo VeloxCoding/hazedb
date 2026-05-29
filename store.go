@@ -20,8 +20,8 @@ func shardCount() int {
 	return 1 << bits.Len(uint(n-1))
 }
 
-// table is the in-memory storage for one declared table. Sharded by
-// PK string hash so independent partitions seldom contend.
+// table is the in-memory storage for one declared table. Sharded by the
+// UUID primary key's hash so independent keys seldom contend.
 //
 // Row layout: each shard owns a contiguous []Row arena. rowIDs are
 // per-shard indices into that arena. Deleted rows are tombstoned in
@@ -35,9 +35,9 @@ type table struct {
 
 type tableShard struct {
 	mu   sync.RWMutex
-	rows []Row              // arena; nil entries are tombstones
-	pk   map[string]uint32  // PK-string → rowID
-	live int                // count of non-tombstoned rows
+	rows []Row            // arena; nil entries are tombstones
+	pk   map[UUID]uint64  // PK (UUID) → rowID
+	live int              // count of non-tombstoned rows
 }
 
 func newTable(def *resolvedTable, sizeHint int) *table {
@@ -53,17 +53,16 @@ func newTable(def *resolvedTable, sizeHint int) *table {
 	}
 	for i := range t.shards {
 		t.shards[i].rows = make([]Row, 0, per)
-		t.shards[i].pk = make(map[string]uint32, per)
+		t.shards[i].pk = make(map[UUID]uint64, per)
 	}
 	return t
 }
 
-// shardOf hashes the PK string (FNV-1a 32-bit) and returns the owning
-// shard. FNV-1a is fast, branchless, and well-distributed for short
-// keys.
-func (t *table) shardOf(pk string) *tableShard {
+// shardOf hashes the 16-byte UUID (FNV-1a 32-bit) and returns the owning
+// shard. FNV-1a is fast, branchless, and well-distributed.
+func (t *table) shardOf(pk UUID) *tableShard {
 	var h uint32 = 2166136261
-	for i := 0; i < len(pk); i++ {
+	for i := 0; i < 16; i++ {
 		h ^= uint32(pk[i])
 		h *= 16777619
 	}
@@ -73,14 +72,14 @@ func (t *table) shardOf(pk string) *tableShard {
 // insert places a row under its PK. Returns ErrDuplicatePK if the key
 // already exists (live or tombstone-replaced rows take new slots).
 func (t *table) insert(row Row) error {
-	pk := row[t.def.pkOrdinal].AsString()
+	pk := row[t.def.pkOrdinal].U
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, exists := s.pk[pk]; exists {
 		return ErrDuplicatePK
 	}
-	rowID := uint32(len(s.rows))
+	rowID := uint64(len(s.rows))
 	s.rows = append(s.rows, row)
 	s.pk[pk] = rowID
 	s.live++
@@ -102,7 +101,7 @@ func (t *table) insert(row Row) error {
 //
 // journal may be nil (memory-only DB).
 func (t *table) insertJournaled(row Row, journal func() error) error {
-	pk := row[t.def.pkOrdinal].AsString()
+	pk := row[t.def.pkOrdinal].U
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -114,7 +113,7 @@ func (t *table) insertJournaled(row Row, journal func() error) error {
 			return err
 		}
 	}
-	rowID := uint32(len(s.rows))
+	rowID := uint64(len(s.rows))
 	s.rows = append(s.rows, row)
 	s.pk[pk] = rowID
 	s.live++
@@ -129,7 +128,7 @@ func (t *table) insertJournaled(row Row, journal func() error) error {
 // columns are saved in a small stack array (heap only if >8 columns are
 // set, which is rare). journal may be nil (memory-only), in which case the
 // values are simply applied with no save/revert overhead.
-func (t *table) updateByPKJournaled(pk string, ords []int, compute func(Row) ([]Value, error), journal func(Row) error) (bool, error) {
+func (t *table) updateByPKJournaled(pk UUID, ords []int, compute func(Row) ([]Value, error), journal func(Row) error) (bool, error) {
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -168,7 +167,7 @@ func (t *table) updateByPKJournaled(pk string, ords []int, compute func(Row) ([]
 // deleteByPKJournaled is the live PK-pinned delete: under the one shard lock
 // it journals (via journal) before tombstoning, so a WAL failure aborts
 // before the row is removed. journal may be nil (memory-only).
-func (t *table) deleteByPKJournaled(pk string, journal func() error) (bool, error) {
+func (t *table) deleteByPKJournaled(pk UUID, journal func() error) (bool, error) {
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -190,7 +189,7 @@ func (t *table) deleteByPKJournaled(pk string, journal func() error) (bool, erro
 // getByPK returns the row for pk, or (nil, false). The returned Row is
 // a shallow alias into the shard arena; callers that escape it past
 // the call must Clone.
-func (t *table) getByPK(pk string) (Row, bool) {
+func (t *table) getByPK(pk UUID) (Row, bool) {
 	s := t.shardOf(pk)
 	s.mu.RLock()
 	rowID, ok := s.pk[pk]
@@ -233,7 +232,7 @@ func (t *table) scanAll(fn func(Row) bool) {
 // update mutates the row at pk using mutate. Returns false if the row
 // is absent. mutate runs under the shard write lock and must not call
 // back into the store.
-func (t *table) update(pk string, mutate func(Row) Row) bool {
+func (t *table) update(pk UUID, mutate func(Row) Row) bool {
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -311,7 +310,7 @@ func (t *table) updateWhereAll(match func(Row) bool, ords []int, compute func(Ro
 
 // deleteByPK removes the row at pk. Returns false if absent.
 // Tombstones in place (rows[rowID] = nil) so rowIDs stay stable.
-func (t *table) deleteByPK(pk string) bool {
+func (t *table) deleteByPK(pk UUID) bool {
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -350,7 +349,7 @@ func (t *table) deleteWhereAll(match func(Row) bool, journal func(pk Value) erro
 					return count, err
 				}
 			}
-			delete(s.pk, r[pkOrd].AsString())
+			delete(s.pk, r[pkOrd].U)
 			s.rows[j] = nil
 			s.live--
 			count++

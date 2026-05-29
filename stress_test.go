@@ -33,7 +33,7 @@ func TestConcurrentMixed(t *testing.T) {
 					return
 				default:
 				}
-				_, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", id, "n", id%100)
+				_, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(int(id)), "n", id%100)
 				if err == nil {
 					atomic.AddInt64(&inserted, 1)
 				}
@@ -77,7 +77,7 @@ func TestWALDurabilityRoundTrip(t *testing.T) {
 	db, path := openDBWithWAL(t)
 	const N = 5000
 	for i := 0; i < N; i++ {
-		_, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", i, fmt.Sprintf("u%d", i), i%100)
+		_, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), fmt.Sprintf("u%d", i), i%100)
 		if err != nil {
 			t.Fatal(err)
 		}

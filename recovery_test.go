@@ -20,7 +20,7 @@ func dumpUsers(t *testing.T, db *DB) string {
 	}
 	var b strings.Builder
 	for _, r := range rows {
-		fmt.Fprintf(&b, "%d|%s|%d\n", r[0].I, r[1].S, r[2].I)
+		fmt.Fprintf(&b, "%s|%s|%d\n", r[0].AsString(), r[1].S, r[2].I)
 	}
 	return b.String()
 }
@@ -37,14 +37,14 @@ func TestRejectedDuplicateInsertDoesNotCorruptWAL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 1, "alice", 30); err != nil {
+	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "alice", 30); err != nil {
 		t.Fatalf("first insert: %v", err)
 	}
 	// Duplicate — must be rejected and must NOT reach the WAL.
-	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 1, "dup", 99); !errors.Is(err, ErrDuplicatePK) {
+	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "dup", 99); !errors.Is(err, ErrDuplicatePK) {
 		t.Fatalf("expected ErrDuplicatePK, got %v", err)
 	}
-	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 2, "bob", 25); err != nil {
+	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(2), "bob", 25); err != nil {
 		t.Fatalf("second insert: %v", err)
 	}
 	if err := db.Close(); err != nil {
@@ -66,7 +66,7 @@ func TestRejectedDuplicateInsertDoesNotCorruptWAL(t *testing.T) {
 		t.Fatalf("expected 2 rows after replay, got %d", len(rows))
 	}
 	// id=1 must still be "alice" (the duplicate "dup" was never applied).
-	_, r1, _ := db2.Query("SELECT name FROM users WHERE id = ?", 1)
+	_, r1, _ := db2.Query("SELECT name FROM users WHERE id = ?", tid(1))
 	if len(r1) != 1 || r1[0][0].S != "alice" {
 		t.Errorf("id=1 should be alice, got %v", r1)
 	}
@@ -84,7 +84,7 @@ func TestWALCorruptTailLengthIsBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 1, "alice", 30)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "alice", 30)
 	db.Close()
 
 	// Append a record header claiming a 4 GiB body, then only a few bytes.
@@ -119,7 +119,7 @@ func TestMultiShardUpdateDeleteWALRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 500; i++ {
-		if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", i, "u", i%50); err != nil {
+		if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "u", i%50); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -160,7 +160,7 @@ func TestConcurrentMultiShardWritesReplayConsistent(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 800; i++ {
-		if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", i, "u", i%100); err != nil {
+		if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "u", i%100); err != nil {
 			t.Fatal(err)
 		}
 	}

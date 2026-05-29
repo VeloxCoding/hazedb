@@ -13,7 +13,7 @@ func benchSchema() Schema {
 			{
 				Name: "users",
 				Columns: []ColumnDef{
-					{Name: "id", Type: TypeInt, PK: true},
+					{Name: "id", Type: TypeUUID, PK: true},
 					{Name: "name", Type: TypeString},
 					{Name: "age", Type: TypeInt},
 				},
@@ -30,7 +30,7 @@ func newBenchDB(b *testing.B, n int) *DB {
 	}
 	b.Cleanup(func() { db.Close() })
 	for i := 0; i < n; i++ {
-		_, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", i, "name", i%100)
+		_, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "name", i%100)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -47,7 +47,7 @@ func BenchmarkInsert_Mem(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", i, "name", i%100)
+		_, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "name", i%100)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -64,7 +64,7 @@ func BenchmarkInsert_WAL(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", i, "name", i%100)
+		_, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "name", i%100)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -86,7 +86,7 @@ func BenchmarkInsert_WALSync(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", i, "name", i%100); err != nil {
+		if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "name", i%100); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -103,7 +103,7 @@ func BenchmarkInsert_WALSyncPerWrite(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", i, "name", i%100); err != nil {
+		if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "name", i%100); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -115,7 +115,7 @@ func BenchmarkSelectByPK_Mem(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_, _, err := db.Query("SELECT name, age FROM users WHERE id = ?", i%N)
+		_, _, err := db.Query("SELECT name, age FROM users WHERE id = ?", tid(i%N))
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -141,7 +141,7 @@ func BenchmarkUpdate_Mem(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_, err := db.Exec("UPDATE users SET age = ? WHERE id = ?", (i%100)+1, i%N)
+		_, err := db.Exec("UPDATE users SET age = ? WHERE id = ?", (i%100)+1, tid(i%N))
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -154,12 +154,12 @@ func BenchmarkDelete_Mem(b *testing.B) {
 	db, _ := Open(Options{Schema: benchSchema(), SizeHint: b.N})
 	defer db.Close()
 	for i := 0; i < b.N; i++ {
-		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", i, "name", i%100)
+		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "name", i%100)
 	}
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_, err := db.Exec("DELETE FROM users WHERE id = ?", i)
+		_, err := db.Exec("DELETE FROM users WHERE id = ?", tid(i))
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -196,7 +196,7 @@ func BenchmarkInsertViaStmtNoSQL(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		args := []Value{Int(int64(i)), Str("name"), Int(int64(i % 100))}
+		args := []Value{UUIDVal(tid(i)), Str("name"), Int(int64(i % 100))}
 		if _, err := db.execInsert(pl, args); err != nil {
 			b.Fatal(err)
 		}
@@ -215,7 +215,7 @@ func BenchmarkSelectByPKViaStmtNoSQL(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		args[0] = Int(int64(i % N))
+		args[0] = UUIDVal(tid(i % N))
 		_, _, err := db.execSelect(pl, args)
 		if err != nil {
 			b.Fatal(err)
@@ -232,7 +232,7 @@ func BenchmarkRoundtripSelectByPK(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_, _, err := db.Query(q, i%N)
+		_, _, err := db.Query(q, tid(i%N))
 		if err != nil {
 			b.Fatal(err)
 		}

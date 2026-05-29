@@ -19,7 +19,7 @@ func BenchmarkSelectByPK_Parallel(b *testing.B) {
 		base := atomic.AddInt64(&counter, 1) * 997
 		i := int(base)
 		for pb.Next() {
-			db.Query("SELECT name, age FROM users WHERE id = ?", i%N)
+			db.Query("SELECT name, age FROM users WHERE id = ?", tid(i%N))
 			i++
 		}
 	})
@@ -35,7 +35,7 @@ func BenchmarkInsert_Parallel_Mem(b *testing.B) {
 		base := atomic.AddInt64(&counter, 1) * 100000
 		i := int(base)
 		for pb.Next() {
-			db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", i, "name", i%100)
+			db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "name", i%100)
 			i++
 		}
 	})
@@ -52,7 +52,7 @@ func BenchmarkInsert_Parallel_WAL(b *testing.B) {
 		base := atomic.AddInt64(&counter, 1) * 100000
 		i := int(base)
 		for pb.Next() {
-			db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", i, "name", i%100)
+			db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "name", i%100)
 			i++
 		}
 	})
@@ -68,7 +68,7 @@ func BenchmarkUpdateByPK_Parallel(b *testing.B) {
 		base := atomic.AddInt64(&counter, 1) * 997
 		i := int(base)
 		for pb.Next() {
-			db.Exec("UPDATE users SET age = ? WHERE id = ?", i%100, i%N)
+			db.Exec("UPDATE users SET age = ? WHERE id = ?", i%100, tid(i%N))
 			i++
 		}
 	})

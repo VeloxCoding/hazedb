@@ -8,20 +8,20 @@ import (
 // Arithmetic SET on a PK-pinned row: col = col +/-/* ?.
 func TestArithmeticSetPK(t *testing.T) {
 	db := openMem(t)
-	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 1, "a", 100)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "a", 100)
 
-	if _, err := db.Exec("UPDATE users SET age = age - ? WHERE id = ?", 30, 1); err != nil {
+	if _, err := db.Exec("UPDATE users SET age = age - ? WHERE id = ?", 30, tid(1)); err != nil {
 		t.Fatal(err)
 	}
-	if got := ageOf(t, db, 1); got != 70 {
+	if got := ageOf(t, db, tid(1)); got != 70 {
 		t.Fatalf("after -30: got %d, want 70", got)
 	}
-	db.Exec("UPDATE users SET age = age + ? WHERE id = ?", 5, 1)
-	if got := ageOf(t, db, 1); got != 75 {
+	db.Exec("UPDATE users SET age = age + ? WHERE id = ?", 5, tid(1))
+	if got := ageOf(t, db, tid(1)); got != 75 {
 		t.Fatalf("after +5: got %d, want 75", got)
 	}
-	db.Exec("UPDATE users SET age = age * ? WHERE id = ?", 2, 1)
-	if got := ageOf(t, db, 1); got != 150 {
+	db.Exec("UPDATE users SET age = age * ? WHERE id = ?", 2, tid(1))
+	if got := ageOf(t, db, tid(1)); got != 150 {
 		t.Fatalf("after *2: got %d, want 150", got)
 	}
 }
@@ -30,7 +30,7 @@ func TestArithmeticSetPK(t *testing.T) {
 func TestArithmeticSetMultiShard(t *testing.T) {
 	db := openMem(t)
 	for i := 0; i < 100; i++ {
-		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", i, "u", 10)
+		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "u", 10)
 	}
 	n, err := db.Exec("UPDATE users SET age = age + ? WHERE age = ?", 5, 10)
 	if err != nil {
@@ -39,7 +39,7 @@ func TestArithmeticSetMultiShard(t *testing.T) {
 	if n != 100 {
 		t.Fatalf("n=%d, want 100", n)
 	}
-	if got := ageOf(t, db, 42); got != 15 {
+	if got := ageOf(t, db, tid(42)); got != 15 {
 		t.Fatalf("got %d, want 15", got)
 	}
 }
@@ -54,9 +54,9 @@ func TestArithmeticSetWALRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 1, "a", 100)
-	db.Exec("UPDATE users SET age = age - ? WHERE id = ?", 40, 1) // -> 60
-	db.Exec("UPDATE users SET age = age + ? WHERE id = ?", 10, 1) // -> 70
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "a", 100)
+	db.Exec("UPDATE users SET age = age - ? WHERE id = ?", 40, tid(1)) // -> 60
+	db.Exec("UPDATE users SET age = age + ? WHERE id = ?", 10, tid(1)) // -> 70
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +66,7 @@ func TestArithmeticSetWALRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db2.Close()
-	if got := ageOf(t, db2, 1); got != 70 {
+	if got := ageOf(t, db2, tid(1)); got != 70 {
 		t.Fatalf("after replay: got %d, want 70", got)
 	}
 }
@@ -74,26 +74,26 @@ func TestArithmeticSetWALRoundTrip(t *testing.T) {
 // Arithmetic is also accepted in WHERE.
 func TestArithmeticInWhere(t *testing.T) {
 	db := openMem(t)
-	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 1, "a", 10)
-	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 2, "b", 20)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "a", 10)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(2), "b", 20)
 	_, rows, err := db.Query("SELECT id FROM users WHERE age + ? > ?", 5, 22)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// age+5 => {15, 25}; > 22 keeps only id=2.
-	if len(rows) != 1 || rows[0][0].I != 2 {
+	if len(rows) != 1 || rows[0][0].U != tid(2) {
 		t.Fatalf("got %v, want only id=2", rows)
 	}
 }
 
-func ageOf(t *testing.T, db *DB, id int) int64 {
+func ageOf(t *testing.T, db *DB, id UUID) int64 {
 	t.Helper()
 	_, rows, err := db.Query("SELECT age FROM users WHERE id = ?", id)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(rows) != 1 {
-		t.Fatalf("id=%d: expected 1 row, got %d", id, len(rows))
+		t.Fatalf("id=%s: expected 1 row, got %d", id, len(rows))
 	}
 	return rows[0][0].I
 }

@@ -61,6 +61,8 @@ func putVal(buf []byte, v Value) []byte {
 	case KindBytes:
 		buf = putU32(buf, uint32(len(v.B)))
 		buf = append(buf, v.B...)
+	case KindUUID:
+		buf = append(buf, v.U[:]...)
 	case KindNull:
 		// kind byte only
 	}
@@ -84,6 +86,10 @@ func getVal(b []byte) (Value, int) {
 		cp := make([]byte, ln)
 		copy(cp, b[off:off+ln])
 		return Value{Kind: kind, B: cp}, off + ln
+	case KindUUID:
+		var u UUID
+		copy(u[:], b[off:off+16])
+		return Value{Kind: kind, U: u}, off + 16
 	case KindNull:
 		return Value{Kind: KindNull}, off
 	}
@@ -149,18 +155,14 @@ func encSQL(buf []byte, sql string, params Row) []byte {
 
 const spikeBody = "the quick brown fox jumps over the lazy dog, then does it once more for length"
 
-func spikeID(i int) string {
-	var b [16]byte // simulate a raw 16-byte UUIDv7 PK
-	binary.LittleEndian.PutUint64(b[:8], uint64(i))
-	return string(b[:])
-}
+func spikeID(i int) UUID { return tid(i) }
 
-// messages: id(16B str PK), conv(int), seq(int), body(~78B str)
+// messages: id(UUID PK), conv(int), seq(int), body(~78B str)
 func msgSchema() Schema {
 	return Schema{Tables: []TableDef{{
 		Name: "messages",
 		Columns: []ColumnDef{
-			{Name: "id", Type: TypeString, PK: true},
+			{Name: "id", Type: TypeUUID, PK: true},
 			{Name: "conv", Type: TypeInt},
 			{Name: "seq", Type: TypeInt},
 			{Name: "body", Type: TypeString},
@@ -169,7 +171,7 @@ func msgSchema() Schema {
 }
 
 func msgRow(i int, body string) Row {
-	return Row{Str(spikeID(i)), Int(int64(i)), Int(int64(i)), Str(body)}
+	return Row{UUIDVal(spikeID(i)), Int(int64(i)), Int(int64(i)), Str(body)}
 }
 
 const (
@@ -190,7 +192,7 @@ func encPhysOrTypedDel(buf []byte, pk Value) []byte {
 // full-row (Physical) vs delta (Typed/SQLStr) gap.
 func wideRow(i int) Row {
 	r := make(Row, 9)
-	r[0] = Str(spikeID(i))
+	r[0] = UUIDVal(spikeID(i))
 	for j := 1; j < 9; j++ {
 		r[j] = Str("colvalue_padding_xx")
 	}
@@ -231,12 +233,12 @@ func BenchmarkWALEnc_UpdNarrow_Physical(b *testing.B) {
 	benchEnc(b, func(buf []byte) []byte { return encPhysUpd(buf, row) })
 }
 func BenchmarkWALEnc_UpdNarrow_Typed(b *testing.B) {
-	pk := Str(spikeID(1))
+	pk := UUIDVal(spikeID(1))
 	vals := Row{Str(spikeBody)}
 	benchEnc(b, func(buf []byte) []byte { return encTypedUpd(buf, pk, []int{3}, vals) })
 }
 func BenchmarkWALEnc_UpdNarrow_SQLStr(b *testing.B) {
-	params := Row{Str(spikeBody), Str(spikeID(1))}
+	params := Row{Str(spikeBody), UUIDVal(spikeID(1))}
 	benchEnc(b, func(buf []byte) []byte { return encSQL(buf, updSQL, params) })
 }
 
@@ -245,25 +247,25 @@ func BenchmarkWALEnc_UpdWide_Physical(b *testing.B) {
 	benchEnc(b, func(buf []byte) []byte { return encPhysUpd(buf, row) })
 }
 func BenchmarkWALEnc_UpdWide_Typed(b *testing.B) {
-	pk := Str(spikeID(1))
+	pk := UUIDVal(spikeID(1))
 	vals := Row{Str("colvalue_padding_xx")}
 	benchEnc(b, func(buf []byte) []byte { return encTypedUpd(buf, pk, []int{1}, vals) })
 }
 func BenchmarkWALEnc_UpdWide_SQLStr(b *testing.B) {
-	params := Row{Str("colvalue_padding_xx"), Str(spikeID(1))}
+	params := Row{Str("colvalue_padding_xx"), UUIDVal(spikeID(1))}
 	benchEnc(b, func(buf []byte) []byte { return encSQL(buf, wideUpdSQL, params) })
 }
 
 func BenchmarkWALEnc_Delete_Physical(b *testing.B) {
-	pk := Str(spikeID(1))
+	pk := UUIDVal(spikeID(1))
 	benchEnc(b, func(buf []byte) []byte { return encPhysOrTypedDel(buf, pk) })
 }
 func BenchmarkWALEnc_Delete_Typed(b *testing.B) {
-	pk := Str(spikeID(1))
+	pk := UUIDVal(spikeID(1))
 	benchEnc(b, func(buf []byte) []byte { return encPhysOrTypedDel(buf, pk) })
 }
 func BenchmarkWALEnc_Delete_SQLStr(b *testing.B) {
-	params := Row{Str(spikeID(1))}
+	params := Row{UUIDVal(spikeID(1))}
 	benchEnc(b, func(buf []byte) []byte { return encSQL(buf, delSQL, params) })
 }
 
@@ -351,7 +353,7 @@ func BenchmarkWALReplay_Insert_SQLStr(b *testing.B) {
 
 func applyPhysUpd(db *DB, rec []byte) {
 	row, _ := getRow(rec[3:])
-	pk := row[0].AsString()
+	pk := row[0].U
 	db.t["messages"].update(pk, func(_ Row) Row { return row })
 }
 
@@ -370,7 +372,7 @@ func applyTypedUpd(db *DB, rec []byte) {
 		off += k
 		vals[i] = v
 	}
-	db.t["messages"].update(pk.AsString(), func(r Row) Row {
+	db.t["messages"].update(pk.U, func(r Row) Row {
 		for i := range ords {
 			r[ords[i]] = vals[i]
 		}
@@ -395,11 +397,11 @@ func BenchmarkWALReplay_UpdNarrow_Physical(b *testing.B) {
 	benchReplay(b, c, newMsgDBFilled, false, applyPhysUpd)
 }
 func BenchmarkWALReplay_UpdNarrow_Typed(b *testing.B) {
-	c := buildCorpus(func(i int) []byte { return encTypedUpd(nil, Str(spikeID(i)), []int{3}, Row{Str(spikeBody)}) })
+	c := buildCorpus(func(i int) []byte { return encTypedUpd(nil, UUIDVal(spikeID(i)), []int{3}, Row{Str(spikeBody)}) })
 	benchReplay(b, c, newMsgDBFilled, false, applyTypedUpd)
 }
 func BenchmarkWALReplay_UpdNarrow_SQLStr(b *testing.B) {
-	c := buildCorpus(func(i int) []byte { return encSQL(nil, updSQL, Row{Str(spikeBody), Str(spikeID(i))}) })
+	c := buildCorpus(func(i int) []byte { return encSQL(nil, updSQL, Row{Str(spikeBody), UUIDVal(spikeID(i))}) })
 	benchReplay(b, c, newMsgDBFilled, false, applySQLUpd)
 }
 
@@ -409,7 +411,7 @@ func BenchmarkWALReplay_UpdNarrow_SQLStr(b *testing.B) {
 
 func applyDirectDel(db *DB, rec []byte) {
 	pk, _ := getVal(rec[3:]) // skip op+tableID
-	db.t["messages"].deleteByPK(pk.AsString())
+	db.t["messages"].deleteByPK(pk.U)
 }
 
 func applySQLDel(db *DB, rec []byte) {
@@ -425,15 +427,15 @@ func applySQLDel(db *DB, rec []byte) {
 }
 
 func BenchmarkWALReplay_Delete_Physical(b *testing.B) {
-	c := buildCorpus(func(i int) []byte { return encPhysOrTypedDel(nil, Str(spikeID(i))) })
+	c := buildCorpus(func(i int) []byte { return encPhysOrTypedDel(nil, UUIDVal(spikeID(i))) })
 	benchReplay(b, c, newMsgDBFilled, true, applyDirectDel)
 }
 func BenchmarkWALReplay_Delete_Typed(b *testing.B) {
-	c := buildCorpus(func(i int) []byte { return encPhysOrTypedDel(nil, Str(spikeID(i))) })
+	c := buildCorpus(func(i int) []byte { return encPhysOrTypedDel(nil, UUIDVal(spikeID(i))) })
 	benchReplay(b, c, newMsgDBFilled, true, applyDirectDel)
 }
 func BenchmarkWALReplay_Delete_SQLStr(b *testing.B) {
-	c := buildCorpus(func(i int) []byte { return encSQL(nil, delSQL, Row{Str(spikeID(i))}) })
+	c := buildCorpus(func(i int) []byte { return encSQL(nil, delSQL, Row{UUIDVal(spikeID(i))}) })
 	benchReplay(b, c, newMsgDBFilled, true, applySQLDel)
 }
 
@@ -454,20 +456,20 @@ func TestWALFormatSizes(t *testing.T) {
 		{
 			"update narrow (set body)",
 			len(encPhysUpd(nil, msgRow(1, spikeBody))),
-			len(encTypedUpd(nil, Str(spikeID(1)), []int{3}, Row{Str(spikeBody)})),
-			len(encSQL(nil, updSQL, Row{Str(spikeBody), Str(spikeID(1))})),
+			len(encTypedUpd(nil, UUIDVal(spikeID(1)), []int{3}, Row{Str(spikeBody)})),
+			len(encSQL(nil, updSQL, Row{Str(spikeBody), UUIDVal(spikeID(1))})),
 		},
 		{
 			"update wide (set 1 of 9 cols)",
 			len(encPhysUpd(nil, wideRow(1))),
-			len(encTypedUpd(nil, Str(spikeID(1)), []int{1}, Row{Str("colvalue_padding_xx")})),
-			len(encSQL(nil, wideUpdSQL, Row{Str("colvalue_padding_xx"), Str(spikeID(1))})),
+			len(encTypedUpd(nil, UUIDVal(spikeID(1)), []int{1}, Row{Str("colvalue_padding_xx")})),
+			len(encSQL(nil, wideUpdSQL, Row{Str("colvalue_padding_xx"), UUIDVal(spikeID(1))})),
 		},
 		{
 			"delete (by pk)",
-			len(encPhysOrTypedDel(nil, Str(spikeID(1)))),
-			len(encPhysOrTypedDel(nil, Str(spikeID(1)))),
-			len(encSQL(nil, delSQL, Row{Str(spikeID(1))})),
+			len(encPhysOrTypedDel(nil, UUIDVal(spikeID(1)))),
+			len(encPhysOrTypedDel(nil, UUIDVal(spikeID(1)))),
+			len(encSQL(nil, delSQL, Row{UUIDVal(spikeID(1))})),
 		},
 	}
 	t.Logf("%-32s %8s %8s %8s", "record", "Physical", "Typed", "SQLStr")

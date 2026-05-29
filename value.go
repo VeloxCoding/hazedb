@@ -7,14 +7,13 @@
 package hazedb
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"strconv"
 )
 
-// ValueKind discriminates the union below. Encoded in 1 byte so a
-// Value is 1 + padding + 8 + 16 = 32 bytes. That's larger than ideal
-// — codegen (M3) replaces []Value with a typed struct per table.
+// ValueKind discriminates the union below.
 type ValueKind uint8
 
 const (
@@ -23,27 +22,36 @@ const (
 	KindString
 	KindBytes
 	KindBool
+	KindUUID
 )
 
-// Value is the runtime cell type. Generic and slow-ish vs a typed
-// struct; appropriate for the interpreter path.
+// Value is the runtime cell type. Generic and slow-ish vs a typed struct;
+// appropriate for the interpreter path (codegen replaces []Value with typed
+// structs per table on the eventual hot path).
 //
 //   - KindInt:    I holds the value
 //   - KindString: S holds the value
 //   - KindBytes:  B holds the value (avoid allocs by reusing slices upstream)
 //   - KindBool:   I == 0 false, I == 1 true
+//   - KindUUID:   U holds the 16 bytes (no heap alloc; usable as a map key)
 //   - KindNull:   all zero
+//
+// U is a fixed [16]byte rather than living in B so a UUID PK is a comparable,
+// allocation-free map key. It costs 16 bytes on every cell; if that proves to
+// matter it can be packed into two uint64 — measure first.
 type Value struct {
 	Kind ValueKind
 	I    int64
 	S    string
 	B    []byte
+	U    UUID
 }
 
 func Int(v int64) Value       { return Value{Kind: KindInt, I: v} }
 func Str(v string) Value      { return Value{Kind: KindString, S: v} }
 func Bytes(v []byte) Value    { return Value{Kind: KindBytes, B: v} }
 func Bool(v bool) Value       { return Value{Kind: KindBool, I: boolToInt(v)} }
+func UUIDVal(u UUID) Value    { return Value{Kind: KindUUID, U: u} }
 func Null() Value             { return Value{Kind: KindNull} }
 func boolToInt(b bool) int64 { if b { return 1 }; return 0 }
 
@@ -61,6 +69,8 @@ func (v Value) AsString() string {
 		return v.S
 	case KindBytes:
 		return string(v.B)
+	case KindUUID:
+		return v.U.String()
 	case KindBool:
 		if v.I == 1 {
 			return "true"
@@ -109,6 +119,10 @@ func (v Value) Compare(o Value) (int, bool) {
 		}
 		return 0, true
 	}
+	if v.Kind == KindUUID && o.Kind == KindUUID {
+		// Byte order == creation-time order for UUIDv7. No alloc.
+		return bytes.Compare(v.U[:], o.U[:]), true
+	}
 	// Fall through to string compare. Lexicographic is correct for strings;
 	// for mixed int/string callers should not rely on the result.
 	a, b := v.AsString(), o.AsString()
@@ -137,6 +151,8 @@ func (v Value) Equal(o Value) bool {
 		return v.S == o.S
 	case KindBytes:
 		return string(v.B) == string(o.B)
+	case KindUUID:
+		return v.U == o.U
 	}
 	return false
 }

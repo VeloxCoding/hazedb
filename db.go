@@ -209,7 +209,7 @@ func (db *DB) replayWAL(w *wal) error {
 			if err != nil {
 				return err
 			}
-			pk := row[rt.def.pkOrdinal].AsString()
+			pk := row[rt.def.pkOrdinal].U
 			if !rt.update(pk, func(_ Row) Row { return row }) {
 				// Replay may see an UPDATE before the INSERT if the WAL was
 				// rewound mid-write; treat as fresh insert.
@@ -221,7 +221,7 @@ func (db *DB) replayWAL(w *wal) error {
 			if err != nil {
 				return err
 			}
-			rt.deleteByPK(pk.AsString())
+			rt.deleteByPK(pk.U)
 			return nil
 		}
 		return fmt.Errorf("%w: unknown op %d", ErrWALCorrupt, rec.Op)
@@ -248,6 +248,8 @@ func toValues(args []any) ([]Value, error) {
 			out[i] = Bytes(x)
 		case bool:
 			out[i] = Bool(x)
+		case UUID:
+			out[i] = UUIDVal(x)
 		case Value:
 			out[i] = x
 		default:

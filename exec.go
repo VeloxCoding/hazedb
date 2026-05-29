@@ -142,6 +142,9 @@ func (db *DB) plan(st stmt) (*plan, error) {
 			if ord == rt.pkOrdinal {
 				return nil, fmt.Errorf("%w: %q.%q", ErrPKUpdate, tname, a.col)
 			}
+			if rt.def.Columns[ord].Immutable {
+				return nil, fmt.Errorf("%w: %q.%q is immutable", ErrPKUpdate, tname, a.col)
+			}
 			pl.updateOrdinals = append(pl.updateOrdinals, ord)
 			// Validate the right-hand side (catches unknown columns in
 			// arithmetic like SET x = bogus - ?) and note row dependence.
@@ -204,6 +207,18 @@ func isLitOrParam(e expr) bool {
 		return true
 	}
 	return false
+}
+
+// coerceToUUID turns a PK-lookup value into a UUID: a UUID passes through; a
+// string is parsed (API-boundary convenience). Anything else is an error.
+func coerceToUUID(v Value) (UUID, error) {
+	switch v.Kind {
+	case KindUUID:
+		return v.U, nil
+	case KindString:
+		return ParseUUID(v.S)
+	}
+	return UUID{}, fmt.Errorf("%w: PK lookup expects UUID, got kind %d", ErrTypeMismatch, v.Kind)
 }
 
 // exprRefsColumn reports whether e reads any column (vs only literals and
@@ -406,7 +421,11 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 		if keyVal.IsNull() {
 			return colNames, nil, nil
 		}
-		r, ok := tbl.getByPK(keyVal.AsString())
+		pk, err := coerceToUUID(keyVal)
+		if err != nil {
+			return nil, nil, err
+		}
+		r, ok := tbl.getByPK(pk)
 		if !ok {
 			return colNames, nil, nil
 		}
@@ -487,16 +506,35 @@ func (db *DB) execInsert(pl *plan, args []Value) (int, error) {
 		row[i] = Null()
 	}
 	ctx := &evalCtx{args: args}
+	pkOrd := tbl.def.pkOrdinal
+	pkProvided := false
 	for i, ord := range pl.insertOrdinals {
 		v, err := evalExpr(st.vals[i], ctx)
 		if err != nil {
 			return 0, err
 		}
 		col := tbl.def.def.Columns[ord]
+		// API-boundary coercion: a string destined for a UUID column is
+		// parsed into a UUID — storage only ever sees [16]byte.
+		if col.Type == TypeUUID && v.Kind == KindString {
+			u, perr := ParseUUID(v.S)
+			if perr != nil {
+				return 0, perr
+			}
+			v = UUIDVal(u)
+		}
 		if err := validateValue(col, v); err != nil {
 			return 0, err
 		}
 		row[ord] = v
+		if ord == pkOrd {
+			pkProvided = true
+		}
+	}
+	// Auto-generate the PK when omitted. The resolved UUID is placed in the
+	// row before the WAL record is written, so replay reproduces it exactly.
+	if !pkProvided {
+		row[pkOrd] = UUIDVal(NewUUIDv7())
 	}
 	// Check NOT NULL on omitted columns.
 	for ord, c := range tbl.def.def.Columns {
@@ -597,7 +635,11 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 				return werr
 			}
 		}
-		ok, err := tbl.updateByPKJournaled(keyVal.AsString(), pl.updateOrdinals, compute, journal)
+		pk, err := coerceToUUID(keyVal)
+		if err != nil {
+			return 0, err
+		}
+		ok, err := tbl.updateByPKJournaled(pk, pl.updateOrdinals, compute, journal)
 		if err != nil {
 			return 0, err
 		}
@@ -643,16 +685,21 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 		if keyVal.IsNull() {
 			return 0, nil
 		}
+		pk, err := coerceToUUID(keyVal)
+		if err != nil {
+			return 0, err
+		}
+		pkVal := UUIDVal(pk) // journal the resolved UUID, not the raw arg
 		var journal func() error
 		if db.wal != nil {
 			journal = func() error {
-				body := encodePK(db.scratch.get(), keyVal)
+				body := encodePK(db.scratch.get(), pkVal)
 				werr := db.wal.writeRecord(opDelete, tbl.tableID, body)
 				db.scratch.put(body)
 				return werr
 			}
 		}
-		ok, err := tbl.deleteByPKJournaled(keyVal.AsString(), journal)
+		ok, err := tbl.deleteByPKJournaled(pk, journal)
 		if err != nil {
 			return 0, err
 		}

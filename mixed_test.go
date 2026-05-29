@@ -28,7 +28,7 @@ func TestMixedWorkloadLatency(t *testing.T) {
 	// Pre-seed
 	const seedN = 50_000
 	for i := 0; i < seedN; i++ {
-		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", i, "seed", i%100)
+		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "seed", i%100)
 	}
 
 	const writers = 4
@@ -51,7 +51,7 @@ func TestMixedWorkloadLatency(t *testing.T) {
 					return
 				default:
 				}
-				_, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", id, "n", id%100)
+				_, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(id), "n", id%100)
 				if err == nil {
 					atomic.AddInt64(&insertN, 1)
 				}
@@ -77,7 +77,7 @@ func TestMixedWorkloadLatency(t *testing.T) {
 				}
 				id := rng.Intn(seedN)
 				t0 := time.Now()
-				_, _, err := db.Query("SELECT name, age FROM users WHERE id = ?", id)
+				_, _, err := db.Query("SELECT name, age FROM users WHERE id = ?", tid(id))
 				dt := time.Since(t0).Nanoseconds()
 				if err == nil {
 					lats = append(lats, dt)
@@ -131,7 +131,7 @@ func TestMixedWorkloadLatency_WAL(t *testing.T) {
 
 	const seedN = 50_000
 	for i := 0; i < seedN; i++ {
-		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", i, "seed", i%100)
+		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "seed", i%100)
 	}
 
 	const writers = 4
@@ -153,7 +153,7 @@ func TestMixedWorkloadLatency_WAL(t *testing.T) {
 					return
 				default:
 				}
-				_, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", id, "n", id%100)
+				_, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(id), "n", id%100)
 				if err == nil {
 					atomic.AddInt64(&insertN, 1)
 				}
@@ -178,7 +178,7 @@ func TestMixedWorkloadLatency_WAL(t *testing.T) {
 				}
 				id := rng.Intn(seedN)
 				t0 := time.Now()
-				_, _, err := db.Query("SELECT name, age FROM users WHERE id = ?", id)
+				_, _, err := db.Query("SELECT name, age FROM users WHERE id = ?", tid(id))
 				dt := time.Since(t0).Nanoseconds()
 				if err == nil {
 					lats = append(lats, dt)

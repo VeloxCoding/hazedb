@@ -17,9 +17,15 @@ import (
 // by PK, UPDATE by PK, DELETE by PK. Same row shape (id, name, age).
 //
 // Goal: honest interpreter-path numbers vs the two stores anyone would
-// realistically reach for. FASTSQL's hand-written codegen target (M3)
-// would shave parser+plan dispatch cost; these benchmarks describe
-// today's path, not tomorrow's.
+// realistically reach for. The codegen target would shave parser+plan
+// dispatch cost; these benchmarks describe today's path, not tomorrow's.
+//
+// FAIRNESS CAVEAT (M4): hazedb's PK is now a 16-byte UUID, while the SQLite
+// and Bolt sides below still use 8-byte integer keys. The cross-store
+// numbers therefore compare different key widths and are NOT apples-to-apples
+// until SQLite (BLOB/TEXT PK) and Bolt (16-byte keys) are switched to UUIDs
+// too. Open decision — see the implementation plan. The hazedb-only
+// (_FASTSQL_) numbers remain valid in isolation.
 
 const compareN = 10000
 
@@ -87,7 +93,7 @@ func BenchmarkInsert_FASTSQL_Mem(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", compareN+i, "name", i%100)
+		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(compareN+i), "name", i%100)
 	}
 }
 
@@ -127,7 +133,7 @@ func BenchmarkSelectByPK_FASTSQL_Mem(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		db.Query("SELECT name, age FROM users WHERE id = ?", i%compareN)
+		db.Query("SELECT name, age FROM users WHERE id = ?", tid(i%compareN))
 	}
 }
 
@@ -169,7 +175,7 @@ func BenchmarkUpdateByPK_FASTSQL_Mem(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		db.Exec("UPDATE users SET age = ? WHERE id = ?", (i%100)+1, i%compareN)
+		db.Exec("UPDATE users SET age = ? WHERE id = ?", (i%100)+1, tid(i%compareN))
 	}
 }
 
@@ -210,12 +216,12 @@ func BenchmarkDeleteByPK_FASTSQL_Mem(b *testing.B) {
 	db, _ := Open(Options{Schema: benchSchema(), SizeHint: b.N})
 	defer db.Close()
 	for i := 0; i < b.N; i++ {
-		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", i, "name", i%100)
+		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "name", i%100)
 	}
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		db.Exec("DELETE FROM users WHERE id = ?", i)
+		db.Exec("DELETE FROM users WHERE id = ?", tid(i))
 	}
 }
 

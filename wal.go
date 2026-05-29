@@ -359,6 +359,8 @@ func encodeRow(buf []byte, row Row) []byte {
 			binary.LittleEndian.PutUint32(u32[:], uint32(len(v.B)))
 			buf = append(buf, u32[:]...)
 			buf = append(buf, v.B...)
+		case KindUUID:
+			buf = append(buf, v.U[:]...)
 		case KindBool:
 			buf = append(buf, byte(v.I))
 		}
@@ -412,6 +414,14 @@ func decodeRow(b []byte) (Row, error) {
 			copy(cp, b[off:off+int(ln)])
 			row[i] = Value{Kind: KindBytes, B: cp}
 			off += int(ln)
+		case KindUUID:
+			if off+16 > len(b) {
+				return nil, fmt.Errorf("%w: uuid payload truncated at col %d", ErrWALCorrupt, i)
+			}
+			var u UUID
+			copy(u[:], b[off:off+16])
+			row[i] = Value{Kind: KindUUID, U: u}
+			off += 16
 		case KindBool:
 			if off+1 > len(b) {
 				return nil, fmt.Errorf("%w: bool payload truncated at col %d", ErrWALCorrupt, i)
@@ -444,6 +454,8 @@ func encodePK(buf []byte, v Value) []byte {
 		binary.LittleEndian.PutUint32(u32[:], uint32(len(v.B)))
 		buf = append(buf, u32[:]...)
 		buf = append(buf, v.B...)
+	case KindUUID:
+		buf = append(buf, v.U[:]...)
 	case KindBool:
 		buf = append(buf, byte(v.I))
 	}
@@ -484,6 +496,13 @@ func decodePK(b []byte) (Value, error) {
 		cp := make([]byte, ln)
 		copy(cp, b[off:off+int(ln)])
 		return Value{Kind: KindBytes, B: cp}, nil
+	case KindUUID:
+		if off+16 > len(b) {
+			return Value{}, fmt.Errorf("%w: uuid pk truncated", ErrWALCorrupt)
+		}
+		var u UUID
+		copy(u[:], b[off:off+16])
+		return Value{Kind: KindUUID, U: u}, nil
 	case KindBool:
 		if off+1 > len(b) {
 			return Value{}, fmt.Errorf("%w: bool pk truncated", ErrWALCorrupt)

@@ -14,6 +14,7 @@ const (
 	TypeString
 	TypeBytes
 	TypeBool
+	TypeUUID
 )
 
 func (t ColumnType) String() string {
@@ -26,16 +27,23 @@ func (t ColumnType) String() string {
 		return "BYTES"
 	case TypeBool:
 		return "BOOL"
+	case TypeUUID:
+		return "UUID"
 	}
 	return "?"
 }
 
 // ColumnDef describes one column at table-create time.
 type ColumnDef struct {
-	Name     string
-	Type     ColumnType
-	PK       bool
-	Nullable bool
+	Name string
+	Type ColumnType
+	// PK marks the single primary-key column. It must be TypeUUID and is
+	// implicitly immutable.
+	PK bool
+	// Immutable rejects UPDATE SET on this column at plan time. Used for an
+	// ordering column (e.g. seq) so a tail index can cache its order safely.
+	Immutable bool
+	Nullable  bool
 }
 
 // TableDef defines a table. Exactly one column must have PK=true.
@@ -84,6 +92,9 @@ func resolveSchema(s Schema) (map[string]*resolvedTable, error) {
 				if rt.pkOrdinal >= 0 {
 					return nil, fmt.Errorf("schema: table %q has multiple PK columns", t.Name)
 				}
+				if c.Type != TypeUUID {
+					return nil, fmt.Errorf("schema: table %q PK column %q must be UUID, got %s", t.Name, c.Name, c.Type)
+				}
 				rt.pkOrdinal = i
 			}
 		}
@@ -120,6 +131,10 @@ func validateValue(c ColumnDef, v Value) error {
 	case TypeBool:
 		if v.Kind != KindBool {
 			return fmt.Errorf("column %q expects BOOL, got %v", c.Name, v.Kind)
+		}
+	case TypeUUID:
+		if v.Kind != KindUUID {
+			return fmt.Errorf("column %q expects UUID, got %v", c.Name, v.Kind)
 		}
 	}
 	return nil

@@ -31,7 +31,7 @@ func TestWALDurabilityModesRoundTrip(t *testing.T) {
 				t.Fatalf("open: %v", err)
 			}
 			for k := 0; k < 50; k++ {
-				if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", k, "u", k); err != nil {
+				if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(k), "u", k); err != nil {
 					t.Fatalf("insert %d: %v", k, err)
 				}
 			}
@@ -63,7 +63,7 @@ func TestWALErrorStateBlocksAndDoesNotApply(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 1, "alice", 30); err != nil {
+	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "alice", 30); err != nil {
 		t.Fatal(err)
 	}
 
@@ -73,20 +73,20 @@ func TestWALErrorStateBlocksAndDoesNotApply(t *testing.T) {
 	db.wal.err = injected
 	db.wal.mu.Unlock()
 
-	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", 2, "bob", 25); !errors.Is(err, injected) {
+	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(2), "bob", 25); !errors.Is(err, injected) {
 		t.Errorf("insert: expected injected error, got %v", err)
 	}
-	if _, err := db.Exec("UPDATE users SET age = ? WHERE id = ?", 99, 1); !errors.Is(err, injected) {
+	if _, err := db.Exec("UPDATE users SET age = ? WHERE id = ?", 99, tid(1)); !errors.Is(err, injected) {
 		t.Errorf("update: expected injected error, got %v", err)
 	}
-	if _, err := db.Exec("DELETE FROM users WHERE id = ?", 1); !errors.Is(err, injected) {
+	if _, err := db.Exec("DELETE FROM users WHERE id = ?", tid(1)); !errors.Is(err, injected) {
 		t.Errorf("delete: expected injected error, got %v", err)
 	}
 
 	// State must be exactly the original row, unchanged: id=2 never inserted,
 	// id=1 still age 30 (the update was reverted), id=1 not deleted.
 	_, rows, _ := db.Query("SELECT id, age FROM users")
-	if len(rows) != 1 || rows[0][0].I != 1 || rows[0][1].I != 30 {
+	if len(rows) != 1 || rows[0][0].U != tid(1) || rows[0][1].I != 30 {
 		t.Errorf("error state must not apply writes; got rows=%v", rows)
 	}
 }
