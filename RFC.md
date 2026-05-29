@@ -2,7 +2,7 @@
 
 **Status:** M1–M6 implemented (store, SQL, WAL durability, UUIDv7 PK, partitioning, runtime catalog + `CREATE`/`DROP TABLE`, single-table transactions); M7–M8 open. See *Implementation status* for what is running vs designed.  
 **Module:** `github.com/VeloxCoding/hazedb`  
-**Updated:** 2026-05-29 (rev. 17 — cached SELECT column names; one fewer alloc per read)
+**Updated:** 2026-05-29 (rev. 18 — bounded top-N for ORDER BY + LIMIT scans)
 
 ---
 
@@ -620,9 +620,9 @@ A feed query `SELECT … WHERE partitionkey=? ORDER BY seq DESC LIMIT n` reads o
 
 | Scan | Time | Allocs |
 |---|---:|---:|
-| One partition (~100 rows) of a 10k-row table, `ORDER BY … LIMIT` | **~34 µs** | 128 |
+| One partition (~120 rows) of a 10k-row table, `ORDER BY … LIMIT 10` | **~19 µs** | 124 |
 
-The partition index earns its keep when `ORDER BY` forces gathering the whole matching set to sort. **Without `ORDER BY`, `LIMIT` now short-circuits the scan** (stop at the limit, project under the lock): an unindexed `SELECT id FROM users WHERE age > ? LIMIT 10` over 10k rows (≈4 900 match) is **~0.93 µs / 4 allocs** — versus **~770 µs / 4 932 allocs before the pushdown** (rev. 12), which cloned every matching row before truncating. So the index matters for ordered tail scans; for an unordered `LIMIT`, the short-circuit already makes a full scan cheap.
+The partition index earns its keep when `ORDER BY` forces examining the whole matching set. An `ORDER BY … LIMIT n` keeps only the running top-n (a bounded heap, cloning a row only when it makes the cut) and sorts just those n, instead of cloning + sorting every match — ~2× faster on the feed query above; the clone savings grow when the scan order is not adversarial to the sort order. **Without `ORDER BY`, `LIMIT` now short-circuits the scan** (stop at the limit, project under the lock): an unindexed `SELECT id FROM users WHERE age > ? LIMIT 10` over 10k rows (≈4 900 match) is **~0.93 µs / 4 allocs** — versus **~770 µs / 4 932 allocs before the pushdown** (rev. 12), which cloned every matching row before truncating. So the index matters for ordered tail scans; for an unordered `LIMIT`, the short-circuit already makes a full scan cheap.
 
 ### Mixed workload — 4 writers + 16 readers, 2 s, WAL on
 

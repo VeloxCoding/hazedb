@@ -637,6 +637,31 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 		scan = func(fn func(Row) bool) { tbl.scanPartition(part, fn) }
 	}
 
+	// ORDER BY + LIMIT: keep only the best `limit` rows by the order column,
+	// cloning a row only when it enters the running top-N — O(limit) clones
+	// instead of O(matched). (Ties on the order column drop arbitrarily, which
+	// SQL permits for a non-unique ORDER BY.)
+	if pl.orderOrdinal >= 0 && st.limit >= 0 {
+		if st.limit == 0 {
+			return colNames, nil, nil
+		}
+		top := topN{ord: pl.orderOrdinal, desc: st.orderDesc, capN: st.limit}
+		scan(func(r Row) bool {
+			if st.where != nil {
+				ctx.row = r
+				v, err := evalExpr(st.where, &ctx)
+				if err != nil || !truthy(v) {
+					return true
+				}
+			}
+			top.offer(r)
+			return true
+		})
+		return colNames, projectRows(top.sorted(), st.starAll, pl.projOrdinals), nil
+	}
+
+	// ORDER BY without LIMIT, or no-ORDER-BY/no-LIMIT full scan: gather all
+	// matches (clone under the lock), then sort if ordered.
 	var matched []Row
 	scan(func(r Row) bool {
 		if st.where != nil {
@@ -649,41 +674,107 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 		matched = append(matched, r.Clone())
 		return true
 	})
-
-	// ORDER BY
 	if pl.orderOrdinal >= 0 {
-		ord := pl.orderOrdinal
-		desc := st.orderDesc
-		sort.SliceStable(matched, func(i, j int) bool {
-			c, ok := matched[i][ord].Compare(matched[j][ord])
-			if !ok {
-				return false
-			}
-			if desc {
-				return c > 0
-			}
-			return c < 0
-		})
+		sortRowsByCol(matched, pl.orderOrdinal, st.orderDesc)
 	}
-
-	// LIMIT
 	if st.limit >= 0 && st.limit < len(matched) {
 		matched = matched[:st.limit]
 	}
+	return colNames, projectRows(matched, st.starAll, pl.projOrdinals), nil
+}
 
-	// Projection
-	if st.starAll {
-		return colNames, matched, nil
+// sortRowsByCol stable-sorts rows by column ord (ascending, or descending when
+// desc). Incomparable cells (NULL) sort as "not less".
+func sortRowsByCol(rows []Row, ord int, desc bool) {
+	sort.SliceStable(rows, func(i, j int) bool {
+		c, ok := rows[i][ord].Compare(rows[j][ord])
+		if !ok {
+			return false
+		}
+		if desc {
+			return c > 0
+		}
+		return c < 0
+	})
+}
+
+// projectRows narrows each row to the projection ordinals (a no-op for
+// SELECT *). The narrowed rows shallow-copy already-private cells.
+func projectRows(matched []Row, starAll bool, ords []int) []Row {
+	if starAll {
+		return matched
 	}
 	out := make([]Row, len(matched))
 	for i, r := range matched {
-		pr := make(Row, len(pl.projOrdinals))
-		for j, ord := range pl.projOrdinals {
+		pr := make(Row, len(ords))
+		for j, ord := range ords {
 			pr[j] = r[ord]
 		}
 		out[i] = pr
 	}
-	return colNames, out, nil
+	return out
+}
+
+// topN keeps the best capN rows by column ord (ascending, or descending when
+// desc), cloning a row only when it makes the cut. Backed by a binary heap
+// whose root is the most-evictable kept row, so a candidate that cannot beat
+// the root is dropped without cloning.
+type topN struct {
+	ord  int
+	desc bool
+	capN int
+	h    []Row
+}
+
+// evictable reports whether a ranks below b under the ORDER BY (a drops first).
+func (t *topN) evictable(a, b Row) bool {
+	c, ok := a[t.ord].Compare(b[t.ord])
+	if !ok {
+		return false
+	}
+	if t.desc {
+		return c < 0 // DESC keeps the largest, so the smaller drops first
+	}
+	return c > 0 // ASC keeps the smallest, so the larger drops first
+}
+
+func (t *topN) offer(r Row) {
+	if len(t.h) < t.capN {
+		t.h = append(t.h, r.Clone())
+		for i := len(t.h) - 1; i > 0; {
+			p := (i - 1) / 2
+			if !t.evictable(t.h[i], t.h[p]) {
+				break
+			}
+			t.h[i], t.h[p] = t.h[p], t.h[i]
+			i = p
+		}
+		return
+	}
+	if !t.evictable(t.h[0], r) { // r can't beat the current worst
+		return
+	}
+	t.h[0] = r.Clone()
+	for i, n := 0, len(t.h); ; {
+		worst, l, rr := i, 2*i+1, 2*i+2
+		if l < n && t.evictable(t.h[l], t.h[worst]) {
+			worst = l
+		}
+		if rr < n && t.evictable(t.h[rr], t.h[worst]) {
+			worst = rr
+		}
+		if worst == i {
+			break
+		}
+		t.h[i], t.h[worst] = t.h[worst], t.h[i]
+		i = worst
+	}
+}
+
+// sorted returns the kept rows in ORDER BY order.
+func (t *topN) sorted() []Row {
+	sortRowsByCol(t.h, t.ord, t.desc)
+	return t.h
 }
 
 // buildInsertRow materialises the full row for an INSERT plan: evaluates each
