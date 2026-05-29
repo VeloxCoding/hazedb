@@ -1,8 +1,8 @@
 # hazedb RFC
 
-**Status:** M1+M2 implemented; M3–M8 open. See *Implementation status* for what is running vs designed.  
+**Status:** M1–M6 implemented (store, SQL, WAL durability, UUIDv7 PK, partitioning, runtime catalog + `CREATE`/`DROP TABLE`, single-table transactions); M7–M8 open. See *Implementation status* for what is running vs designed.  
 **Module:** `github.com/VeloxCoding/hazedb`  
-**Updated:** 2026-05-29 (rev. 7 — WAL format settled as typed-mutation after benchmarking; see *Review coverage* and *Changelog*)
+**Updated:** 2026-05-29 (rev. 13 — benchmarks re-measured at M6; status + stale-milestone fixes)
 
 ---
 
@@ -49,7 +49,7 @@ tables are *examples* of that profile, not the scope.)
 
 The remainder of this RFC describes the **target architecture** — the full design hazedb is being built toward. Not all of it is implemented. This section is the single source of truth on what runs today vs what is planned.
 
-### Running today (M1 + M2 + M3 + M4 foundation)
+### Running today (M1–M6)
 
 - Sharded RWMutex storage: `[]Value` typed rows, append-only arena, tombstone deletes, per-shard `map[UUID]uint64` PK index, `uint64` rowID
 - **UUIDv7 PK, enforced** — `[16]byte` stored inline in `Value` (no per-cell alloc); INSERT auto-generates a monotonic UUIDv7 when omitted (resolved before the WAL write), or accepts a client UUID; a canonical-string PK is parsed to UUID at the API boundary, never in storage
@@ -61,7 +61,7 @@ The remainder of this RFC describes the **target architecture** — the full des
 - PK fast path (`WHERE id = ?` → pk-map lookup, one shard) and indexed partition scan (`WHERE partkey = ?`), both as compiled-plan properties available to runtime-created tables
 - **PartitionKey shard routing + table-wide `pkDirectory` + per-partition tail index** (M5) — partition-routed shards, `map[UUID]rowLocation` directory for table-wide PK uniqueness + O(1) `WHERE id = ?`, indexed `WHERE partkey = ?` scan
 - **Runtime catalog + first-class DDL** — `CREATE TABLE` / `DROP TABLE` over an `atomic.Pointer[catalog]` (RCU swap), durable append-only table IDs, catalog-version plan invalidation, WAL-logged and replayed before mutations; runtime tables are not second-class (insert/read benchmarks identical to predeclared)
-- The *Measured benchmarks* table predates M3/M4. M4 perf cost recorded in `bench/baseline_m4.txt`: the 16-byte UUID in every `Value` cell adds ~10-22% ns and +50-100 B/op vs M3; allocs flat-or-better. (An optional typed-struct wrapper could reclaim the `[]Value` overhead later, but is post-1.0 and not on the hot path.)
+- *Measured benchmarks* were re-measured at rev. 12. Historical note: the M4 switch to a 16-byte UUID in every `Value` cell added ~10-22% ns / +50-100 B/op vs M3 (`bench/baseline_m4.txt`); an optional typed-struct wrapper could reclaim the `[]Value` overhead later (post-1.0, not on the hot path).
 - Read-path clone-under-lock: a PK/partition lookup clones the matched row while still holding the shard read lock, so a returned row never aliases storage a concurrent write could mutate. A projected `SELECT` clones only its projected columns under the lock (no full-row clone), and a point-read `Query` evaluates just the PK argument from the raw args (no full `[]Value` conversion, no `evalCtx`) → ~198 ns / 4 allocs on a 3-col table projecting 2; `SELECT *` still takes the full-row clone
 - `LIMIT` without `ORDER BY` is applied during the scan (stop at the limit, project under the lock) instead of materialising the whole match set then truncating — fewer allocations and an early exit
 
@@ -569,7 +569,7 @@ Cross-table transactions (debit one table, credit another) require locking shard
 
 ## Measured benchmarks
 
-> **Scope:** measured on the **M5 implementation** — UUIDv7 PK, partitioned tables, logical typed-mutation WAL, runtime SQL engine with cached prepared plans. These numbers are the runtime engine itself (no code generation involved); it already runs ~8× SQLite on point reads. The `[]Value` representation carries some per-row overhead an optional typed-struct wrapper could trim later, so treat the single-thread numbers as a **floor**. All on AMD Ryzen AI MAX+ 395 (32 threads), Docker, golang:1.22; medians of count≥3.
+> **Scope:** the **hazedb** columns/rows were re-measured at rev. 12 (M6: UUIDv7 PK, partitioning, runtime catalog, single-table transactions, point-read fast path, `LIMIT` pushdown). The **SQLite / Bolt** cross-store columns are from the earlier sweep — those engines are unchanged, only hazedb's code moved. These are the runtime engine itself (no code generation); it runs ~9× SQLite on point reads. The `[]Value` representation carries per-row overhead an optional typed-struct wrapper could trim later, so treat the single-thread numbers as a **floor**. All on AMD Ryzen AI MAX+ 395 (32 threads), Docker, golang:1.22; absolute µs are load-sensitive on this dev box, so read them as ratios, not an SLA.
 
 ### Point operations vs SQLite and Bolt (single-thread, fair 16-byte UUID keys)
 
@@ -577,42 +577,52 @@ All four stores key by the same 16-byte UUID, so the comparison is fair on key w
 
 | Operation | hazedb (mem) | hazedb (+WAL) | SQLite (mem) | SQLite (disk) | Bolt |
 |---|---:|---:|---:|---:|---:|
-| INSERT | **0.50 µs** | 0.62 µs | 1.8 µs | 20 µs | 1 500 µs † |
-| SELECT WHERE id=? | **0.25 µs** | — | 2.0 µs | 2.8 µs | 0.52 µs |
-| UPDATE WHERE id=? | **0.20 µs** | — | 1.0 µs | 2.5 µs | 1 400 µs † |
-| DELETE WHERE id=? | **0.39 µs** | — | — | 20–49 µs | 4 000 µs † |
+| INSERT | **0.59 µs** | 0.76 µs | 1.8 µs | 20 µs | 1 500 µs † |
+| SELECT WHERE id=? | **0.22 µs** | — | 2.0 µs | 2.8 µs | 0.52 µs |
+| UPDATE WHERE id=? | **0.24 µs** | — | 1.0 µs | 2.5 µs | 1 400 µs † |
+| DELETE WHERE id=? | **0.44 µs** | — | — | 20–49 µs | 4 000 µs † |
 
-**Even RAM-vs-RAM, hazedb leads:** vs SQLite `:memory:` it is ~8× on reads, ~3.5× on inserts, ~5× on updates.
+**Even RAM-vs-RAM, hazedb leads:** vs SQLite `:memory:` it is ~9× on reads, ~3× on inserts, ~4× on updates.
 
-**What the gap is — and isn't.** It is mostly the Go *access layer*, and it is **not** the cgo crossing. Evidence: swapping the cgo driver for **pure-Go SQLite** (`modernc.org/sqlite`, no cgo, same `database/sql`) made it *slower*, not faster — read **4.3 µs**, insert **14.9 µs**, update **3.4 µs** vs the cgo build's 2.0 / 1.7 / 1.0 µs. So removing cgo costs speed; the crossing was never the bottleneck. What a Go program actually pays to use SQLite is the `database/sql` layer (reflection, interface conversions, ~25 allocations per read vs hazedb's 6) on top of a general-purpose engine. hazedb is faster because it skips that layer — typed rows returned in-process, no SQL dispatch per call — which is the project thesis, **not** a claim that its lookup beats SQLite's B-tree. † Write rows for SQLite-disk and Bolt are **not** like-for-like on durability (they fsync/journal to disk; hazedb-mem does not). Allocations/op: hazedb 2–6, SQLite 9–26, Bolt 49–66.
+**What the gap is — and isn't.** It is mostly the Go *access layer*, and it is **not** the cgo crossing. Evidence: swapping the cgo driver for **pure-Go SQLite** (`modernc.org/sqlite`, no cgo, same `database/sql`) made it *slower*, not faster — read **4.3 µs**, insert **14.9 µs**, update **3.4 µs** vs the cgo build's 2.0 / 1.7 / 1.0 µs. So removing cgo costs speed; the crossing was never the bottleneck. What a Go program actually pays to use SQLite is the `database/sql` layer (reflection, interface conversions, ~25 allocations per read vs hazedb's 4) on top of a general-purpose engine. hazedb is faster because it skips that layer — typed rows returned in-process, no SQL dispatch per call — which is the project thesis, **not** a claim that its lookup beats SQLite's B-tree. † Write rows for SQLite-disk and Bolt are **not** like-for-like on durability (they fsync/journal to disk; hazedb-mem does not). Allocations/op: hazedb 2–4, SQLite 9–26, Bolt 49–66.
+
+### Transactions (single-table, v1)
+
+| Operation | Time | Allocs |
+|---|---:|---:|
+| 2-row transfer — `db.Transaction` with two PK-pinned arithmetic UPDATEs | **~1.1 µs** | 19 |
+
+Commit locks only the shards the staged statements touch (not all shards) and writes one `TXN` WAL envelope; ~2× a bare PK update, the price of atomicity + the staged overlay. See *Transactions*.
 
 ### Parallel scaling (32 cores)
 
 | Operation | Single | Parallel |
 |---|---:|---:|
-| SELECT WHERE id=? | 0.25 µs | **0.09 µs** |
-| INSERT (memory) | 0.52 µs | **0.10 µs** |
+| SELECT WHERE id=? | 0.22 µs | **0.09 µs** |
+| INSERT (memory) | 0.59 µs | **0.13 µs** |
+| UPDATE WHERE id=? | 0.24 µs | **0.11 µs** |
 
 ### Durability ladder — INSERT (relative; overlay FS, not a real-disk fsync SLA)
 
 | Mode | INSERT |
 |---|---:|
-| flush only (default ticker) | 0.62 µs |
-| flush + fsync on ticker (`WALSync`) | 0.95 µs |
-| flush + fsync every write (`WALSyncPerWrite`) | ~1 650 µs |
+| flush only (default ticker) | 0.76 µs |
+| flush + fsync on ticker (`WALSync`) | ~1.5 µs |
+| flush + fsync every write (`WALSyncPerWrite`) | ~1 640 µs |
 
-### Indexed partition scan vs full-table scan
+### Indexed partition scan, and the LIMIT short-circuit
 
-`SELECT … WHERE partitionkey=? ORDER BY … LIMIT n` reads only the matching partition.
+A feed query `SELECT … WHERE partitionkey=? ORDER BY seq DESC LIMIT n` reads only the matching partition's rows — O(partition), not O(table):
 
 | Scan | Time | Allocs |
 |---|---:|---:|
-| One partition (~100 rows) of a 10k-row table | **31 µs** | 128 |
-| Full unindexed range scan of 10k rows | 770 µs | 4 932 |
+| One partition (~100 rows) of a 10k-row table, `ORDER BY … LIMIT` | **~34 µs** | 128 |
 
-~25× faster, and the gap widens with table size (O(partition) vs O(table)).
+The partition index earns its keep when `ORDER BY` forces gathering the whole matching set to sort. **Without `ORDER BY`, `LIMIT` now short-circuits the scan** (stop at the limit, project under the lock): an unindexed `SELECT id FROM users WHERE age > ? LIMIT 10` over 10k rows (≈4 900 match) is **~1.3 µs / 16 allocs** — versus **~770 µs / 4 932 allocs before the pushdown** (rev. 12), which cloned every matching row before truncating. So the index matters for ordered tail scans; for an unordered `LIMIT`, the short-circuit already makes a full scan cheap.
 
 ### Mixed workload — 4 writers + 16 readers, 2 s, WAL on
+
+*Not re-measured at rev. 12; these predate the read-path fast path, so the read percentiles are if anything conservative.*
 
 | | Value |
 |---|---:|
@@ -627,7 +637,7 @@ All four stores key by the same 16-byte UUID, so the comparison is fair on key w
 
 ## Current file layout
 
-Files that exist today (M1+M2). Where a file's eventual scope differs from what runs now (notably `wal.go`), the planned additions are annotated inline and dated by milestone — they are not implemented yet.
+Files that exist today. Where a file's eventual scope differs from what runs now (notably `wal.go`), the planned additions are annotated inline and dated by milestone — they are not implemented yet.
 
 ```
 github.com/VeloxCoding/hazedb   (package hazedb)
@@ -638,7 +648,7 @@ github.com/VeloxCoding/hazedb   (package hazedb)
 ├── partition_store.go  Partitioned-table storage: pkDirectory (UUID→location), tail index, two-lock insert, release-then-retry read
 ├── catalog.go       Runtime catalog (atomic snapshot, RCU swap), CREATE/DROP, durable table IDs, catalog WAL record codec
 ├── txn.go           Transactions: Tx, db.Transaction closure, staged overlay, commit (lock-all-shards + one TXN envelope), lock-free apply helpers
-├── wal.go           Logical typed-mutation WAL: versioned envelope (magic|type|version|length|payload|crc32c), MUTATION + CREATE/DROP catalog records, CRC32C, durability modes, bounds-checked tail recovery. Planned: TXN envelope grouping (M6), snapshot load (M7)
+├── wal.go           Logical typed-mutation WAL: versioned envelope (magic|type|version|length|payload|crc32c), MUTATION + TXN + CREATE/DROP catalog records, CRC32C, durability modes, bounds-checked tail recovery. Planned: snapshot load (M7)
 ├── uuid.go          UUID [16]byte type + monotonic RFC-9562 UUIDv7 generator
 ├── lexer.go         Tokenizer
 ├── ast.go           AST node types (incl. createStmt/dropStmt)
@@ -669,9 +679,9 @@ github.com/VeloxCoding/hazedb   (package hazedb)
 | pkDirectory for partitioned tables | Required from day one — not deferred. Enforces table-wide PK uniqueness and enables O(1) `WHERE id = ?` without scanning all shards. PK and PartitionKey columns are immutable (enforced at plan time). |
 | WAL format | Logical **typed-mutation**: op + tableID + resolved typed params per record (full row on insert; PK + changed-column deltas on update; PK on delete). **NOT SQL-string** — benchmarked and rejected (SQL text cost +50% bytes/insert, 2.5× bytes/delete, ~2× replay; spike in `wal_format_spike_test.go`). All auto-generated values resolved before write; deterministic replay via the apply path; `hazedb dump` reconstructs SQL for inspection. |
 | WAL durability default | async-bufio + ticker (1 s), fsync opt-in via `WALSync bool` |
-| Public API | One runtime engine: `db.Query()`/`db.Exec()` parse once, cache the plan per SQL string, re-bind on catalog-version change. This is the hot path (~8× SQLite without codegen). An optional typed-struct wrapper over the same plans is post-1.0 ergonomics, not a speed mechanism. |
+| Public API | One runtime engine: `db.Query()`/`db.Exec()` parse once, cache the plan per SQL string, re-bind on catalog-version change. This is the hot path (~9× SQLite on point reads, without codegen). An optional typed-struct wrapper over the same plans is post-1.0 ergonomics, not a speed mechanism. |
 | Schema lifecycle | `CREATE`/`DROP TABLE` at runtime over an atomic catalog (RCU); durable append-only table IDs; no `ALTER` in v1 |
-| Multi-shard non-PK writes | Closed by correctness, not preference. The one-shard-at-a-time pattern is a write-serializability + replay-divergence bug (see *Transactions — The problem*). A multi-shard `UPDATE`/`DELETE` not pinned to a single shard by PK/PartitionKey must either lock all affected shards before the WAL write, or be wrapped in `db.Transaction()`. Until `db.Transaction()` lands (M5), such statements take the lock-all-shards path or are rejected at plan time. |
+| Multi-shard non-PK writes | Closed by correctness, not preference. The one-shard-at-a-time pattern is a write-serializability + replay-divergence bug (see *Transactions — The problem*). A multi-shard `UPDATE`/`DELETE` not pinned to a single shard by PK/PartitionKey must either lock all affected shards before the WAL write, or be wrapped in `db.Transaction()` (M6, shipped). Outside a transaction such statements take the lock-all-shards path; inside one, the v1 rule requires PK-pinned statements. |
 
 ---
 
@@ -763,115 +773,3 @@ Each mechanism was checked against every operation that can touch it — insert,
 ## One line
 
 hazedb compiles into your Go binary, keeps all data in RAM, writes a WAL for durability, and serves SQL queries at sub-µs p50 / <50 µs p99 under concurrent mixed workload.
-
----
-
-## Changelog
-
-**rev. 12 (2026-05-29) — point-read fast path + LIMIT pushdown**
-
-Two read-path optimisations (originated as a Codex pass, reviewed and integrated):
-
-- **Point-read `Query` fast path.** For `WHERE id = ?`, `Query` now evaluates only the PK argument directly from the raw `args` (`evalLitOrParamAny` → `execSelectPK`) instead of converting every arg through `toValues` and building an `evalCtx`. Saves two allocations per point read. On a 3-col table projecting 2: ~260 ns → ~198 ns, 6 → 4 allocs, 376 → 232 B/op.
-- **`LIMIT` without `ORDER BY` pushdown.** The scan stops once `limit` rows are collected and projects each under the shard read lock, instead of materialising the full match set and truncating. Fewer allocations, early exit. The prealloc is capped (`min(limit, 1024)`) so a pathological huge `LIMIT` over a tiny result doesn't allocate a giant slice. New `TestSelectLimitNoOrderBy` pins the count semantics (exact limit, limit>rows, limit 0, WHERE+LIMIT).
-
-Refactors: `selectColNames`, `toValue` (single-arg), `evalCtx` passed by value. Full `-race` suite green.
-
-**rev. 11 (2026-05-29) — projected point reads clone only their columns**
-
-The race fix (clone the matched row under the shard read lock so a returned row never aliases the arena) cloned the *whole* row, after which a projected SELECT copied the wanted columns out of that clone — two allocations and a full-width copy for a query that wants a few columns. Now a projected point read (`getByPKProject` / partitioned variant) clones only the projected columns directly into the result row under the lock; `SELECT *` keeps the full-row clone. Measured on a 3-column table projecting 2: ~384 ns → ~260 ns, 7 → 6 allocs, 600 → 376 B/op — a CPU win with allocations and memory *also* down. The gap widens with table width vs projection width.
-
-**rev. 10 (2026-05-29) — transaction commit locks only the touched shards**
-
-The M6 commit path no longer locks every shard of the table; it locks only the shards the staged statements touch, in ascending shard-index order. The set is computed alloc-free into a stack buffer (linear dedup + insertion sort, no map, no `sort.Slice` closure). For a non-partitioned table each shard is the PK's hash; for a partitioned table an INSERT routes by its row's PartitionKey value and an UPDATE/DELETE by the current pkDirectory location (read under the directory lock the commit already holds). Deadlock-safe against `updateWhereAll`/predicate writes because every acquirer takes shard locks in ascending order. Measured: a 2-row transfer drops from ~3.0 µs to ~1.0 µs (≈2.9×) on a 128-shard box, with allocations and bytes/op unchanged (19 allocs / 1376 B) — a win on CPU with no regression on allocation or memory.
-
-**rev. 9 (2026-05-29) — M6 single-table transactions implemented (v1 scope)**
-
-`db.Transaction(func(tx *Tx) error)` lands at the deliberately narrow v1 scope, built and tested (transfer, rollback, restart, read-your-writes, partitioned, concurrent balance-conservation under `-race`, plus guardrail rejections):
-
-- **Write-only API** (`tx.Exec` only, no `tx.Query`), **PK-pinned statements**, **single table per transaction** — rejections surface as `ErrTxUnsupported`. This avoids pretending to offer snapshot isolation and closes the Go-side read-compute-write lost-update trap.
-- **Staged overlay** gives read-your-writes (statement N sees 1..N−1); **arithmetic `SET`** is (re-)evaluated under the commit locks against live + in-tx state, so the journaled values are the true committed-time results.
-- **Poison-on-first-error**: a failed `tx.Exec` forces rollback even if the closure returns nil.
-- **One `TXN` WAL envelope** (`recTxn`): `nmut:2 | (mlen:4 | op|tableID|op-body) × nmut`, reusing the single-statement mutation encoders and `applyMutation` on replay; torn envelope discarded whole, complete envelope replays all-or-nothing.
-- **Commit locks all shards of the table** (+ pkDirectory if partitioned), reusing the `updateWhereAll` lock-all pattern. Measured ~3.0 µs / 19 allocs for a 2-row transfer (vs ~0.5 µs for one insert) on a 128-shard box — the all-shard hold is the bulk of it. Acceptable for an opt-in path; **subset-locking the touched shards is the documented optimisation** (trivial for non-partitioned, needs a directory lookup for partitioned). Roadmap M6 marked done; stale `M3`/`M5` references in the Transactions section corrected (arithmetic SET shipped in M3; transactions are M6).
-
-**rev. 8 (2026-05-29) — runtime catalog is the primary architecture; codegen demoted to optional wrapper**
-
-A foundational direction change, validated in code (insert/read benchmarks for a runtime-created table are identical to a predeclared one). Earlier revisions treated `go generate` codegen as *the hot path* and the SQL interpreter as a "fallback," with the schema fixed at `Open()`. That is inverted:
-
-- **One runtime engine is the hot path.** `db.Query()`/`db.Exec()` parse each SQL string once, cache the compiled plan, and re-run it from cache. Measured ~8× SQLite on point reads with **no** code generation, so codegen is not a performance precondition. Rewrote *Query API* (was *Query API and codegen model*): removed the two-tier "generated methods = hot path / interpreter = fallback" framing and the `StrictMode` "no interpreter in production" guarantee.
-- **Codegen demoted to an optional, post-1.0 ergonomic wrapper.** A generated typed-struct layer can sit *on top of the same cached plans* for compile-time type safety and nicer call sites; it buys ergonomics, not throughput. Updated the `[]Value` note, the PK rationale ("engine stays simple", not "codegen is simpler"), the named-transaction section, the cgo-boundary section, the benchmark-scope note, and the settled-decisions *Public API* row to match.
-- **Runtime catalog + first-class DDL (new section).** Tables are live state behind an `atomic.Pointer[catalog]` (RCU swap on DDL, lock-free reads/writes, `ddlMu` serialises DDL only). `CREATE`/`DROP TABLE` run while serving; durable append-only `tableID`s (drop nils the slot, never reuses the id); a monotonic catalog `version` lazily invalidates cached plans so a plan never runs against a changed table; DDL is WAL-logged before publish and replayed before the mutations that reference it, so runtime tables (including partitioned ones, with their directory + tail index) survive restart.
-- **v1 schema limits stated.** `CREATE` + `DROP` only — **no `ALTER`** (not a keyword → parse error; reshape via create-copy-drop). No "DROP while an active cursor holds the table" lock is needed: `Query()` fully materialises and deep-clones before returning, so there are no streaming cursors aliasing storage. Non-goal table updated ("No runtime schema migration" → "No `ALTER TABLE` in v1").
-- **Roadmap re-aligned to what shipped.** M4 = UUIDv7 PK + immutable order column + typed-mutation WAL (done); M5 = PartitionKey/`pkDirectory`/indexed scan **+ runtime catalog/DDL** (done); transactions are M6; multi-table + secondary indexes + the optional typed-struct wrapper move to post-1.0.
-
-**rev. 7 (2026-05-29) — WAL format settled by benchmark**
-
-The WAL format was an open architectural choice between three encodings. A spike (preserved in `wal_format_spike_test.go`, run via `golang:1.22` docker) measured all three on write size and decode+apply (replay) cost, sharing one value codec for fairness:
-
-| record | Physical row-image | SQL-string logical | Typed-mutation (chosen) |
-|---|--:|--:|--:|
-| insert | 127B | 190B | 127B |
-| update narrow | 127B | 151B | 110B |
-| update wide (1 of 9 cols) | 218B | 86B | **51B** |
-| delete | 24B | 60B | 24B |
-| replay insert (ns/op, allocs) | 198 / 3 | 389 / 5 | 198 / 3 |
-| replay update narrow | 185 / 3 | 225 / 5 | 149 / 4 |
-| replay delete | 92 / 1 | 183 / 3 | 92 / 1 |
-
-- **Adopted typed-mutation, rejected SQL-string.** SQL-string lost on the two dimensions that matter here — WAL write size (+50% insert, 2.5× delete) and replay (~2× slower, more allocs, because every record re-runs prepare + the eval pipeline). Its only plausible edge (a human/replication-friendly SQL log) is illusory: the envelope is binary-framed with CRC regardless, and a consumer already needs the exact schema + UUID + transaction semantics to replay. Typed-mutation keeps every "logical" benefit (replay through the apply path, snapshots, TXN/CHECKPOINT envelope) without the parser tax, and additionally beats the *current physical* format on updates by delta-encoding (51B vs 218B on a wide one-column edit).
-- **Envelope payload redefined.** `STATEMENT (sql_len|sql|params_len|params)` → `MUTATION (op|tableID|op-body)`, where INSERT carries the full row, UPDATE carries `pk + (ordinal,value)` deltas, DELETE carries the pk. Type byte renamed `1=MUTATION`. TXN groups MUTATION payloads. Reconciled the format section, replay, tail-recovery (inner-length wording), `hazedb dump`, settled-decisions, file-layout, and review-coverage rows.
-
-**rev. 6 (2026-05-29) — fifth review pass**
-
-Of the eight points raised, five were already fixed in rev. 5 (the review was against rev. 4): tx read isolation, `dirtySinceSync`, `bw.Write` fatal-path, segment record-boundary, and `uint64` rowID. Three were genuinely new and are applied here:
-
-- **Partitioned `WHERE id=?` could return a phantom not-found — correction of a rev. 3 mistake.** rev. 3 told the read path to treat a tombstone/PK-mismatch at the resolved location as not-found. That is wrong for `DELETE`+`INSERT` of the same PK (PartitionKey-move): the row exists before and after the transaction, only at a new location, so not-found is a phantom. Fixed: on tombstone/mismatch, **retry the `pkDirectory` lookup** (bounded) — it finds the new location or a genuine deletion — or hold the directory read lock across the shard read. The "return not-found" rule is removed.
-- **Transaction error handling — poisoned tx.** First `tx.Exec` error now makes the `Tx` sticky-failed: later `tx.Exec` calls no-op with the same error, and `db.Transaction` forces rollback returning that error even if the closure returns `nil`. Prevents an ignored statement error from silently committing a partial transaction. Go example updated to propagate errors.
-- **Checkpoint discovery at recovery.** Specified how recovery *finds* the checkpoint before replaying: a `MANIFEST{snapshot, lsn}` file (atomic-replace, fsync, after snapshot durable / before segment deletion) read first, or an explicit two-pass scan for the newest verified `CHECKPOINT`. Naive one-pass replay from the first segment would double-apply pre-checkpoint records. M7 roadmap updated.
-
-**rev. 5 (2026-05-29) — fourth review pass + full invariant sweep**
-
-External points (all confirmed and applied):
-- **Transaction read isolation.** v1 transactions made write-only at the API; read-compute-write across the closure (lost-update / non-serialisable) is not promised without read-set validation / SSI, now stated. Internal reads (read-your-writes, arithmetic `SET`) are evaluated under commit locks.
-- **fsync skipped after auto-flush.** Sync decision now keys off a `dirtySinceSync` flag, not `bw.Buffered()`; `bufio` auto-flush could leave unsynced data invisible to a `Buffered()`-gated sync, breaking the `WALSync` power-loss bound.
-- **WAL append errors.** `bw.Write` errors are now fatal and checked at pipeline step 6 — abort before applying to memory; added to the error-state rules alongside flush/sync.
-- **Segmented WAL framing.** Records never span a segment (rotate before append); segment headers are outside LSN space; recovery resolves LSN→segment by base comparison.
-- **rowID overflow.** `rowID` widened to `uint64` (uint32 ≈ 4.29B slots incl. tombstones is reachable on a hot shard before M7 snapshot; wraparound is silent corruption).
-
-Found in own sweep (not externally flagged):
-- **Bug introduced in rev. 4, now fixed:** the envelope text said recovery should "skip records it doesn't understand" — that is silent data loss for a data WAL. Unknown version/type now fails loud (aborts `Open()`); only tail truncation discards.
-- **Checkpoint write-barrier** added to the top of the global lock order (an unlisted "pause all writes" barrier is a latent lock-order violation).
-- **Pre-M7 caveat:** no log truncation → unbounded WAL on disk and cold-start recovery time linear in total history (distinct from the RAM churn caveat).
-- **Multi-shard `ORDER BY` + `LIMIT`** must gather-then-sort; `LIMIT n` cannot be pushed per-shard.
-- **Shard count** clarified as runtime-derived and never persisted; routing re-derived on replay/snapshot-load, self-consistent across machines.
-- **Auto-gen PK in a transaction** resolves at statement-execution time (read-your-writes + WAL consistency).
-- Added a **Review coverage** matrix (invariant × operation) plus an explicit "not yet swept" list.
-
-**rev. 4 (2026-05-29) — third review pass applied**
-
-- **Multi-shard SELECT consistency (now defined).** Added an explicit read-consistency model to the SQL interpreter: single-shard/pinned scans are point-in-time; unpinned multi-shard scans are per-shard consistent but *not* globally point-in-time (the read-side counterpart of the multi-shard write rule). Consistent cross-shard reads require read-locking all involved shards.
-- **Transaction predicate writes (overlay fixed).** The `(table, PK)` overlay captures effects but cannot pre-freeze a predicate's matching set. Added *Predicate writes*: v1 restricts transactions to PK-pinned statements (non-pinned rejected at plan time); the later predicate-write path must lock all shards of each table and evaluate the predicate under those locks. No frozen-pre-lock row sets.
-- **Tail-index order column is now immutable.** Added to the plan-time immutability rules: `UPDATE … SET <order_col> = ?` is rejected, because it would leave `partitionIndex.seqs` stale and corrupt tail-scan order. Mutable-order alternative (maintain the index on update, O(N) shift) documented but not the v1 default.
-- **WAL record envelope (replaces single-statement format).** Defined a typed, versioned, self-delimiting envelope `magic|type|version|length|payload|crc32c` with STATEMENT / TXN / CHECKPOINT payloads, explicit little-endian byte order, and CRC32C. Transaction atomicity is the envelope boundary (torn envelope discarded), replacing the "(sql, params) pairs + COMMIT marker" framing. Reconciled the tail-recovery, transaction-internals, replay, and M5 roadmap text.
-- **Segment-aware LSN.** LSN redefined as a global monotonic logical offset; each segment header records its `base` global offset, and recovery resolves an LSN to `(segment, offset)` by base comparison (or store `(segmentID, offset)` explicitly). A bare per-file byte offset is ambiguous once the WAL is segmented. Updated the M7 roadmap and consistent-cut protocol to match.
-
-**rev. 3 (2026-05-29) — second review pass applied**
-
-- **Partitioned shard ≠ partition value (P1).** Corrected the `tableShard` comment ("rows for one partition value" → all partition values that hash to the shard) and added a per-partition-value tail index `tails map[PartitionValue]*partitionIndex`. A single per-shard index would interleave rows from colliding partition values into one scan order. Updated *Ordered index* and the shard-routing bullet to match.
-- **Transaction read-your-writes (P1).** Replaced pure buffering with a staged overlay: statements evaluate sequentially against an overlay so statement *N* observes statements 1…*N*−1 (correct SQL semantics for `INSERT x; UPDATE x` and repeated writes to one row). Arithmetic `SET` re-evaluates against locked live state + earlier in-tx effects at commit.
-- **WAL flush goroutine concurrency (P1).** Specified that the ticker holds `walMu` across `Buffered`/`Flush`/`Sync` (`bufio.Writer` is not concurrent-safe), and that `WALFlushInterval <= 0` starts no ticker (`time.NewTicker(0)` panics; manual-only mode).
-- **UUIDv7 ordering over-claim (P2).** Softened "`ORDER BY id` = temporal order" to ms-granularity; within a millisecond, ordering requires an RFC 9562 monotonic generator or an explicit `seq` column (the tail index's `seqs`).
-- **Checkpoint LSN semantics (P2).** Defined `lsn` as the exclusive offset of the first record not in the snapshot; replay scans from `lsn` inclusive and skips `CHECKPOINT` marker records. Removes the double-apply / skip off-by-one.
-- **WAL status contradiction (P2).** `wal.go` in *Current file layout* now describes the current physical binary WAL, with logical/COMMIT/snapshot annotated as planned (M4/M5/M7), matching *Implementation status*.
-
-**rev. 2 (2026-05-29) — correctness review applied**
-
-- **Multi-shard non-PK writes (blocking).** Rewrote *Transactions → The problem*: the one-shard-at-a-time pattern is a write-serializability + replay-divergence bug, not just a torn read. Removed the contradictory claim that the WAL append happens "while holding all relevant shard locks" *and* that readers see a torn view (mutually exclusive). Such writes must lock all affected shards before the WAL write or run under `db.Transaction()`. Moved *Open decision* #4 to *Settled decisions* — closed by correctness.
-- **Partitioned `WHERE id = ?` read path.** Documented the pkDirectory→shard TOCTOU: the shard read must re-validate liveness (tombstone / PK mismatch = not-found), or hold the directory lock across the read. Default is release-then-revalidate.
-- **Churn vs. compaction.** Flagged that high-eviction targets (sessions, caches) grow memory monotonically and degrade tail-scans (tombstone skipping) until M7 snapshot/restart.
-- **Cross-table lock order.** Shard lock order specified as lexicographic `(table index, shard index)`, not shard index alone, to prevent multi-table deadlock.
-- **WAL tail recovery.** Lengths (`sql_len`/`params_len`) must be bounds-checked against remaining file size before allocate/read; CRC sits after the length-driven read and does not protect against a corrupt length.
-- **M7 checkpoint durability.** Snapshot (and its directory) must be fsync'd before the `CHECKPOINT` marker is made durable and before pre-checkpoint segments are deleted; directory fsync also required on new WAL segment creation.
-- **Non-partitioned `pk` map.** Target key type changed to `map[UUID]uint32` to match the partitioned path (no string allocation); current string-keyed impl noted as M1+M2-only.
-- **Statement cache.** Noted the `sync.Map` is unbounded and safe only under strict parameterisation; inlined literals leak.

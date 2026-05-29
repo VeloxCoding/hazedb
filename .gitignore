@@ -3,6 +3,9 @@
 /CLAUDE_*.md
 .claude/
 
+# Local-only changelog (kept out of the published spec)
+/rfc-changelog.md
+
 # Go build/test artifacts
 *.test
 *.prof
