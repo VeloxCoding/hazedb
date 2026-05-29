@@ -31,6 +31,11 @@ type table struct {
 	def    *resolvedTable
 	shards []tableShard
 	mask   uint32
+	// pkDir is the table-wide PK→location directory for PARTITIONED tables
+	// (nil otherwise). Partitioned shards route by PartitionKey value, so the
+	// per-shard pk map can't enforce table-wide PK uniqueness or answer
+	// WHERE id=? — the directory does both.
+	pkDir *pkDirectory
 }
 
 type tableShard struct {
@@ -53,25 +58,36 @@ func newTable(def *resolvedTable, sizeHint int) *table {
 	}
 	for i := range t.shards {
 		t.shards[i].rows = make([]Row, 0, per)
-		t.shards[i].pk = make(map[UUID]uint64, per)
+		if !def.partitioned() {
+			t.shards[i].pk = make(map[UUID]uint64, per)
+		}
+	}
+	if def.partitioned() {
+		t.pkDir = &pkDirectory{idx: make(map[UUID]rowLocation, sizeHint)}
 	}
 	return t
 }
 
-// shardOf hashes the 16-byte UUID (FNV-1a 32-bit) and returns the owning
-// shard. FNV-1a is fast, branchless, and well-distributed.
-func (t *table) shardOf(pk UUID) *tableShard {
+// shardIdxOf hashes the 16-byte UUID (FNV-1a 32-bit) to a shard index. For a
+// non-partitioned table the UUID is the PK; for a partitioned table it is the
+// PartitionKey value (so all rows of one partition land in one shard).
+func (t *table) shardIdxOf(u UUID) uint32 {
 	var h uint32 = 2166136261
 	for i := 0; i < 16; i++ {
-		h ^= uint32(pk[i])
+		h ^= uint32(u[i])
 		h *= 16777619
 	}
-	return &t.shards[h&t.mask]
+	return h & t.mask
 }
+
+func (t *table) shardOf(u UUID) *tableShard { return &t.shards[t.shardIdxOf(u)] }
 
 // insert places a row under its PK. Returns ErrDuplicatePK if the key
 // already exists (live or tombstone-replaced rows take new slots).
 func (t *table) insert(row Row) error {
+	if t.pkDir != nil {
+		return t.insertPartitioned(row, nil)
+	}
 	pk := row[t.def.pkOrdinal].U
 	s := t.shardOf(pk)
 	s.mu.Lock()
@@ -101,6 +117,9 @@ func (t *table) insert(row Row) error {
 //
 // journal may be nil (memory-only DB).
 func (t *table) insertJournaled(row Row, journal func() error) error {
+	if t.pkDir != nil {
+		return t.insertPartitioned(row, journal)
+	}
 	pk := row[t.def.pkOrdinal].U
 	s := t.shardOf(pk)
 	s.mu.Lock()
@@ -129,6 +148,9 @@ func (t *table) insertJournaled(row Row, journal func() error) error {
 // set, which is rare). journal may be nil (memory-only), in which case the
 // values are simply applied with no save/revert overhead.
 func (t *table) updateByPKJournaled(pk UUID, ords []int, compute func(Row) ([]Value, error), journal func(Row) error) (bool, error) {
+	if t.pkDir != nil {
+		return t.updateByPKJournaledPartitioned(pk, ords, compute, journal)
+	}
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -168,6 +190,9 @@ func (t *table) updateByPKJournaled(pk UUID, ords []int, compute func(Row) ([]Va
 // it journals (via journal) before tombstoning, so a WAL failure aborts
 // before the row is removed. journal may be nil (memory-only).
 func (t *table) deleteByPKJournaled(pk UUID, journal func() error) (bool, error) {
+	if t.pkDir != nil {
+		return t.deleteByPKJournaledPartitioned(pk, journal)
+	}
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -190,6 +215,9 @@ func (t *table) deleteByPKJournaled(pk UUID, journal func() error) (bool, error)
 // a shallow alias into the shard arena; callers that escape it past
 // the call must Clone.
 func (t *table) getByPK(pk UUID) (Row, bool) {
+	if t.pkDir != nil {
+		return t.getByPKPartitioned(pk)
+	}
 	s := t.shardOf(pk)
 	s.mu.RLock()
 	rowID, ok := s.pk[pk]
@@ -233,6 +261,9 @@ func (t *table) scanAll(fn func(Row) bool) {
 // is absent. mutate runs under the shard write lock and must not call
 // back into the store.
 func (t *table) update(pk UUID, mutate func(Row) Row) bool {
+	if t.pkDir != nil {
+		return t.updatePartitioned(pk, mutate)
+	}
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -311,6 +342,9 @@ func (t *table) updateWhereAll(match func(Row) bool, ords []int, compute func(Ro
 // deleteByPK removes the row at pk. Returns false if absent.
 // Tombstones in place (rows[rowID] = nil) so rowIDs stay stable.
 func (t *table) deleteByPK(pk UUID) bool {
+	if t.pkDir != nil {
+		return t.deleteByPKPartitioned(pk)
+	}
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -331,6 +365,9 @@ func (t *table) deleteByPK(pk UUID) bool {
 // tombstone is applied, so a WAL-append failure aborts before that row is
 // removed. Returns the count deleted (or applied-so-far plus the error).
 func (t *table) deleteWhereAll(match func(Row) bool, journal func(pk Value) error) (int, error) {
+	if t.pkDir != nil {
+		return t.deleteWhereAllPartitioned(match, journal)
+	}
 	pkOrd := t.def.pkOrdinal
 	t.lockAllShards()
 	defer t.unlockAllShards()
