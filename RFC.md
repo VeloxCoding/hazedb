@@ -36,26 +36,25 @@ directly into a Caddy module, FrankenPHP extension, or standalone Go binary.
 
 The remainder of this RFC describes the **target architecture** — the full design hazedb is being built toward. Not all of it is implemented. This section is the single source of truth on what runs today vs what is planned.
 
-### Running today (M1 + M2 + M3)
+### Running today (M1 + M2 + M3 + M4 foundation)
 
-- Sharded RWMutex storage: `[]Value` typed rows, append-only arena, tombstone deletes, per-shard `pk` map keyed by string
-- Physical binary WAL: length-prefixed records with CRC32, 64 KB bufio buffer, tail-recovery on open (length-bounds-checked against bytes-remaining)
-- Write pipeline enforces validate → WAL append → apply, all under the relevant shard lock(s); multi-shard predicate writes hold every shard lock so WAL order == in-memory order
-- WAL durability modes (M3): background flush ticker (`WALFlushInterval`), `WALSync` (ticker fsync, keyed off a `dirtySinceSync` flag), `WALSyncPerWrite` (fsync every record), and a sticky WAL error state that blocks further writes
-- Runtime SQL interpreter: parse → plan → execute for `SELECT` / `INSERT` / `UPDATE` / `DELETE`, including arithmetic in `SET` and `WHERE` (`col +/-/* ?`) (M3)
-- Statement cache (`sync.Map`) and PK fast path (`WHERE pk = ?` → direct shard map lookup)
-- Integer or string PK — **UUIDv7 enforcement is not yet implemented**
-- The *Measured benchmarks* table predates the M3 work; M3 left the memory-only hot paths flat and added ~5% to Insert_WAL (append now under the shard lock)
+- Sharded RWMutex storage: `[]Value` typed rows, append-only arena, tombstone deletes, per-shard `map[UUID]uint64` PK index, `uint64` rowID
+- **UUIDv7 PK, enforced** — `[16]byte` stored inline in `Value` (no per-cell alloc); INSERT auto-generates a monotonic UUIDv7 when omitted (resolved before the WAL write), or accepts a client UUID; a canonical-string PK is parsed to UUID at the API boundary, never in storage
+- Immutable order column (`seq`) support: an `Immutable` column flag rejects `UPDATE SET` at plan time (PK is implicitly immutable) — the stable schema M5's tail index builds against
+- **Logical typed-mutation WAL**: versioned self-delimiting envelope (`magic|type|version|length|payload|crc32c`); MUTATION payload is `op|tableID|op-body` (insert=full row, update=pk+changed-column deltas, delete=pk); CRC32C; replay fails loud on bad magic / newer version / unknown type / CRC mismatch on a complete record, tolerates truncated tails
+- WAL durability modes (M3): flush ticker (`WALFlushInterval`, 0=1s default, <0=manual), `WALSync` (ticker fsync via a `dirtySinceSync` flag), `WALSyncPerWrite`, sticky WAL error state
+- Write pipeline enforces validate → WAL append → apply under the relevant shard lock(s); multi-shard predicate writes hold every shard lock so WAL order == in-memory order
+- Runtime SQL interpreter: `SELECT` / `INSERT` / `UPDATE` / `DELETE` with arithmetic in `SET` and `WHERE` (`col +/-/* ?`)
+- Statement cache (`sync.Map`) and PK fast path (`WHERE id = ?` → pk-map lookup, one shard)
+- The *Measured benchmarks* table predates M3/M4. M4 perf cost recorded in `bench/baseline_m4.txt`: the 16-byte UUID in every `Value` cell adds ~10-22% ns and +50-100 B/op vs M3; allocs flat-or-better. Reclaimed later by the codegen typed-struct path.
 
-### Designed, not yet implemented (M4+)
+### Designed, not yet implemented (M5+)
 
 | Feature | Milestone |
 |---|---|
-| UUIDv7-enforced PK with auto-generation + `[16]byte` keys + `uint64` rowID | M4 |
-| Logical WAL — replaces physical binary WAL | M4 |
-| PartitionKey shard routing + table-wide `pkDirectory` | M4 |
-| Compiled query API: `go generate` → `*Queries` typed methods + strict mode | M4 |
-| `db.Transaction()` Go closure API + WAL `COMMIT` grouping | M5 |
+| PartitionKey shard routing + table-wide `pkDirectory` + per-partition tail index | M5 |
+| Compiled query API: `go generate` → `*Queries` typed methods + strict mode | M5 |
+| `db.Transaction()` Go closure API + WAL `TXN` envelope grouping | M6 |
 | WAL segments + snapshot checkpoint | M7 |
 | FrankenPHP cgo binding (`hazedb_exec_transaction`, named transaction codegen) | M8 |
 
@@ -622,7 +621,8 @@ github.com/VeloxCoding/hazedb   (package hazedb)
 ├── schema.go        Schema, TableDef, ColumnDef, resolvedTable, validateValue
 ├── errors.go        Sentinel errors
 ├── store.go         Sharded RWMutex storage: insert/getByPK/scanAll/update/delete
-├── wal.go           Physical binary WAL (current M1+M2): length-prefixed record + CRC32, 64 KB bufio, tail-recovery. Planned: logical typed-mutation record (M4), TXN envelope grouping (M5), snapshot load (M7)
+├── wal.go           Logical typed-mutation WAL: versioned envelope (magic|type|version|length|payload|crc32c), MUTATION payload, CRC32C, durability modes, bounds-checked tail recovery. Planned: TXN envelope grouping (M6), snapshot load (M7)
+├── uuid.go          UUID [16]byte type + monotonic RFC-9562 UUIDv7 generator
 ├── lexer.go         Tokenizer
 ├── ast.go           AST node types
 ├── parser.go        Recursive-descent parser
