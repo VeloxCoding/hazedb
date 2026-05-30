@@ -95,6 +95,13 @@ type Options struct {
 	// highest per-write cost. Overrides the ticker's sync cadence.
 	WALSyncPerWrite bool
 
+	// WALRotateInterval enables segmented mode and sets how often the active
+	// WAL segment is sealed and a new one opened. Zero (default) keeps the
+	// single-file WAL. In segmented mode WALPath is a DIRECTORY of segment files
+	// (seg-<n>.wal); sealed segments can be drained without touching the open
+	// one. Forced on (default 5s) when SQLitePath is set. See docs/durability.md.
+	WALRotateInterval time.Duration
+
 	// IndexMergeInterval is how often the background goroutine reconciles
 	// secondary indexes with the dirty rows. Zero selects a default (50ms); a
 	// negative value disables the goroutine (manual merge only — used by tests
@@ -122,26 +129,42 @@ func Open(opts Options) (*DB, error) {
 	}
 	db.cat.Store(cat)
 	if opts.WALPath != "" {
-		w, err := openWAL(opts.WALPath, opts.WALSync, opts.WALSyncPerWrite)
+		rotateInterval := opts.WALRotateInterval
+		segmented := rotateInterval > 0
+		var w *wal
+		var err error
+		if segmented {
+			w, err = openWALSegmented(opts.WALPath, opts.WALSync, opts.WALSyncPerWrite)
+		} else {
+			w, err = openWAL(opts.WALPath, opts.WALSync, opts.WALSyncPerWrite)
+		}
 		if err != nil {
 			return nil, err
 		}
-		// Replay first (reads from the start), then position for appends and
-		// only then start the ticker — so the background goroutine never
-		// races the replay reader on the shared file handle.
+		// Replay existing records first, then position for appends and only
+		// then start the tickers — so no background goroutine (flush or rotate)
+		// races a replay reader on the append handle.
 		if err := db.replayWAL(w); err != nil {
 			w.close()
 			return nil, err
 		}
-		if err := w.seekToEnd(); err != nil {
-			w.close()
-			return nil, err
+		if segmented {
+			if err := w.startActiveSegment(); err != nil {
+				w.close()
+				return nil, err
+			}
+		} else {
+			if err := w.seekToEnd(); err != nil {
+				w.close()
+				return nil, err
+			}
 		}
 		flushInterval := opts.WALFlushInterval
 		if flushInterval == 0 {
 			flushInterval = time.Second // safe default
 		}
 		w.startTicker(flushInterval)
+		w.startRotateTicker(rotateInterval)
 		db.wal = w
 		// Replay marked rows dirty but never built the indexes; rebuild them
 		// from the live rows now, so reads are index-fast before serving.
@@ -414,7 +437,7 @@ func (db *DB) prepare(sql string, cat *catalog) (*plan, error) {
 // references the table, so a mutation always resolves against an
 // already-rebuilt catalog.
 func (db *DB) replayWAL(w *wal) error {
-	return w.replay(func(recType uint8, payload []byte) error {
+	return w.replayAll(func(recType uint8, payload []byte) error {
 		switch recType {
 		case recCreateTable:
 			tableID, td, err := decodeCreateTable(payload)

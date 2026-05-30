@@ -81,6 +81,16 @@ type wal struct {
 	stop chan struct{}
 	wg   sync.WaitGroup
 
+	// Segmentation (segmented mode only; dir == "" ⇒ single-file mode). In
+	// segmented mode the WAL is a directory of sealed segment files plus one
+	// active segment (w.f / w.bw). rotate() seals the active segment and opens
+	// the next, so a background drainer can consume sealed segments without ever
+	// touching the file being appended to. See docs/durability.md.
+	dir        string        // segment directory; empty ⇒ single-file mode
+	seg        uint64        // active segment number (segmented mode)
+	segHasData bool          // active segment has ≥1 record since it was opened
+	rotateStop chan struct{} // closed by close() to stop the rotate ticker
+
 	// close() may be called more than once (explicit Close + t.Cleanup);
 	// closeOnce makes it idempotent and closeErr returns the same result.
 	closeOnce sync.Once
@@ -190,6 +200,7 @@ func (w *wal) writeRecord(recType uint8, payload []byte) error {
 		return w.err
 	}
 	w.dirtySinceSync = true
+	w.segHasData = true
 	w.lsn++
 
 	if w.syncPerWrite {
@@ -271,6 +282,9 @@ func (w *wal) flush() error {
 	if w.err != nil {
 		return w.err
 	}
+	if w.bw == nil { // segmented WAL before its active segment is open
+		return nil
+	}
 	return w.bw.Flush()
 }
 
@@ -283,12 +297,23 @@ func (w *wal) close() error {
 		return nil
 	}
 	w.closeOnce.Do(func() {
+		// Stop both background goroutines (flush ticker + rotate ticker) and
+		// join them BEFORE taking w.mu, so neither can be blocked on the lock
+		// while close waits for it.
 		if w.stop != nil {
 			close(w.stop)
+		}
+		if w.rotateStop != nil {
+			close(w.rotateStop)
+		}
+		if w.stop != nil || w.rotateStop != nil {
 			w.wg.Wait()
 		}
 		w.mu.Lock()
 		defer w.mu.Unlock()
+		if w.f == nil {
+			return
+		}
 		if w.bw != nil && w.err == nil {
 			if err := w.bw.Flush(); err != nil {
 				w.f.Close()
@@ -297,23 +322,35 @@ func (w *wal) close() error {
 			}
 		}
 		w.closeErr = w.f.Close()
+		// Segmented mode: drop an empty trailing active segment so idle
+		// open/close cycles don't accrete zero-record files.
+		if w.dir != "" && !w.segHasData && w.closeErr == nil {
+			_ = os.Remove(w.segPath(w.seg))
+		}
 	})
 	return w.closeErr
 }
 
 // replay reads the WAL from the start to EOF, handing each record's (type,
 // payload) to apply. The caller dispatches by type (mutation vs catalog).
+// Single-file mode only; segmented mode replays via replayAll.
+func (w *wal) replay(apply func(recType uint8, payload []byte) error) error {
+	return w.replayFile(w.f, apply)
+}
+
+// replayFile reads one open WAL file from the start to EOF, handing each
+// record's (type, payload) to apply.
 //
 // Tail tolerance: a truncated final record (short header/payload read, or a
 // declared length past EOF) is the incomplete tail of an interrupted write
 // and is discarded. A wrong magic, a version newer than this binary, or a CRC
 // mismatch on a fully-present record is hard corruption and aborts Open.
 // payload aliases the read buffer; the caller's decoders copy what they keep.
-func (w *wal) replay(apply func(recType uint8, payload []byte) error) error {
-	if _, err := w.f.Seek(0, io.SeekStart); err != nil {
+func (w *wal) replayFile(f *os.File, apply func(recType uint8, payload []byte) error) error {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	fi, err := w.f.Stat()
+	fi, err := f.Stat()
 	if err != nil {
 		return err
 	}
@@ -321,7 +358,7 @@ func (w *wal) replay(apply func(recType uint8, payload []byte) error) error {
 	var pos int64
 	var hdr [8]byte
 	for {
-		_, err := io.ReadFull(w.f, hdr[:])
+		_, err := io.ReadFull(f, hdr[:])
 		if err == io.EOF {
 			return nil
 		}
@@ -350,7 +387,7 @@ func (w *wal) replay(apply func(recType uint8, payload []byte) error) error {
 			return nil
 		}
 		buf := make([]byte, length+4)
-		if _, err := io.ReadFull(w.f, buf); err != nil {
+		if _, err := io.ReadFull(f, buf); err != nil {
 			if err == io.ErrUnexpectedEOF {
 				return nil // truncated payload at tail — tolerated
 			}
