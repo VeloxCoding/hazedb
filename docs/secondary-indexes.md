@@ -1,6 +1,6 @@
 # Secondary indexes — async maintenance + hybrid reads
 
-**Status: in progress** (phased rollout S1–S9 below).
+**Status: implemented** (S1–S9 shipped; non-partitioned tables only).
 
 This note records the design for optional **secondary indexes** on non-PK
 columns, declared in DDL (`INDEX (col)`), maintained **asynchronously** by a
@@ -162,6 +162,22 @@ the core.
 The "correct first (synchronous), fast second (async)" order pins the read path
 in S2–S3 before the async complexity arrives — the read path does not change
 after that.
+
+### Measured (S9, AMD Ryzen AI MAX+ 395, 10k-row table, `bench_index_test.go`)
+
+| benchmark | result | note |
+|---|---|---|
+| indexed point read | ~1330 ns/op | O(1) bucket + live re-check |
+| full-scan read (same query, no index) | ~100400 ns/op | O(n) over 10k rows — **~75× slower** |
+| insert WITHOUT index | ~425 ns/op | baseline |
+| insert WITH index | ~494 ns/op | **+~69 ns** = the per-shard dirty append |
+| merge 10k dirty rows | ~3.86 ms | boot/rebuild-scale; runs in the background |
+
+The read speedup is the whole point; the write overhead is one append under the
+lock the write already holds, independent of the index count. The per-index
+RWMutex is kept (no lock-free snapshot swap): the reader cost is dominated by the
+by-PK re-check clone, not lock contention, so a snapshot swap is not yet
+warranted.
 
 ---
 
