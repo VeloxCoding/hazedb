@@ -897,7 +897,17 @@ func (db *DB) execSelectOrderedWalk(pl *plan, args []Value) ([]string, []Row, er
 	takeIdx := func() {
 		pk := snap[ii].pk
 		stepIdx()
-		if r, ok := tbl.getByPK(pk); ok && matches(r) {
+		if st.where == nil { // no residual: fetch projected directly (one clone)
+			if st.starAll {
+				if r, ok := tbl.getByPK(pk); ok {
+					out = append(out, r)
+				}
+			} else if pr, ok := tbl.getByPKProject(pk, pl.projOrdinals); ok {
+				out = append(out, pr)
+			}
+			return
+		}
+		if r, ok := tbl.getByPK(pk); ok && matches(r) { // residual needs the full row
 			out = append(out, project(r))
 		}
 	}

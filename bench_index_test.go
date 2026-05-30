@@ -1,6 +1,7 @@
 package hazedb
 
 import (
+	"fmt"
 	"strconv"
 	"testing"
 )
@@ -130,6 +131,29 @@ func benchIndexOrderBy(b *testing.B, perAuthor int) {
 
 func BenchmarkIndexOrderBy_50(b *testing.B)   { benchIndexOrderBy(b, 50) }
 func BenchmarkIndexOrderBy_5000(b *testing.B) { benchIndexOrderBy(b, 5000) }
+
+// Global ORDER BY on an ordered index: walk the sorted view + take LIMIT, no
+// scan + sort. Compare to a hash index, which would scan all + top-N heap.
+func BenchmarkOrderedWalk_50k(b *testing.B) {
+	const n = 50000
+	db, err := Open(Options{Schema: Schema{}, IndexMergeInterval: -1, SizeHint: n})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec("CREATE TABLE t (id uuid primary key, email text, ORDERED INDEX (email))")
+	for i := 0; i < n; i++ {
+		db.Exec("INSERT INTO t (id, email) VALUES (?, ?)", NewUUIDv7(), fmt.Sprintf("user%05d@x", i))
+	}
+	db.mergeIndexes()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, rows, _ := db.Query("SELECT id, email FROM t ORDER BY email ASC LIMIT 100"); len(rows) != 100 {
+			b.Fatalf("rows=%d", len(rows))
+		}
+	}
+}
 
 // Two non-unique indexes intersected: WHERE name = ? AND city = ?. ~1/6 of 50k
 // rows are "Peter" (~8300) spread over 8 cities, so ~1040 Peters per city. The

@@ -62,7 +62,10 @@ for ($i = 0; $i < $N; $i++) {
 
 // =================== schema (identical indexes on both) ===================
 hazedb_exec('DROP TABLE users');
-hazedb_exec('CREATE TABLE users (id uuid primary key, name text, age int null, email text, city text, INDEX (email), INDEX (name), INDEX (city))');
+// email is an ORDERED index (serves equality + the global ORDER BY email walk);
+// name/city are hash indexes (equality + AND intersection). SQLite has a btree
+// on all three, so the indexes match in capability.
+hazedb_exec('CREATE TABLE users (id uuid primary key, name text, age int null, email text, city text, ORDERED INDEX (email), INDEX (name), INDEX (city))');
 
 $pdo = new PDO('sqlite::memory:');
 $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
