@@ -723,6 +723,69 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 	return colNames, out, nil
 }
 
+// execSelectIdxOne is the single-row (QueryRow) form of execSelectIdx for a
+// SELECT with no ORDER BY: it returns the first candidate whose live row passes
+// the full WHERE and stops, skipping the []Row slice + collect machinery the
+// multi-row path builds. A dirty PK already covered by the index pass that
+// failed the WHERE simply re-fails (no dedup needed for first-match).
+func (db *DB) execSelectIdxOne(pl *plan, args []Value) ([]string, Row, error) {
+	st := pl.st.(*selectStmt)
+	tbl := pl.rt
+	colNames := pl.colNames
+	if st.limit == 0 {
+		return colNames, nil, nil
+	}
+	ctx := evalCtx{cols: tbl.def.colByName, args: args}
+	var pks []UUID
+	for i, ord := range pl.idxCols {
+		keyVal, err := evalExpr(pl.idxSrcs[i], &ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		if keyVal.IsNull() {
+			return colNames, nil, nil
+		}
+		si := tbl.indexFor(ord)
+		if si == nil {
+			return colNames, nil, nil
+		}
+		bucket := si.lookup(keyOf(keyVal))
+		if i == 0 {
+			pks = bucket
+		} else {
+			pks = intersectPKs(pks, bucket)
+		}
+		if len(pks) == 0 {
+			break
+		}
+	}
+	try := func(pk UUID) (Row, bool) {
+		r, ok := tbl.getByPK(pk)
+		if !ok {
+			return nil, false
+		}
+		ctx.row = r
+		if v, err := evalExpr(st.where, &ctx); err != nil || !truthy(v) {
+			return nil, false
+		}
+		if st.starAll {
+			return r, true
+		}
+		return projectClone(r, pl.projOrdinals), true
+	}
+	for _, pk := range pks {
+		if r, ok := try(pk); ok {
+			return colNames, r, nil
+		}
+	}
+	for _, pk := range tbl.dirtyPKs() {
+		if r, ok := try(pk); ok {
+			return colNames, r, nil
+		}
+	}
+	return colNames, nil, nil
+}
+
 // execSelect runs the SELECT plan. Returns the columns and a slice of
 // projected rows. Rows are deep-cloned before returning so the caller
 // may mutate them without affecting storage.

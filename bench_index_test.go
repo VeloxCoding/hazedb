@@ -45,6 +45,18 @@ func benchIndexRead(b *testing.B, withIndex bool, n int) {
 func BenchmarkIndexRead_Indexed_10k(b *testing.B) { benchIndexRead(b, true, 10000) }
 func BenchmarkIndexRead_Scan_10k(b *testing.B)    { benchIndexRead(b, false, 10000) }
 
+// QueryRow on an indexed column goes through the lean single-row path
+// (execSelectIdxOne) — no []Row slice. Compare to the Query (multi-row) bench.
+func BenchmarkIndexReadOne_10k(b *testing.B) {
+	db, emails := benchIndexSeed(b, true, 10000)
+	defer db.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		db.QueryRow("SELECT email FROM t WHERE email = ?", emails[i%10000])
+	}
+}
+
 func benchIndexInsert(b *testing.B, withIndex bool) {
 	idx := ""
 	if withIndex {
