@@ -213,3 +213,26 @@ whole async mechanism is correct regardless of timing.
   batched per-shard locking, and a key-only top-N (clone only the final `LIMIT`).
   Profiled shares and trade-offs in [php-sql-layer.md](php-sql-layer.md). Deferred:
   they only pay off for huge hot buckets, against keeping the path simple.
+
+## 12. Ordered indexes (implemented)
+
+`ORDERED INDEX (col)` is a sorted index that serves equality + `ORDER BY` (and,
+later, ranges), where the default hash `INDEX` serves equality only. It plugs
+into the same async-merge + dirty-overlay model:
+
+- **Structure**: a `[]ordEntry{key, pk}` sorted by key, rebuilt from `rev` by the
+  merger once per batch (and recovery after a full scan) — *before* dropping the
+  dirty entries, so the no-gap guarantee holds. Equality `lookup()`
+  binary-searches it, so the existing equality/AND path works unchanged.
+- **Read** (`execSelectOrderedWalk`): a global `ORDER BY col [ASC|DESC] [LIMIT n]`
+  merges the sorted-index walk (a non-dirty entry is fresh, so its key drives the
+  order and the row is fetched only when selected) with the dirty overlay (live
+  rows of not-yet-merged PKs), applies any residual `WHERE`, and stops at `LIMIT`.
+- **Measured**: global `ORDER BY email ASC LIMIT 100` over 50k rows went from
+  ~811 µs (hash scan + top-N, ~27× behind SQLite) to ~24 µs — ahead of native C
+  SQLite. See [php-sql-layer.md](php-sql-layer.md).
+
+Open: range predicates (`col > ?`) on an ordered index reuse the same sorted
+view (seek + walk) — not yet wired. Maintenance currently rebuilds the sorted
+slice per merge (O(n log n)); a write-heavy large table may want incremental
+maintenance (skiplist/btree) — measure before adding.

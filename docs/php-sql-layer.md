@@ -28,7 +28,7 @@ every statement the parser accepts — but that set is a deliberate subset of SQ
 
 | area | accepted |
 |---|---|
-| DDL | `CREATE TABLE name (col TYPE …)` with `PRIMARY KEY` / `PARTITION KEY` constraints and `[UNIQUE] INDEX [name] (col)` declarations; `DROP TABLE name` |
+| DDL | `CREATE TABLE name (col TYPE …)` with `PRIMARY KEY` / `PARTITION KEY` constraints and `[UNIQUE] [ORDERED] INDEX [name] (col)` declarations; `DROP TABLE name` |
 | Column types | `int`, `text`/`string`, `bool`, `bytes`/`blob`, `uuid` |
 | Writes | `INSERT INTO … VALUES (…)`, `UPDATE … SET … WHERE …`, `DELETE FROM … WHERE …` |
 | `SELECT` | `*` or an explicit column list, **one** table (`FROM t`), optional `WHERE`, `ORDER BY col [ASC\|DESC]`, `LIMIT n` |
@@ -62,9 +62,14 @@ to that residual filter, not the index.
 **`ORDER BY` on a filtered list** is index-assisted: `WHERE author = ? ORDER BY
 date DESC LIMIT 20` resolves the author's rows through the index, then sorts that
 (small) subset and applies the `LIMIT` — the everyday list-view pattern, no full
-scan. A *bare* `ORDER BY` with no indexed equality (e.g. *all* posts by date)
-still scans then sorts; a global ordered index would change that, and is not
-built yet.
+scan.
+
+**A global `ORDER BY` on an `ORDERED INDEX`** walks the sorted index in order and
+stops at `LIMIT` — `SELECT … ORDER BY email ASC LIMIT 100` on a hash `INDEX`
+would scan every row + keep a top-N heap, but on `ORDERED INDEX (email)` it
+touches ~`LIMIT` rows. A hash index serves equality only; an `ORDERED INDEX`
+serves equality (binary search) + `ORDER BY` (and, later, ranges). A *bare*
+`ORDER BY` on a column with no ordered index still scans then sorts.
 
 **Async, but always correct.** Indexes are maintained *off the write path*: a
 write only flags its row, and a background merger reconciles the index shortly
