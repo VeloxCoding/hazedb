@@ -33,7 +33,7 @@ func go_hazedb_exec(sql *C.zend_string, argsJSON *C.zend_string) unsafe.Pointer 
 	return hazedb_exec(sql, argsJSON)
 }
 
-//export go_hazedb_uuidv7
-func go_hazedb_uuidv7() unsafe.Pointer {
-	return hazedb_uuidv7()
+//export go_hazedb_ping
+func go_hazedb_ping() unsafe.Pointer {
+	return hazedb_ping()
 }

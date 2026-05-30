@@ -11,7 +11,19 @@ function show($label, $v) {
     echo $label, '=', ($v === null ? 'NULL' : $v), "\n";
 }
 
-$id = hazedb_uuidv7();
+// The app supplies its own PK (canonical UUID string). hazedb also auto-fills
+// a UUIDv7 when the id is omitted on INSERT — generate one here only because we
+// read the row back by id below.
+function make_uuid(): string {
+    $b = random_bytes(16);
+    $b[6] = chr((ord($b[6]) & 0x0f) | 0x40);     // version 4
+    $b[8] = chr((ord($b[8]) & 0x3f) | 0x80);     // RFC 4122 variant
+    return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($b), 4));
+}
+
+show('ping', hazedb_ping());                     // expect pong (module provisioned a DB)
+
+$id = make_uuid();
 echo 'uuidlen=', strlen($id), "\n";              // expect 36
 
 show('create', hazedb_exec('CREATE TABLE users (id uuid primary key, name text, age int)', ''));

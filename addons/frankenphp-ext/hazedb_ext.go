@@ -5,7 +5,7 @@
 // "default" during Provision; defaultSlot here Loads it per call. A Caddy
 // config reload swaps the slot atomically — nothing to invalidate here.
 //
-// Three PHP functions:
+// PHP functions:
 //
 //	hazedb_query(string $sql, string $args): ?string
 //	    Run a SELECT. Returns {"columns":[...],"rows":[[...],...]} as a JSON
@@ -19,17 +19,17 @@
 //	    path (this is the "insert" function, generalised). Same $args rule.
 //	    Returns {"affected":N}, an error envelope, or null (no DB).
 //
-//	hazedb_uuidv7(): string
-//	    A fresh UUIDv7 string — convenience for populating UUID primary keys,
-//	    since hazedb PKs are UUIDs and the string-only PHP surface needs a way
-//	    to mint them. Never null.
+//	hazedb_ping(): string
+//	    Liveness probe for the extension itself: "pong" if a Caddy module has
+//	    registered a DB under "default", "pong (no db)" otherwise. Takes no
+//	    args, never null — the minimal end-to-end check that the cgo bridge and
+//	    the shared-DB slot are wired up.
 //
 // cgo lifetime contract (see addons/frankenphp-ext/build/README.md pitfall #8):
-//   - args_json is read synchronously (ArgsFromJSON copies values out via
-//     json.Decode), so it is taken as a zero-copy view.
-//   - sql is deep-copied: db.prepare stores the SQL string as a permanent
-//     stmtCache map key, so an alias over PHP-arena memory would dangle after
-//     the request ends and index the plan cache by freed bytes.
+//   - Both sql and args_json are passed as zero-copy views: each function reads
+//     them synchronously while the PHP-arena memory is still valid. db.prepare
+//     clones the SQL itself on a cache miss (the only time it is retained), so
+//     the hot cache-hit path copies nothing — see db.prepare's contract.
 //   - response bytes are copied into a PHP-owned zend_string by
 //     phpStringFromBytes before returning.
 
@@ -58,20 +58,13 @@ var defaultSlot = hazedb.LookupDBSlot("default")
 
 // zendStringView returns a zero-copy Go string aliasing a zend_string's bytes.
 // Valid only for the duration of the calling PHP function — read paths only.
+// The SQL string is safe to pass as a view because db.prepare clones it on a
+// cache miss before retaining it (the cache-hit path never retains it).
 func zendStringView(s *C.zend_string) string {
 	if s == nil {
 		return ""
 	}
 	return unsafe.String((*byte)(unsafe.Pointer(&s.val)), int(s.len))
-}
-
-// zendStringCopy returns a Go-owned copy of a zend_string's bytes. Required when
-// the bytes outlive the call — here, the SQL string that becomes a stmtCache key.
-func zendStringCopy(s *C.zend_string) string {
-	if s == nil {
-		return ""
-	}
-	return C.GoStringN((*C.char)(unsafe.Pointer(&s.val)), C.int(s.len))
 }
 
 // phpStringFromBytes emalloc's a PHP zend_string from b. Empty input returns
@@ -99,7 +92,7 @@ func hazedb_query(sql *C.zend_string, argsJSON *C.zend_string) unsafe.Pointer {
 	if err != nil {
 		return phpStringFromBytes(hazedb.ErrorJSON(err.Error()))
 	}
-	cols, rows, err := db.Query(zendStringCopy(sql), args...)
+	cols, rows, err := db.Query(zendStringView(sql), args...)
 	if err != nil {
 		return phpStringFromBytes(hazedb.ErrorJSON(err.Error()))
 	}
@@ -123,16 +116,19 @@ func hazedb_exec(sql *C.zend_string, argsJSON *C.zend_string) unsafe.Pointer {
 	if err != nil {
 		return phpStringFromBytes(hazedb.ErrorJSON(err.Error()))
 	}
-	n, err := db.Exec(zendStringCopy(sql), args...)
+	n, err := db.Exec(zendStringView(sql), args...)
 	if err != nil {
 		return phpStringFromBytes(hazedb.ErrorJSON(err.Error()))
 	}
 	return phpStringFromBytes(hazedb.ExecResultJSON(n))
 }
 
-// hazedb_uuidv7 returns a fresh UUIDv7 as a 36-char string.
+// hazedb_ping reports that the extension is loaded and whether a DB is wired up.
 //
-// export_php:function hazedb_uuidv7(): string
-func hazedb_uuidv7() unsafe.Pointer {
-	return phpStringFromBytes([]byte(hazedb.NewUUIDv7().String()))
+// export_php:function hazedb_ping(): string
+func hazedb_ping() unsafe.Pointer {
+	if defaultSlot.Load() == nil {
+		return phpStringFromBytes([]byte("pong (no db)"))
+	}
+	return phpStringFromBytes([]byte("pong"))
 }

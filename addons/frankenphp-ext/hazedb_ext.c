@@ -65,10 +65,10 @@ PHP_FUNCTION(hazedb_exec)
 	RETURN_NULL();
 }
 
-PHP_FUNCTION(hazedb_uuidv7)
+PHP_FUNCTION(hazedb_ping)
 {
     ZEND_PARSE_PARAMETERS_NONE();
-    zend_string *result = go_hazedb_uuidv7();
+    zend_string *result = go_hazedb_ping();
     if (result) {
         RETURN_STR(result);
     }

@@ -5,7 +5,7 @@ PHP run SQL against hazedb **in-process** — a Go function call inside the same
 FrankenPHP/Caddy process, no socket, no protocol, no HTTP roundtrip.
 
 ```php
-$id = hazedb_uuidv7();
+$id = '0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b';   // app-supplied PK (any canonical UUID)
 
 hazedb_exec('CREATE TABLE users (id uuid primary key, name text, age int)', '');
 hazedb_exec('INSERT INTO users (id, name, age) VALUES (?, ?, ?)',
@@ -15,6 +15,10 @@ hazedb_exec('INSERT INTO users (id, name, age) VALUES (?, ?, ?)',
 $json = hazedb_query('SELECT name, age FROM users WHERE id = ?', $id);
 // {"columns":["name","age"],"rows":[["Alice",30]]}
 ```
+
+You can also **omit the id** on INSERT — hazedb auto-fills a UUIDv7 for a `uuid
+primary key` column. Supply your own id (as above) only when the app needs to
+address the row later.
 
 PHP and the Caddy module share **one** `*DB` through hazedb's process-wide
 registry: the Caddy module publishes it under `"default"` during `Provision`;
@@ -28,7 +32,7 @@ in the Caddyfile (the module never provisioned), every function returns `null`.
 |---|---|---|
 | `hazedb_query(string $sql, string $args): ?string` | `SELECT` | `{"columns":[...],"rows":[[...],...]}` (JSON string), `{"error":"..."}` on SQL error, `null` if no DB |
 | `hazedb_exec(string $sql, string $args): ?string` | `INSERT` / `UPDATE` / `DELETE` / `CREATE TABLE` / `DROP TABLE` | `{"affected":N}`, error envelope, or `null` |
-| `hazedb_uuidv7(): string` | — | a fresh UUIDv7 string (for UUID primary keys) |
+| `hazedb_ping(): string` | — | `pong` if a Caddy module registered a DB, `pong (no db)` otherwise |
 
 `hazedb_exec` is the write path — it is the "insert" function, generalised to
 every write/DDL statement, mirroring the Go API's `db.Query` / `db.Exec` split.

@@ -15,6 +15,6 @@ function hazedb_query(string $sql, string $args): ?string {}
 
 function hazedb_exec(string $sql, string $args): ?string {}
 
-function hazedb_uuidv7(): string {}
+function hazedb_ping(): string {}
 
 

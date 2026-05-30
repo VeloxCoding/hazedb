@@ -30,6 +30,8 @@ MSYS_NO_PATHCONV=1 docker run --rm \
         echo "$OUT"
         echo "---------------------------"
         kill $PID 2>/dev/null || true
-        echo "$OUT" | grep -q "\"rows\":\[\[\"alice\",30\]\]" && { echo "SMOKE: PASS"; exit 0; }
+        echo "$OUT" | grep -q "^ping=pong$" \
+            && echo "$OUT" | grep -q "\"rows\":\[\[\"alice\",30\]\]" \
+            && { echo "SMOKE: PASS"; exit 0; }
         echo "SMOKE: FAIL"; exit 1
     '

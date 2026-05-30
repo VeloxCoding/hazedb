@@ -14,11 +14,19 @@ set_time_limit(0);
 $N     = (int)($_GET['n']    ?? 10000);
 $iters = (int)($_GET['iter'] ?? 1000000);
 
+// App-supplied PK (canonical UUID string), as a real PHP app would mint it.
+function make_uuid(): string {
+    $b = random_bytes(16);
+    $b[6] = chr((ord($b[6]) & 0x0f) | 0x40);     // version 4
+    $b[8] = chr((ord($b[8]) & 0x3f) | 0x80);     // RFC 4122 variant
+    return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($b), 4));
+}
+
 // --- seed (writes use the JSON-array arg form: multiple typed values) ---
 hazedb_exec('CREATE TABLE users (id uuid primary key, name text, age int)', '');
 $ids = [];
 for ($i = 0; $i < $N; $i++) {
-    $id = hazedb_uuidv7();
+    $id = make_uuid();
     $ids[] = $id;
     hazedb_exec('INSERT INTO users (id, name, age) VALUES (?, ?, ?)',
                 json_encode([$id, "user$i", $i % 100]));
@@ -32,12 +40,22 @@ for ($i = 0; $i < 50000; $i++) {
     hazedb_query('SELECT name, age FROM users WHERE id = ?', $ids[$i % $N]);
 }
 
-// --- measure: id direct, no decode ---
+// --- measure A: id direct, raw JSON string returned (no PHP decode) ---
 $t0 = microtime(true);
 for ($i = 0; $i < $iters; $i++) {
     hazedb_query('SELECT name, age FROM users WHERE id = ?', $ids[$i % $N]);
 }
-$dt = microtime(true) - $t0;
+$rawDt = microtime(true) - $t0;
 
-printf("rows=%d iters=%d time=%.3fs\n", $N, $iters, $dt);
-printf("qps=%d  ns/op=%.0f  us/op=%.2f\n", (int)($iters / $dt), $dt * 1e9 / $iters, $dt * 1e6 / $iters);
+// --- measure B: same call + json_decode to a PHP array (the realistic full cost) ---
+$t0 = microtime(true);
+for ($i = 0; $i < $iters; $i++) {
+    $r = json_decode(hazedb_query('SELECT name, age FROM users WHERE id = ?', $ids[$i % $N]), true);
+}
+$decDt = microtime(true) - $t0;
+
+printf("rows=%d iters=%d\n", $N, $iters);
+printf("RAW    : time=%.3fs  qps=%d  ns/op=%.0f\n", $rawDt, (int)($iters / $rawDt), $rawDt * 1e9 / $iters);
+printf("DECODE : time=%.3fs  qps=%d  ns/op=%.0f\n", $decDt, (int)($iters / $decDt), $decDt * 1e9 / $iters);
+printf("json_decode tax = %.0f ns/op (%.1f%% of the decoded call)\n",
+       ($decDt - $rawDt) * 1e9 / $iters, ($decDt - $rawDt) / $decDt * 100);
