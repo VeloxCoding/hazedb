@@ -98,8 +98,13 @@ args, so they pass Values straight through.
 **Extension (cgo) — the zval trampolines + the four functions** in
 [`hazedb_ext.go`](../addons/frankenphp-ext/hazedb_ext.go):
 
-- **Build** (Go rows → PHP): `hzd_arr_new`, `hzd_push_arr`, and keyed setters
-  `hzd_set_long/bool/null/strn` (assoc rows keyed by column name).
+- **Build** (Go rows → PHP): `hzd_arr_new` + `hzd_push_arr` for the outer list,
+  and `hzd_build_row` — a **single batched trampoline** that builds one whole
+  assoc row (all cells) in **one cgo crossing** instead of one per cell. It is
+  fed from a pooled `rowScratch` (`fillKeys` packs the column names once per
+  query; per-row value buffers are reused), so the hot path allocates nothing.
+  See §6 for why batching alone regressed single-row `fetch` until pooling
+  removed the per-call allocations.
 - **Read** (PHP args array → Go): `hzd_arr_count`, `hzd_arr_get`,
   `hzd_zval_kind` (normalises the zval type) and the value accessors →
   `valuesFromZval` builds `[]Value`.
@@ -120,7 +125,7 @@ args, so they pass Values straight through.
 | [`db.go`](../db.go) | `ExecValues` + `QueryValues` + `QueryRowValues` (typed entry points). |
 | [`exec.go`](../exec.go) | `evalLitOrParamValue` (Value-arg PK eval). |
 | [`wire.go`](../wire.go) | `RowsToJSON` hand-rolled; `RowsToJSONObjects` (list-of-objects). |
-| [`addons/frankenphp-ext/hazedb_ext.go`](../addons/frankenphp-ext/hazedb_ext.go) | The zval trampolines + `hazedb_fetch` / `hazedb_fetchall` / `hazedb_fetchall_json` / `hazedb_exec` / `hazedb_ping` + `valuesFromZval` / `setCell` helpers. |
+| [`addons/frankenphp-ext/hazedb_ext.go`](../addons/frankenphp-ext/hazedb_ext.go) | The zval trampolines + `hazedb_fetch` / `hazedb_fetchall` / `hazedb_fetchall_json` / `hazedb_exec` / `hazedb_ping` + `valuesFromZval` (args read) and the pooled `rowScratch` / `fillKeys` / batched `rowToAssoc` (result build). |
 | `addons/frankenphp-ext/hazedb_ext.{c,_arginfo.h,_generated.go}`, `.stub.php` | Generated wrappers (`regenerate.sh`). Commit with `hazedb_ext.go`. |
 | `addons/frankenphp-ext/build/test.php` + `smoke.sh` | Correctness checks (emit `*_ok=yes` markers). |
 | `bench_typed_args_test.go`, `bench_encode_test.go` | `TestExecValuesParity`, `TestQueryValuesParity`, `TestEncodeParity` + insert/encode benchmarks. |
@@ -136,7 +141,7 @@ generated files are machine-made and must not be edited.
 |---|---|
 | `hzd_arr_new(n)` | `zend_new_array(n)` |
 | `hzd_push_arr(a, child)` | `ZVAL_ARR` + `zend_hash_next_index_insert` (append a row to the list) |
-| `hzd_set_long/bool/null/strn(a, key, klen, …)` | `ZVAL_*` + `zend_hash_str_update` (assoc cell by column name) |
+| `hzd_build_row(n, keybuf, koff, kinds, lvals, valbuf, voff)` | builds one whole assoc row (`ZVAL_*` + `zend_hash_str_update` per cell) in **one** crossing; keys & string values arrive as packed buffers + offset arrays (all pointer-free, so cgo's pointer rules are satisfied) |
 | `hzd_arr_count(a)` | `zend_hash_num_elements` |
 | `hzd_arr_get(a, i)` | `zend_hash_index_find` |
 | `hzd_zval_kind(z)` | `Z_TYPE_P` → `0` null `1` false `2` true `3` long `4` string `5` double `6` other |
@@ -189,11 +194,46 @@ with independent inserts.
 `hazedb_fetch` ≈ 2–2.3× SQLite for the same usable assoc shape.
 
 **Array-args cost and the scalar fast path.** Wrapping a single id as `[$id]`
-costs ~80 ns/call — PHP builds a one-element array and Go reads the
+costs ~70–80 ns/call — PHP builds a one-element array and Go reads the
 `zend_array`. The `mixed $args` param therefore accepts a **bare scalar** too:
 `hazedb_fetch($sql, $id)` reads one zval directly (no array build/iterate) and
 recovers that cost (~2.4M vs ~2.0M). Arrays remain the form for multi-param
 calls; the scalar form is the fast path for the dominant single-key read.
+
+### Batched row build + pooled scratch
+
+The result-build side was profiled in isolation (`build/conv_bench.php`, which
+holds the query shape constant and varies only the cell/row count, so the
+per-cell / per-row **delta** is the conversion cost — the one thing the Go-side
+benchmarks can't reach). The first build did **one cgo crossing per cell**; a
+crossing measured ~18 ns, so a wide row paid that 9× over. Two changes followed:
+
+1. `hzd_build_row` builds a whole row in **one** crossing (keys + string values
+   passed as packed buffers + offsets — pointer-free, cgo-safe).
+2. The scratch buffers are **pooled** (`sync.Pool`). Batching alone *regressed*
+   single-row `fetch` (~358 → ~467 ns) because it traded ~8 cheap crossings for
+   ~5 per-call slice allocations (~110 ns) that don't amortise over one row.
+   Pooling replaces those with one `Get`/`Put` (~20 ns).
+
+Net (PHP 8.5.6, two stable runs, scalar arg):
+
+| shape | per-cell crossing | batched, no pool | **batched + pooled** |
+|---|---|---|---|
+| `fetch` 1 int cell | 358 ns | 467 ns | **365 ns** (flat) |
+| `fetch` 9 int cells | 674 ns | 934 ns | **586 ns** (−13%) |
+| per-int-cell build | 39.5 ns | 58.3 ns | **27.6 ns** (−30%) |
+| `fetchall` 100 rows ×9 | 41835 ns | 27800 ns | **~26200 ns** (−37%) |
+| assoc build vs `_json` | +14.8 µs | +0.8 µs | **+~1 µs** |
+
+The single-row hot path stays flat; wide rows and `fetchall` win. The headline
+2-column point read (~2.4M / ~417 ns) is unchanged-to-slightly-better. The
+biggest structural result: a native-array `fetchall` now costs about the same as
+the JSON pass-through (`hazedb_fetchall_json`), where it used to cost ~14 µs more
+for 100×9. The residual ~27.6 ns/cell is now almost entirely
+`zend_hash_str_update` (re-hashing the column name each cell) + the zval set —
+the crossing is amortised to ~2 ns/cell. Attacking that residual needs interned,
+pre-hashed column keys (§8), deferred as not worth the `zend_string` lifetime
+complexity for the small single-row gain.
 
 ---
 
@@ -217,9 +257,10 @@ calls; the scalar form is the fast path for the dominant single-key read.
   storage; the SQL string is a zero-copy view (`db.prepare` clones on a miss).
 - **Native types out** — int/bool/string come back as the real PHP type, unlike
   PDO+SQLite's default stringify. UUID/BYTES come back as strings.
-- **Building a `zend_array` is not free** (~300 ns for a small assoc row) — that
-  cost, plus the array-args read, is why `fetch` (~470 ns) does not match the raw
-  json-string speed.
+- **Building a `zend_array` is not free** (~27.6 ns per cell after batching +
+  pooling; see §6) — that cost, plus the array-args read, is why a multi-column
+  `fetch` does not match the raw json-string speed. The per-cell cost is now
+  almost all `zend_hash_str_update` + the zval set, not the cgo crossing.
 
 ---
 
@@ -228,7 +269,13 @@ calls; the scalar form is the fast path for the dominant single-key read.
 - **Storage floor.** After removing the JSON tax, inserts sit on the storage
   engine (PK map + row alloc). The largest lever (a single-probe find-or-insert
   on the PK map) was measured earlier at only ~8% and shelved.
+- **Interned column keys.** Pre-hashed `zend_string` keys would remove the
+  per-cell `zend_hash_str_update` re-hash (the bulk of the residual ~27.6 ns/cell,
+  §6). Deferred: the `zend_string` interning + lifetime management is real
+  complexity for a small single-row gain.
 - **Pooled result buffer** for `hazedb_fetchall_json` (zero-alloc steady state).
+  The native-array build path is already pooled (`rowScratch`, §6); the JSON
+  encoder's output `[]byte` is not yet.
 
-(The scalar-arg fast path — `mixed $args` accepting a bare scalar — is
-**implemented**; see §6.)
+(The scalar-arg fast path — `mixed $args` accepting a bare scalar — and the
+batched + pooled row build are **implemented**; see §6.)

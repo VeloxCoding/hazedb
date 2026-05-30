@@ -59,20 +59,35 @@ static zend_array *hzd_arr_new(uint32_t n) { return zend_new_array(n); }
 static void hzd_push_arr(zend_array *a, zend_array *child) {
     zval z; ZVAL_ARR(&z, child); zend_hash_next_index_insert(a, &z);
 }
-// keyed scalar setters: build a flat assoc row (column name -> value)
-static void hzd_set_long(zend_array *a, const char *k, size_t kl, zend_long v) {
-    zval z; ZVAL_LONG(&z, v); zend_hash_str_update(a, k, kl, &z);
-}
-static void hzd_set_bool(zend_array *a, const char *k, size_t kl, int b) {
-    zval z; ZVAL_BOOL(&z, b); zend_hash_str_update(a, k, kl, &z);
-}
-static void hzd_set_null(zend_array *a, const char *k, size_t kl) {
-    zval z; ZVAL_NULL(&z); zend_hash_str_update(a, k, kl, &z);
-}
-static void hzd_set_strn(zend_array *a, const char *k, size_t kl, const char *s, size_t n) {
-    zval z;
-    if (n == 0) { ZVAL_EMPTY_STRING(&z); } else { ZVAL_STRINGL(&z, s, n); }
-    zend_hash_str_update(a, k, kl, &z);
+// hzd_build_row builds one flat assoc row (column name -> value) in a SINGLE
+// cgo crossing, replacing one crossing per cell. To stay within cgo's pointer
+// rules everything arrives as pointer-free buffers: keys packed in keybuf with
+// (n+1) offsets koff; per-cell kind selects the value source —
+//   0 null  1 false  2 true  3 long(lvals[i])  4 string(valbuf[voff[i]:voff[i+1]])
+// lvals is indexed per cell (entry unused for non-long kinds); voff is
+// monotonic, so non-string cells contribute a zero-length span.
+static zend_array *hzd_build_row(uint32_t n,
+        const char *keybuf, const int32_t *koff,
+        const uint8_t *kinds, const int64_t *lvals,
+        const char *valbuf, const int32_t *voff) {
+    zend_array *a = zend_new_array(n);
+    for (uint32_t i = 0; i < n; i++) {
+        zval z;
+        switch (kinds[i]) {
+            case 1:  ZVAL_FALSE(&z); break;
+            case 2:  ZVAL_TRUE(&z); break;
+            case 3:  ZVAL_LONG(&z, lvals[i]); break;
+            case 4: {
+                size_t sl = (size_t)(voff[i+1] - voff[i]);
+                if (sl == 0) { ZVAL_EMPTY_STRING(&z); }
+                else { ZVAL_STRINGL(&z, valbuf + voff[i], sl); }
+                break;
+            }
+            default: ZVAL_NULL(&z); break;
+        }
+        zend_hash_str_update(a, keybuf + koff[i], (size_t)(koff[i+1] - koff[i]), &z);
+    }
+    return a;
 }
 
 // --- read a PHP array of args (PHP -> Go) ---
@@ -101,6 +116,7 @@ static zend_array *hzd_zval_arr(zval *z) { return Z_ARRVAL_P(z); }
 import "C"
 
 import (
+	"sync"
 	"unsafe"
 
 	"github.com/VeloxCoding/hazedb"
@@ -205,55 +221,107 @@ func argsFromMixed(a *C.zval) ([]hazedb.Value, bool) {
 	}
 }
 
-// setStr stores a Go string under a key (handles the empty case so
-// unsafe.StringData(nil) is never deref'd).
-func setStr(a *C.zend_array, kp *C.char, kl C.size_t, s string) {
-	var p *C.char
-	if len(s) > 0 {
-		p = (*C.char)(unsafe.Pointer(unsafe.StringData(s)))
+// Pointer helpers: hand a pointer-free Go slice's backing to C, or nil when
+// empty (so &s[0] is never taken on a zero-length slice). The pointed-to memory
+// holds no Go pointers, so it satisfies cgo's pointer-passing rule, and
+// hzd_build_row copies everything out before returning — nothing is retained.
+func charPtr(b []byte) *C.char {
+	if len(b) == 0 {
+		return nil
 	}
-	C.hzd_set_strn(a, kp, kl, p, C.size_t(len(s)))
+	return (*C.char)(unsafe.Pointer(&b[0]))
+}
+func i32Ptr(s []int32) *C.int32_t {
+	if len(s) == 0 {
+		return nil
+	}
+	return (*C.int32_t)(unsafe.Pointer(&s[0]))
+}
+func u8Ptr(s []uint8) *C.uint8_t {
+	if len(s) == 0 {
+		return nil
+	}
+	return (*C.uint8_t)(unsafe.Pointer(&s[0]))
+}
+func i64Ptr(s []int64) *C.int64_t {
+	if len(s) == 0 {
+		return nil
+	}
+	return (*C.int64_t)(unsafe.Pointer(&s[0]))
 }
 
-// setCell stores one cell under its column-name key (the assoc-row shape).
-// UUID -> canonical string, Bytes -> raw byte string; ints/bools stay native.
-func setCell(a *C.zend_array, key string, v hazedb.Value) {
-	kp := (*C.char)(unsafe.Pointer(unsafe.StringData(key)))
-	kl := C.size_t(len(key))
-	switch v.Kind {
-	case hazedb.KindNull:
-		C.hzd_set_null(a, kp, kl)
-	case hazedb.KindInt:
-		C.hzd_set_long(a, kp, kl, C.zend_long(v.Int()))
-	case hazedb.KindBool:
-		b := C.int(0)
-		if v.Bool() {
-			b = 1
-		}
-		C.hzd_set_bool(a, kp, kl, b)
-	case hazedb.KindString:
-		setStr(a, kp, kl, v.Str())
-	case hazedb.KindUUID:
-		setStr(a, kp, kl, v.UUID().String())
-	case hazedb.KindBytes:
-		bs := v.Bytes()
-		var p *C.char
-		if len(bs) > 0 {
-			p = (*C.char)(unsafe.Pointer(&bs[0]))
-		}
-		C.hzd_set_strn(a, kp, kl, p, C.size_t(len(bs)))
-	default:
-		C.hzd_set_null(a, kp, kl)
+// rowScratch holds every reusable buffer for the batched row build — the packed
+// keys (stable per query) plus the per-row value buffers. Pooled (scratchPool)
+// so a call reuses backing capacity instead of allocating ~5 slices each time;
+// that per-call alloc cost otherwise sinks the single-row fetch path, where the
+// saved cgo crossings don't amortize. hzd_build_row copies everything into the
+// Zend heap before returning, so the scratch is free to reuse/return at once.
+type rowScratch struct {
+	keybuf []byte
+	koff   []int32
+	kinds  []uint8
+	lvals  []int64
+	valbuf []byte
+	voff   []int32
+}
+
+var scratchPool = sync.Pool{New: func() any { return new(rowScratch) }}
+
+// fillKeys packs the column names into keybuf + (n+1) offsets, once per query
+// since the keys are identical for every row.
+func (sc *rowScratch) fillKeys(cols []string) {
+	sc.keybuf = sc.keybuf[:0]
+	sc.koff = append(sc.koff[:0], 0)
+	for _, c := range cols {
+		sc.keybuf = append(sc.keybuf, c...)
+		sc.koff = append(sc.koff, int32(len(sc.keybuf)))
 	}
 }
 
-// rowToAssoc builds a single assoc PHP array from cols + one row.
-func rowToAssoc(cols []string, row hazedb.Row) *C.zend_array {
-	a := C.hzd_arr_new(C.uint32_t(len(cols)))
-	for i, c := range cols {
-		setCell(a, c, row[i])
+// rowToAssoc builds one assoc PHP array from the packed keys + one row in a
+// single cgo crossing. The value buffers are refilled on every call. UUID ->
+// canonical string, Bytes -> raw byte string; ints/bools stay native.
+func (sc *rowScratch) rowToAssoc(row hazedb.Row) *C.zend_array {
+	n := len(sc.koff) - 1
+	sc.kinds = sc.kinds[:0]
+	sc.lvals = sc.lvals[:0]
+	sc.valbuf = sc.valbuf[:0]
+	sc.voff = append(sc.voff[:0], 0)
+	for i := 0; i < n; i++ {
+		v := row[i]
+		switch v.Kind {
+		case hazedb.KindBool:
+			k := uint8(1)
+			if v.Bool() {
+				k = 2
+			}
+			sc.kinds = append(sc.kinds, k)
+			sc.lvals = append(sc.lvals, 0)
+		case hazedb.KindInt:
+			sc.kinds = append(sc.kinds, 3)
+			sc.lvals = append(sc.lvals, v.Int())
+		case hazedb.KindString:
+			sc.kinds = append(sc.kinds, 4)
+			sc.lvals = append(sc.lvals, 0)
+			sc.valbuf = append(sc.valbuf, v.Str()...)
+		case hazedb.KindUUID:
+			sc.kinds = append(sc.kinds, 4)
+			sc.lvals = append(sc.lvals, 0)
+			sc.valbuf = append(sc.valbuf, v.UUID().String()...)
+		case hazedb.KindBytes:
+			sc.kinds = append(sc.kinds, 4)
+			sc.lvals = append(sc.lvals, 0)
+			sc.valbuf = append(sc.valbuf, v.Bytes()...)
+		default: // KindNull or unknown
+			sc.kinds = append(sc.kinds, 0)
+			sc.lvals = append(sc.lvals, 0)
+		}
+		sc.voff = append(sc.voff, int32(len(sc.valbuf)))
 	}
-	return a
+	return C.hzd_build_row(C.uint32_t(n),
+		charPtr(sc.keybuf), i32Ptr(sc.koff),
+		u8Ptr(sc.kinds), i64Ptr(sc.lvals),
+		charPtr(sc.valbuf), i32Ptr(sc.voff))
 }
 
 // hazedb_fetch returns one row as a flat assoc PHP array, or null (no row / no
@@ -273,7 +341,11 @@ func hazedb_fetch(sql *C.zend_string, args *C.zval) unsafe.Pointer {
 	if err != nil || row == nil {
 		return nil
 	}
-	return unsafe.Pointer(rowToAssoc(cols, row))
+	sc := scratchPool.Get().(*rowScratch)
+	sc.fillKeys(cols)
+	res := unsafe.Pointer(sc.rowToAssoc(row))
+	scratchPool.Put(sc)
+	return res
 }
 
 // hazedb_fetchall returns all rows as a list of assoc PHP arrays. Empty result
@@ -294,10 +366,13 @@ func hazedb_fetchall(sql *C.zend_string, args *C.zval) unsafe.Pointer {
 	if err != nil {
 		return nil
 	}
+	sc := scratchPool.Get().(*rowScratch)
+	sc.fillKeys(cols)
 	out := C.hzd_arr_new(C.uint32_t(len(rows)))
 	for i := range rows {
-		C.hzd_push_arr(out, rowToAssoc(cols, rows[i]))
+		C.hzd_push_arr(out, sc.rowToAssoc(rows[i]))
 	}
+	scratchPool.Put(sc)
 	return unsafe.Pointer(out)
 }
 
