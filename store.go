@@ -5,6 +5,7 @@ import (
 	"math/bits"
 	"runtime"
 	"sync"
+	"sync/atomic"
 )
 
 // shardCount picks a power-of-two shard count from runtime.NumCPU()*4,
@@ -45,6 +46,10 @@ type table struct {
 	// per-shard pk map can't enforce table-wide PK uniqueness or answer
 	// WHERE id=? — the directory does both.
 	pkDir *pkDirectory
+	// dirtyCount is the total pending dirty PKs across all shards (+1 per
+	// markDirtyLocked, -n per merge drop). An indexed read skips the 32-shard
+	// dirty-overlay scan when this is 0 — the steady-state fast path.
+	dirtyCount atomic.Int64
 }
 
 type tableShard struct {
@@ -72,6 +77,7 @@ type tableShard struct {
 func (t *table) markDirtyLocked(s *tableShard, pk UUID) {
 	if len(t.indexes) > 0 {
 		s.dirty = append(s.dirty, pk)
+		t.dirtyCount.Add(1)
 	}
 }
 

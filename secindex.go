@@ -213,6 +213,9 @@ func (db *DB) mergeIndexes() {
 // not-yet-merged row is still a candidate (then re-checked against its live
 // row). Copied out under each shard's read lock.
 func (t *table) dirtyPKs() []UUID {
+	if t.dirtyCount.Load() == 0 {
+		return nil // steady state: skip the 32-shard scan entirely
+	}
 	var out []UUID
 	for i := range t.shards {
 		s := &t.shards[i]
@@ -262,6 +265,7 @@ func (t *table) mergeIndexes() {
 		s.mu.Lock()
 		s.dirty = s.dirty[n:] // drop the processed prefix; later appends remain
 		s.mu.Unlock()
+		t.dirtyCount.Add(-int64(n))
 	}
 }
 
@@ -307,4 +311,5 @@ func (t *table) rebuildIndexes() {
 		s.dirty = nil // replay marked rows dirty; the full rebuild covers them
 		s.mu.Unlock()
 	}
+	t.dirtyCount.Store(0)
 }
