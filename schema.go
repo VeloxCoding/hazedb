@@ -153,6 +153,9 @@ func resolveSchema(s Schema) (map[string]*resolvedTable, error) {
 		if rt.partitionOrdinal == rt.pkOrdinal {
 			return nil, fmt.Errorf("schema: table %q PartitionKey must be a different column than the PK", t.Name)
 		}
+		if rt.partitioned() && len(t.Indexes) > 0 {
+			return nil, fmt.Errorf("schema: table %q secondary indexes on partitioned tables are not supported yet", t.Name)
+		}
 		seenIdxCol := make(map[int]bool, len(t.Indexes))
 		seenIdxName := make(map[string]bool, len(t.Indexes))
 		for _, ix := range t.Indexes {

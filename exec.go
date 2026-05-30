@@ -91,6 +91,14 @@ type plan struct {
 	// yields the partition value.
 	partLookup bool
 	partSource expr
+
+	// idxLookup is true when a SELECT (no ORDER BY) pins a secondary-indexed
+	// column to a value (WHERE email = ?). The executor resolves candidate PKs
+	// through the index instead of scanning. idxColOrd is the indexed column;
+	// idxSource yields the value.
+	idxLookup bool
+	idxColOrd int
+	idxSource expr
 }
 
 func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
@@ -162,6 +170,17 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 				if ok, src := detectColEq(s.where, rt, rt.partitionOrdinal); ok {
 					pl.partLookup = true
 					pl.partSource = src
+				}
+			} else if len(rt.indexes) > 0 && s.orderCol == "" {
+				// Secondary-index point/bucket lookup. ORDER BY falls back to the
+				// scan (the index is unordered) — a v1 limitation.
+				for _, ri := range rt.indexes {
+					if ok, src := detectColEq(s.where, rt, ri.ordinal); ok {
+						pl.idxLookup = true
+						pl.idxColOrd = ri.ordinal
+						pl.idxSource = src
+						break
+					}
 				}
 			}
 		}
@@ -520,6 +539,45 @@ func (db *DB) execSelectPKOne(pl *plan, keyVal Value) ([]string, Row, error) {
 	return colNames, pr, nil
 }
 
+// execSelectIdx runs a SELECT pinned to a secondary-indexed column (WHERE col =
+// ?). It resolves candidate PKs through the index, then fetches and projects
+// each by PK. The synchronous-maintenance baseline (S2) trusts the index match;
+// S3 adds a live re-check so a concurrently-changed row is filtered.
+func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
+	st := pl.st.(*selectStmt)
+	tbl := pl.rt
+	colNames := pl.colNames
+	keyVal, err := evalExpr(pl.idxSource, ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if keyVal.IsNull() || st.limit == 0 {
+		return colNames, nil, nil
+	}
+	si := tbl.indexFor(pl.idxColOrd)
+	if si == nil {
+		return colNames, nil, nil
+	}
+	pks := si.lookup(keyOf(keyVal))
+	if len(pks) == 0 {
+		return colNames, nil, nil
+	}
+	out := make([]Row, 0, len(pks))
+	for _, pk := range pks {
+		if st.starAll {
+			if r, ok := tbl.getByPK(pk); ok {
+				out = append(out, r)
+			}
+		} else if pr, ok := tbl.getByPKProject(pk, pl.projOrdinals); ok {
+			out = append(out, pr)
+		}
+		if st.limit >= 0 && len(out) >= st.limit {
+			break
+		}
+	}
+	return colNames, out, nil
+}
+
 // execSelect runs the SELECT plan. Returns the columns and a slice of
 // projected rows. Rows are deep-cloned before returning so the caller
 // may mutate them without affecting storage.
@@ -560,6 +618,12 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 			return colNames, nil, nil
 		}
 		return colNames, []Row{pr}, nil
+	}
+
+	// Secondary-index lookup: resolve candidate PKs through the index, fetch
+	// each by PK and project. No scan.
+	if pl.idxLookup {
+		return db.execSelectIdx(pl, &ctx)
 	}
 
 	// Collect matching rows. A partition-pinned SELECT (WHERE partkey = ?)
@@ -894,6 +958,9 @@ func (db *DB) execInsert(pl *plan, args []Value) (int, error) {
 	}); err != nil {
 		return 0, err
 	}
+	if len(tbl.indexes) > 0 {
+		tbl.idxApply(row[tbl.def.pkOrdinal].UUID(), row)
+	}
 	return 1, nil
 }
 
@@ -957,6 +1024,7 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 			return 0, err
 		}
 		if ok {
+			db.idxApplyAfterUpdate(tbl, pk)
 			return 1, nil
 		}
 		return 0, nil
@@ -1034,6 +1102,7 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 			return 0, err
 		}
 		if ok {
+			db.idxApplyAfterUpdate(tbl, pk)
 			return 1, nil
 		}
 		return 0, nil
@@ -1051,7 +1120,23 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		}
 		journalAll = db.journalTxnBodies
 	}
-	return tbl.updateWhereAll(match, pl.updateOrdinals, compute, encode, journalAll)
+	n, err := tbl.updateWhereAll(match, pl.updateOrdinals, compute, encode, journalAll)
+	if err == nil && n > 0 && len(tbl.indexes) > 0 {
+		tbl.rebuildIndexes() // bulk deltas aren't tracked incrementally
+	}
+	return n, err
+}
+
+// idxApplyAfterUpdate refreshes the secondary indexes for a single updated row.
+// It re-reads the live row (a clone) so the reverse map sees the new value;
+// the eventual-consistency model tolerates a concurrent change landing first.
+func (db *DB) idxApplyAfterUpdate(tbl *tableRT, pk UUID) {
+	if len(tbl.indexes) == 0 {
+		return
+	}
+	if nr, ok := tbl.getByPK(pk); ok {
+		tbl.idxApply(pk, nr)
+	}
 }
 
 // execDelete dispatches on the WHERE shape, mirroring execUpdate. A
@@ -1094,6 +1179,9 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 			return 0, err
 		}
 		if ok {
+			if len(tbl.indexes) > 0 {
+				tbl.idxApply(pk, nil)
+			}
 			return 1, nil
 		}
 		return 0, nil
@@ -1121,5 +1209,9 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 		}
 		journalAll = db.journalTxnBodies
 	}
-	return tbl.deleteWhereAll(match, encode, journalAll)
+	n, err := tbl.deleteWhereAll(match, encode, journalAll)
+	if err == nil && n > 0 && len(tbl.indexes) > 0 {
+		tbl.rebuildIndexes() // bulk deltas aren't tracked incrementally
+	}
+	return n, err
 }

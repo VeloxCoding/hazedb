@@ -32,6 +32,10 @@ type table struct {
 	def    *resolvedTable
 	shards []tableShard
 	mask   uint32
+	// indexes are the secondary indexes declared on non-PK columns (nil when
+	// none). Maintained per docs/secondary-indexes.md; only non-partitioned
+	// tables may declare them (enforced in resolveSchema).
+	indexes []*secIndex
 	// pkDir is the table-wide PK→location directory for PARTITIONED tables
 	// (nil otherwise). Partitioned shards route by PartitionKey value, so the
 	// per-shard pk map can't enforce table-wide PK uniqueness or answer
@@ -73,6 +77,9 @@ func newTable(def *resolvedTable, sizeHint int) *table {
 	}
 	if def.partitioned() {
 		t.pkDir = &pkDirectory{idx: make(map[UUID]rowLocation, sizeHint)}
+	}
+	for _, ri := range def.indexes {
+		t.indexes = append(t.indexes, newSecIndex(ri))
 	}
 	return t
 }
