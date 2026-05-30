@@ -22,9 +22,12 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// drainTable is the mirror's view of one table: enough to build the row SQL.
+// drainTable is the mirror's view of one table: enough to build the row SQL and
+// to rebuild the in-memory table on SQLite-backed recovery (def carries columns,
+// types, and indexes).
 type drainTable struct {
 	name      string
+	def       TableDef
 	cols      []ColumnDef
 	pkOrd     int
 	insertSQL string // INSERT OR REPLACE INTO "t" (...) VALUES (?,...)
@@ -211,7 +214,7 @@ func createTableSQL(td TableDef) string {
 }
 
 func buildDrainTable(td TableDef) *drainTable {
-	dt := &drainTable{name: td.Name, cols: td.Columns, pkOrd: 0}
+	dt := &drainTable{name: td.Name, def: td, cols: td.Columns, pkOrd: 0}
 	var cols, ph strings.Builder
 	for i, c := range td.Columns {
 		if c.PK {
@@ -319,6 +322,9 @@ func (db *DB) drainSegment(n uint64, path string) error {
 		return err
 	}
 	db.sq.lastDrained = n
+	// Reclaim WAL disk: this segment's records are now durably in SQLite, which
+	// is the recovery source for everything up to lastDrained.
+	_ = os.Remove(path)
 	return nil
 }
 

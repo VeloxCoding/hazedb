@@ -172,19 +172,56 @@ func Open(opts Options) (*DB, error) {
 		// Replay existing records first, then position for appends and only
 		// then start the tickers — so no background goroutine (flush or rotate)
 		// races a replay reader on the append handle.
-		if err := db.replayWAL(w); err != nil {
-			w.close()
-			return nil, err
-		}
-		if segmented {
+		if opts.SQLitePath != "" {
+			// SQLite-backed recovery: the mirror is the system of record on disk.
+			// Open it first, load it into memory, then replay only the undrained
+			// WAL tail (segments past the drained cursor) on top.
+			minAge := opts.SegmentDrainMinAge
+			if minAge == 0 {
+				minAge = 5 * time.Second
+			}
+			m, merr := newSQLiteMirror(opts.SQLitePath, db.cat.Load(), minAge)
+			if merr != nil {
+				w.close()
+				return nil, merr
+			}
+			db.sq = m
+			if err := db.recoverFromSQLite(); err != nil {
+				w.close()
+				m.close()
+				return nil, err
+			}
+			if err := w.removeDrainedSegments(m.lastDrained); err != nil {
+				w.close()
+				m.close()
+				return nil, err
+			}
+			if err := w.replayFrom(m.lastDrained, db.applyReplayRecord); err != nil {
+				w.close()
+				m.close()
+				return nil, err
+			}
 			if err := w.startActiveSegment(); err != nil {
 				w.close()
+				m.close()
 				return nil, err
 			}
 		} else {
-			if err := w.seekToEnd(); err != nil {
+			// WAL is the recovery source: replay every segment into memory.
+			if err := db.replayWAL(w); err != nil {
 				w.close()
 				return nil, err
+			}
+			if segmented {
+				if err := w.startActiveSegment(); err != nil {
+					w.close()
+					return nil, err
+				}
+			} else {
+				if err := w.seekToEnd(); err != nil {
+					w.close()
+					return nil, err
+				}
 			}
 		}
 		flushInterval := opts.WALFlushInterval
@@ -194,21 +231,11 @@ func Open(opts Options) (*DB, error) {
 		w.startTicker(flushInterval)
 		w.startRotateTicker(rotateInterval)
 		db.wal = w
-		// Replay marked rows dirty but never built the indexes; rebuild them
-		// from the live rows now, so reads are index-fast before serving.
+		// Replay marked rows dirty but never built the indexes; rebuild them from
+		// the live rows now, so reads are index-fast before serving.
 		db.rebuildAllIndexes()
 
 		if opts.SQLitePath != "" {
-			minAge := opts.SegmentDrainMinAge
-			if minAge == 0 {
-				minAge = 5 * time.Second
-			}
-			m, err := newSQLiteMirror(opts.SQLitePath, db.cat.Load(), minAge)
-			if err != nil {
-				w.close()
-				return nil, err
-			}
-			db.sq = m
 			drainInterval := opts.DrainInterval
 			if drainInterval == 0 {
 				drainInterval = time.Minute
@@ -494,59 +521,64 @@ func (db *DB) prepare(sql string, cat *catalog) (*plan, error) {
 // references the table, so a mutation always resolves against an
 // already-rebuilt catalog.
 func (db *DB) replayWAL(w *wal) error {
-	return w.replayAll(func(recType uint8, payload []byte) error {
-		switch recType {
-		case recCreateTable:
-			tableID, td, err := decodeCreateTable(payload)
-			if err != nil {
-				return err
-			}
-			resolved, err := resolveSchema(Schema{Tables: []TableDef{td}})
-			if err != nil {
-				return err
-			}
-			rt := &tableRT{table: newTable(resolved[td.Name], db.sizeHint), tableID: tableID}
-			db.cat.Store(db.cat.Load().withTable(rt))
-			return nil
-		case recDropTable:
-			name, err := decodeDropTable(payload)
-			if err != nil {
-				return err
-			}
-			db.cat.Store(db.cat.Load().withoutTable(name))
-			return nil
-		case recCheckpoint:
-			return nil // no row state — skip
-		case recMutation:
-			return db.applyMutationRecord(payload)
-		case recTxn:
-			// A transaction is a count-prefixed group of sub-mutations, applied
-			// in order. The whole group arrived as one CRC-valid envelope, so it
-			// is all-or-nothing by construction; a torn group was discarded by
-			// the tail check before reaching here.
-			if len(payload) < 2 {
-				return fmt.Errorf("%w: short txn payload", ErrWALCorrupt)
-			}
-			n := int(binary.LittleEndian.Uint16(payload[0:2]))
-			off := 2
-			for i := 0; i < n; i++ {
-				if off+4 > len(payload) {
-					return fmt.Errorf("%w: txn sub-mutation length truncated", ErrWALCorrupt)
-				}
-				mlen := int(binary.LittleEndian.Uint32(payload[off : off+4]))
-				off += 4
-				if mlen < 0 || off+mlen > len(payload) {
-					return fmt.Errorf("%w: txn sub-mutation body truncated", ErrWALCorrupt)
-				}
-				if err := db.applyMutationRecord(payload[off : off+mlen]); err != nil {
-					return err
-				}
-				off += mlen
-			}
-			return nil
+	return w.replayAll(db.applyReplayRecord)
+}
+
+// applyReplayRecord applies one decoded WAL record to the in-memory store during
+// recovery. Shared by full replay (replayWAL) and SQLite-backed tail replay
+// (replayFrom): catalog records rebuild the catalog, mutations re-apply rows.
+func (db *DB) applyReplayRecord(recType uint8, payload []byte) error {
+	switch recType {
+	case recCreateTable:
+		tableID, td, err := decodeCreateTable(payload)
+		if err != nil {
+			return err
 		}
-		return fmt.Errorf("%w: unknown record type %d", ErrWALCorrupt, recType)
-	})
+		resolved, err := resolveSchema(Schema{Tables: []TableDef{td}})
+		if err != nil {
+			return err
+		}
+		rt := &tableRT{table: newTable(resolved[td.Name], db.sizeHint), tableID: tableID}
+		db.cat.Store(db.cat.Load().withTable(rt))
+		return nil
+	case recDropTable:
+		name, err := decodeDropTable(payload)
+		if err != nil {
+			return err
+		}
+		db.cat.Store(db.cat.Load().withoutTable(name))
+		return nil
+	case recCheckpoint:
+		return nil // no row state — skip
+	case recMutation:
+		return db.applyMutationRecord(payload)
+	case recTxn:
+		// A transaction is a count-prefixed group of sub-mutations, applied
+		// in order. The whole group arrived as one CRC-valid envelope, so it
+		// is all-or-nothing by construction; a torn group was discarded by
+		// the tail check before reaching here.
+		if len(payload) < 2 {
+			return fmt.Errorf("%w: short txn payload", ErrWALCorrupt)
+		}
+		n := int(binary.LittleEndian.Uint16(payload[0:2]))
+		off := 2
+		for i := 0; i < n; i++ {
+			if off+4 > len(payload) {
+				return fmt.Errorf("%w: txn sub-mutation length truncated", ErrWALCorrupt)
+			}
+			mlen := int(binary.LittleEndian.Uint32(payload[off : off+4]))
+			off += 4
+			if mlen < 0 || off+mlen > len(payload) {
+				return fmt.Errorf("%w: txn sub-mutation body truncated", ErrWALCorrupt)
+			}
+			if err := db.applyMutationRecord(payload[off : off+mlen]); err != nil {
+				return err
+			}
+			off += mlen
+		}
+		return nil
+	}
+	return fmt.Errorf("%w: unknown record type %d", ErrWALCorrupt, recType)
 }
 
 // applyMutationRecord decodes one op|tableID|op-body mutation record and

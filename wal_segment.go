@@ -135,6 +135,48 @@ func (w *wal) replayAll(apply func(recType uint8, payload []byte) error) error {
 	return nil
 }
 
+// replayFrom replays only segments numbered above minSeg, ascending. Used by
+// SQLite-backed recovery: segments at or below the drained cursor are already in
+// the mirror and must not be re-applied to memory.
+func (w *wal) replayFrom(minSeg uint64, apply func(recType uint8, payload []byte) error) error {
+	segs, err := listSegments(w.dir)
+	if err != nil {
+		return err
+	}
+	for _, n := range segs {
+		if n <= minSeg {
+			continue
+		}
+		f, err := os.Open(w.segPath(n))
+		if err != nil {
+			return err
+		}
+		err = w.replayFile(f, apply)
+		f.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// removeDrainedSegments deletes sealed segments at or below minSeg — boot
+// housekeeping for the crash window between a drain commit and the file delete.
+func (w *wal) removeDrainedSegments(minSeg uint64) error {
+	segs, err := listSegments(w.dir)
+	if err != nil {
+		return err
+	}
+	for _, n := range segs {
+		if n <= minSeg {
+			if err := os.Remove(w.segPath(n)); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // rotate seals the active segment (flush, fsync when WALSync, close) and opens
 // the next. No-op in single-file mode, on a sticky error, or when the active
 // segment holds no records (so idle ticks create no empty segments). Takes w.mu,
