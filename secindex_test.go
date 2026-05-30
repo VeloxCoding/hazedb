@@ -254,3 +254,34 @@ func TestIndexNonUniqueBucket(t *testing.T) {
 		t.Fatalf("non-unique index bucket wrong: got %d, want 4", len(rows))
 	}
 }
+
+// S6: churn within non-unique buckets — moving a PK between buckets (update) and
+// removing one (delete), across merges, must keep both buckets exact. Exercises
+// removeFwdLocked's swap-remove on multi-PK buckets.
+func TestIndexNonUniqueChurn(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE users (id uuid primary key, city text, INDEX (city))")
+	ams := make([]UUID, 3)
+	for i := range ams {
+		ams[i] = NewUUIDv7()
+		db.Exec("INSERT INTO users (id, city) VALUES (?, ?)", ams[i], "AMS")
+	}
+	rtm := NewUUIDv7()
+	db.Exec("INSERT INTO users (id, city) VALUES (?, ?)", rtm, "RTM")
+	db.mergeIndexes()
+
+	db.Exec("UPDATE users SET city = ? WHERE id = ?", "RTM", ams[0]) // AMS -> RTM
+	db.Exec("DELETE FROM users WHERE id = ?", ams[1])                // drop one AMS
+	db.mergeIndexes()
+
+	if _, rows, _ := db.Query("SELECT id FROM users WHERE city = ?", "AMS"); len(rows) != 1 {
+		t.Fatalf("AMS bucket after churn: got %d, want 1", len(rows))
+	}
+	if _, rows, _ := db.Query("SELECT id FROM users WHERE city = ?", "RTM"); len(rows) != 2 {
+		t.Fatalf("RTM bucket after churn: got %d, want 2", len(rows))
+	}
+	tbl := db.cat.Load().byName["users"].table
+	if n := len(tbl.dirtyPKs()); n != 0 {
+		t.Fatalf("dirty not drained: %d", n)
+	}
+}
