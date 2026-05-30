@@ -9,6 +9,55 @@ Build / smoke tooling for the hazedb PHP extension (source in
 ./smoke.sh        # boot the binary, run test.php, assert the cgo path works
 ```
 
+## Adding a new PHP function (the workflow)
+
+The whole loop is: **edit one Go file → regenerate → build → smoke.**
+
+1. **Write the Go function in [`../hazedb_ext.go`](../hazedb_ext.go)** with an
+   `// export_php:` directive. Keep the space after `//` (gofmt-clean — the
+   build tightens it to `//export_php:` inside the container, pitfall #1):
+
+   ```go
+   // export_php:function hazedb_count(string $sql): ?string
+   func hazedb_count(sql *C.zend_string) unsafe.Pointer {
+       db := defaultSlot.Load()
+       if db == nil {
+           return nil // no Caddy module registered a DB -> PHP null
+       }
+       // ... call db.Query / db.Exec, build the response bytes, then:
+       return phpStringFromBytes(body)
+   }
+   ```
+
+   Signature + cgo rules (detail in the pitfalls below):
+   - PHP `string` param → Go `*C.zend_string`; PHP `int` param → Go **`int64`**
+     (never `C.zend_long` — the generator silently skips the function, #4).
+   - Return `?string` → `unsafe.Pointer` from `phpStringFromBytes` (nil → PHP
+     `null`). Returning a PHP array would need C trampolines (#5) — avoid; return
+     JSON (or a scalar) as a string.
+   - Read a param with `zendStringView` (zero-copy alias, read-only). If the
+     bytes are **retained past the call** (e.g. become a map key), deep-copy with
+     `zendStringCopy` — that's why hazedb copies the SQL string (#8).
+   - Resolve the shared `*DB` via `defaultSlot.Load()`; treat nil as "no Caddy
+     module loaded".
+
+2. **Regenerate the wrappers:** `./regenerate.sh` rewrites the five
+   `hazedb_ext.*` files from the directives. `git add` them together with your
+   `hazedb_ext.go` change. Needed whenever a **signature** changes (new function,
+   added/renamed param, changed return type). A body-only logic change needs
+   only step 3.
+
+3. **Build:** `./build.sh` → `dist/frankenphp`.
+
+4. **Smoke:** add a call to [`test.php`](test.php), run `./smoke.sh`. Bench with
+   [`bench.php`](bench.php) if it's a hot path.
+
+5. **Use it:** the function is callable from any PHP served by the binary.
+
+Starting a *brand-new* extension (not just a new function) is the same chain
+with a fresh `addons/<name>/` directory + `go.mod`; copy this `build/` dir and
+swap the `hazedb_ext` / module names.
+
 | file | role |
 |---|---|
 | `Dockerfile.gen` | Cached builder image: PHP-ZTS headers + `frankenphp-gen` (built from master for `extension-init`) + `xcaddy` + the `GEN_STUB_SCRIPT` path. ~3 min cold, instant warm. |
