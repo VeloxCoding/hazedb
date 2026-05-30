@@ -28,7 +28,7 @@ every statement the parser accepts — but that set is a deliberate subset of SQ
 
 | area | accepted |
 |---|---|
-| DDL | `CREATE TABLE name (col TYPE …)` with `PRIMARY KEY` / `PARTITION KEY` constraints; `DROP TABLE name` |
+| DDL | `CREATE TABLE name (col TYPE …)` with `PRIMARY KEY` / `PARTITION KEY` constraints and `[UNIQUE] INDEX [name] (col)` declarations; `DROP TABLE name` |
 | Column types | `int`, `text`/`string`, `bool`, `bytes`/`blob`, `uuid` |
 | Writes | `INSERT INTO … VALUES (…)`, `UPDATE … SET … WHERE …`, `DELETE FROM … WHERE …` |
 | `SELECT` | `*` or an explicit column list, **one** table (`FROM t`), optional `WHERE`, `ORDER BY col [ASC\|DESC]`, `LIMIT n` |
@@ -38,6 +38,45 @@ every statement the parser accepts — but that set is a deliberate subset of SQ
 **Primary key:** every table has exactly one PK, type `uuid`. INSERT
 auto-generates a UUIDv7 when the id is omitted; supply your own (any canonical
 UUID string) only when the app needs to address the row later.
+
+## Secondary indexes
+
+Declare an index on a non-PK column to make `WHERE col = ?` a lookup instead of
+a full scan:
+
+```sql
+CREATE TABLE users (
+    id uuid primary key, name text, age int null, email text,
+    INDEX (email),
+    UNIQUE INDEX (name)   -- UNIQUE is a selectivity hint, not an enforced constraint
+)
+```
+
+A query that pins an indexed column by equality uses the index — alone or inside
+an `AND` (`WHERE email = ? AND name = ?`, where the planner uses one index and
+filters the rest). `OR`, `ORDER BY`, and ranges (`<`, `>`) fall back to a scan.
+
+**Async, but always correct.** Indexes are maintained *off the write path*: a
+write only flags its row, and a background merger reconciles the index shortly
+after. A read combines the index with the just-written (not-yet-merged) rows and
+re-checks each against the live row, so it is correct at any merge lag — never
+stale, never a wrong row. This fits the cache contract (a brief index lag is
+acceptable in front of a source of truth).
+
+**Costs** (measured, 50k rows; see [secondary-indexes.md](secondary-indexes.md)
+for the full design; the `idxcmp` harness in the external `demo_and_perf`
+testbed reproduces the SQLite comparison):
+
+- **Read:** ~1.6 µs for `WHERE email = ? AND name = ?` — ~75× faster than the
+  equivalent full scan, and ~100× faster than the same query on SQLite `:memory:`.
+- **Write:** ~+69 ns per insert/update/delete (one flag, independent of how many
+  indexes the table has).
+- **Re-indexing (merge):** ~30 ms to reconcile 50k rows across two indexes —
+  one-time, in the background (every 50 ms) or once at boot after WAL replay.
+
+**Limits:** non-partitioned tables only (an `INDEX` on a partitioned table is
+rejected); single-column only (no composite); `UNIQUE` does not reject
+duplicates (uniqueness is the operator's promise, used only to read faster).
 
 ## Not supported — will error or fail to parse
 
@@ -52,11 +91,12 @@ UUID string) only when the app needs to address the row later.
 
 ## What this means in practice
 
-For the common PHP pattern — read or write a row by id, or list + filter +
-order + limit rows in a single table — these functions cover everything. For
-relational work (joins, aggregation, reporting), do that in your application or
-in the source-of-truth database; hazedb is the hot-read / write-buffer layer in
-front of it, not the system of record.
+For the common PHP pattern — read or write a row by id, look one up by an
+indexed column (`WHERE email = ?`), or list + filter + order + limit rows in a
+single table — these functions cover everything. For relational work (joins,
+aggregation, reporting), do that in your application or in the source-of-truth
+database; hazedb is the hot-read / write-buffer layer in front of it, not the
+system of record.
 
 ## Future additions — feasibility tiers
 
