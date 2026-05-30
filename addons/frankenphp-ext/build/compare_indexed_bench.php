@@ -178,3 +178,41 @@ $line("AND: WHERE name = ? AND city = ?", $andH, $andS, $IT_AND);
 $line("ORDER BY age DESC LIMIT 20 (city)", $obigH, $obigS, $IT_OBIG);
 $line("ORDER BY age ASC LIMIT 20 (name)", $osmlH, $osmlS, $IT_OSML);
 $line("ORDER BY email ASC LIMIT 100 (global)", $oemH, $oemS, $IT_OEM);
+
+// =================== page-load mode: SQLite prepares per call ===================
+// hazedb_exec/hazedb_fetch already resolve the (cached) plan per call; the fair
+// match for a classic per-request page load is PDO preparing fresh each time
+// (no long-lived reused statement). hazedb numbers are unchanged from above.
+$pdoP = new PDO('sqlite::memory:');
+$pdoP->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+$pdoP->exec('CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT, age INTEGER, email TEXT, city TEXT)');
+$pdoP->exec('CREATE INDEX idx_email ON users(email)');
+$pdoP->exec('CREATE INDEX idx_name  ON users(name)');
+$pdoP->exec('CREATE INDEX idx_city  ON users(city)');
+$t = microtime(true);
+for ($i = 0; $i < $N; $i++) {
+    $st = $pdoP->prepare($INS);
+    $st->execute([$ids[$i], $names[$i], $ages[$i], $emails[$i], $cities[$i]]);
+}
+$sqInsPC = microtime(true) - $t;
+$pdoP = null;
+
+$t = microtime(true);
+for ($i = 0; $i < $IT_PK; $i++) {
+    $st = $pdo->prepare($Q_PK);
+    $st->execute([$ids[$i % $N]]);
+    $st->fetch(PDO::FETCH_ASSOC);
+}
+$pkSpc = microtime(true) - $t;
+$t = microtime(true);
+for ($i = 0; $i < $IT_PT; $i++) {
+    $st = $pdo->prepare($Q_PT);
+    $st->execute([$emails[$i % $N]]);
+    $st->fetch(PDO::FETCH_ASSOC);
+}
+$ptSpc = microtime(true) - $t;
+
+echo "\nPAGE-LOAD MODE (SQLite prepares per call; hazedb unchanged — it always does)\n";
+$line("INSERT", $hzIns, $sqInsPC, $N);
+$line("point: WHERE id = ?  (PK)", $pkH, $pkSpc, $IT_PK);
+$line("point: WHERE email = ?  (index)", $ptH, $ptSpc, $IT_PT);
