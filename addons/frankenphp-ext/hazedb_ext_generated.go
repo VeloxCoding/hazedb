@@ -33,6 +33,16 @@ func go_hazedb_exec(sql *C.zend_string, argsJSON *C.zend_string) unsafe.Pointer 
 	return hazedb_exec(sql, argsJSON)
 }
 
+//export go_hazedb_query_arr
+func go_hazedb_query_arr(sql *C.zend_string, argsStr *C.zend_string) unsafe.Pointer {
+	return hazedb_query_arr(sql, argsStr)
+}
+
+//export go_hazedb_exec_arr
+func go_hazedb_exec_arr(sql *C.zend_string, args *C.zend_array) unsafe.Pointer {
+	return hazedb_exec_arr(sql, args)
+}
+
 //export go_hazedb_ping
 func go_hazedb_ping() unsafe.Pointer {
 	return hazedb_ping()

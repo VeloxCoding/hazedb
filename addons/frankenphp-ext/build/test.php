@@ -35,3 +35,17 @@ show('query', hazedb_query(
     'SELECT name, age FROM users WHERE id = ?',
     json_encode([$id])
 ));                                               // expect {"columns":["name","age"],"rows":[["alice",30]]}
+
+// hazedb_query_arr returns a native PHP array; re-encoding it must match the
+// JSON path above (proves the zval-direct builder produces identical data).
+$arr = hazedb_query_arr('SELECT name, age FROM users WHERE id = ?', $id);
+echo 'query_arr_is_array=', (is_array($arr) ? 'yes' : 'no'), "\n";
+echo 'query_arr=', json_encode($arr), "\n";      // expect identical to 'query' above
+
+// hazedb_exec_arr: insert with a NATIVE PHP array (no json_encode), read back.
+$id2 = make_uuid();
+show('exec_arr', hazedb_exec_arr(
+    'INSERT INTO users (id, name, age) VALUES (?, ?, ?)',
+    [$id2, 'bob', 25]
+));                                               // expect {"affected":1}
+echo 'exec_arr_read=', json_encode(hazedb_query_arr('SELECT name, age FROM users WHERE id = ?', $id2)), "\n";

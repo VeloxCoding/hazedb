@@ -30,8 +30,13 @@ MSYS_NO_PATHCONV=1 docker run --rm \
         echo "$OUT"
         echo "---------------------------"
         kill $PID 2>/dev/null || true
+        # Require: ping, the JSON query row, AND query_arr re-encoding to the
+        # identical row (proves the zval-direct array builder).
         echo "$OUT" | grep -q "^ping=pong$" \
-            && echo "$OUT" | grep -q "\"rows\":\[\[\"alice\",30\]\]" \
+            && echo "$OUT" | grep -q "^query={\"columns\":\[\"name\",\"age\"\],\"rows\":\[\[\"alice\",30\]\]}" \
+            && echo "$OUT" | grep -q "^query_arr={\"columns\":\[\"name\",\"age\"\],\"rows\":\[\[\"alice\",30\]\]}" \
+            && echo "$OUT" | grep -q "^exec_arr={\"affected\":1}" \
+            && echo "$OUT" | grep -q "^exec_arr_read={\"columns\":\[\"name\",\"age\"\],\"rows\":\[\[\"bob\",25\]\]}" \
             && { echo "SMOKE: PASS"; exit 0; }
         echo "SMOKE: FAIL"; exit 1
     '

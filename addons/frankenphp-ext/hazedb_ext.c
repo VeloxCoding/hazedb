@@ -65,6 +65,38 @@ PHP_FUNCTION(hazedb_exec)
 	RETURN_NULL();
 }
 
+PHP_FUNCTION(hazedb_query_arr)
+{
+    zend_string *sql = NULL;
+    zend_string *args = NULL;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STR(sql)
+        Z_PARAM_STR(args)
+    ZEND_PARSE_PARAMETERS_END();
+    zend_array *result = go_hazedb_query_arr(sql, args);
+    if (result) {
+        RETURN_ARR(result);
+    }
+
+	RETURN_NULL();
+}
+
+PHP_FUNCTION(hazedb_exec_arr)
+{
+    zend_string *sql = NULL;
+    zend_array *args = NULL;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STR(sql)
+        Z_PARAM_ARRAY_HT(args)
+    ZEND_PARSE_PARAMETERS_END();
+    zend_string *result = go_hazedb_exec_arr(sql, args);
+    if (result) {
+        RETURN_STR(result);
+    }
+
+	RETURN_NULL();
+}
+
 PHP_FUNCTION(hazedb_ping)
 {
     ZEND_PARSE_PARAMETERS_NONE();
