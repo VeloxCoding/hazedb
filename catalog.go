@@ -133,6 +133,8 @@ func (db *DB) dropTable(name string) error {
 //
 // CREATE: tableID:2 | name(len:2+bytes) | numCols:2 | per col: name(len:2+bytes) | type:1 | flags:1
 //   flags bit 0 = PK, 1 = PartitionKey, 2 = Immutable, 3 = Nullable
+//   then (optional, omitted by pre-index records): numIndexes:2 |
+//        per index: name(len:2+bytes) | col(len:2+bytes) | flags:1 (bit 0 = Unique)
 // DROP:   name(len:2+bytes)
 
 func encodeCreateTable(buf []byte, tableID uint16, td TableDef) []byte {
@@ -156,6 +158,18 @@ func encodeCreateTable(buf []byte, tableID uint16, td TableDef) []byte {
 		}
 		if c.Nullable {
 			flags |= 8
+		}
+		buf = append(buf, flags)
+	}
+	buf = appendU16LE(buf, uint16(len(td.Indexes)))
+	for _, ix := range td.Indexes {
+		buf = appendU16LE(buf, uint16(len(ix.Name)))
+		buf = append(buf, ix.Name...)
+		buf = appendU16LE(buf, uint16(len(ix.Column)))
+		buf = append(buf, ix.Column...)
+		var flags byte
+		if ix.Unique {
+			flags |= 1
 		}
 		buf = append(buf, flags)
 	}
@@ -199,6 +213,30 @@ func decodeCreateTable(b []byte) (uint16, TableDef, error) {
 		c.Immutable = flags&4 != 0
 		c.Nullable = flags&8 != 0
 		td.Columns = append(td.Columns, c)
+	}
+	// Index section is optional: pre-index WAL records end after the columns.
+	if off+2 > len(b) {
+		return tableID, td, nil
+	}
+	nidx := int(binary.LittleEndian.Uint16(b[off : off+2]))
+	off += 2
+	for i := 0; i < nidx; i++ {
+		name, n, err := getLenStr(b[off:])
+		if err != nil {
+			return 0, td, err
+		}
+		off += n
+		col, n, err := getLenStr(b[off:])
+		if err != nil {
+			return 0, td, err
+		}
+		off += n
+		if off >= len(b) {
+			return 0, td, fmt.Errorf("%w: create-table index flags", ErrWALCorrupt)
+		}
+		flags := b[off]
+		off++
+		td.Indexes = append(td.Indexes, IndexDef{Name: name, Column: col, Unique: flags&1 != 0})
 	}
 	return tableID, td, nil
 }

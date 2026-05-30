@@ -52,16 +52,34 @@ type ColumnDef struct {
 	Nullable     bool
 }
 
+// IndexDef declares a secondary index on one non-PK column. Maintained
+// asynchronously and read through a hybrid path; see docs/secondary-indexes.md.
+// Single-column only in v1 (composite is v1.1+).
+type IndexDef struct {
+	Name   string // optional; auto-derived as "idx_<col>" when empty
+	Column string
+	Unique bool
+}
+
 // TableDef defines a table. Exactly one column must have PK=true.
 // Multi-column PK is v1.1+.
 type TableDef struct {
 	Name    string
 	Columns []ColumnDef
+	Indexes []IndexDef
 }
 
 // Schema is the database schema. Tables are addressed by name.
 type Schema struct {
 	Tables []TableDef
+}
+
+// resolvedIndex is the validated form of an IndexDef: the indexed column's
+// ordinal plus its uniqueness, resolved once at schema time.
+type resolvedIndex struct {
+	name    string
+	ordinal int
+	unique  bool
 }
 
 // resolvedTable is the internal, validated form of a TableDef. Holds
@@ -71,6 +89,17 @@ type resolvedTable struct {
 	colByName        map[string]int
 	pkOrdinal        int
 	partitionOrdinal int // -1 if the table is not partitioned
+	indexes          []resolvedIndex
+}
+
+// indexOfColumn returns the resolved index on column ordinal ord, or nil.
+func (rt *resolvedTable) indexOfColumn(ord int) *resolvedIndex {
+	for i := range rt.indexes {
+		if rt.indexes[i].ordinal == ord {
+			return &rt.indexes[i]
+		}
+	}
+	return nil
 }
 
 // partitioned reports whether the table declares a PartitionKey.
@@ -123,6 +152,30 @@ func resolveSchema(s Schema) (map[string]*resolvedTable, error) {
 		}
 		if rt.partitionOrdinal == rt.pkOrdinal {
 			return nil, fmt.Errorf("schema: table %q PartitionKey must be a different column than the PK", t.Name)
+		}
+		seenIdxCol := make(map[int]bool, len(t.Indexes))
+		seenIdxName := make(map[string]bool, len(t.Indexes))
+		for _, ix := range t.Indexes {
+			ord, ok := rt.colByName[ix.Column]
+			if !ok {
+				return nil, fmt.Errorf("schema: table %q INDEX on unknown column %q", t.Name, ix.Column)
+			}
+			if ord == rt.pkOrdinal {
+				return nil, fmt.Errorf("schema: table %q INDEX on PK column %q is redundant", t.Name, ix.Column)
+			}
+			if seenIdxCol[ord] {
+				return nil, fmt.Errorf("schema: table %q has multiple indexes on column %q", t.Name, ix.Column)
+			}
+			seenIdxCol[ord] = true
+			name := ix.Name
+			if name == "" {
+				name = "idx_" + ix.Column
+			}
+			if seenIdxName[name] {
+				return nil, fmt.Errorf("schema: table %q duplicate index name %q", t.Name, name)
+			}
+			seenIdxName[name] = true
+			rt.indexes = append(rt.indexes, resolvedIndex{name: name, ordinal: ord, unique: ix.Unique})
 		}
 		out[t.Name] = rt
 	}

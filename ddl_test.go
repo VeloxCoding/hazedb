@@ -277,6 +277,83 @@ func TestNoAlterTable(t *testing.T) {
 	}
 }
 
+// resolvedTableByName fetches a table's resolved form for white-box assertions.
+func resolvedTableByName(t *testing.T, db *DB, name string) *resolvedTable {
+	t.Helper()
+	rt := db.cat.Load().byName[name]
+	if rt == nil {
+		t.Fatalf("table %q not in catalog", name)
+	}
+	return rt.table.def
+}
+
+// S1: an index declaration parses, resolves to the right column ordinal +
+// uniqueness, gets an auto-derived name when unnamed, and does not disturb the
+// existing full-scan read path.
+func TestCreateTableWithIndex(t *testing.T) {
+	db := openEmpty(t)
+	if _, err := db.Exec("CREATE TABLE users (id uuid primary key, name text, email text, INDEX (email), UNIQUE INDEX by_name (name))"); err != nil {
+		t.Fatal(err)
+	}
+	rt := resolvedTableByName(t, db, "users")
+	if len(rt.indexes) != 2 {
+		t.Fatalf("want 2 indexes, got %d", len(rt.indexes))
+	}
+	if rt.indexes[0] != (resolvedIndex{name: "idx_email", ordinal: 2, unique: false}) {
+		t.Errorf("email index resolved wrong: %+v", rt.indexes[0])
+	}
+	if rt.indexes[1] != (resolvedIndex{name: "by_name", ordinal: 1, unique: true}) {
+		t.Errorf("name index resolved wrong: %+v", rt.indexes[1])
+	}
+	// Reads still work (full scan; index behaviour lands in S2+).
+	id := NewUUIDv7()
+	db.Exec("INSERT INTO users (id, name, email) VALUES (?, ?, ?)", id, "alice", "a@x")
+	if _, rows, _ := db.Query("SELECT name FROM users WHERE email = ?", "a@x"); len(rows) != 1 || rows[0][0].Str() != "alice" {
+		t.Fatalf("full-scan read on indexed column broken: %v", rows)
+	}
+}
+
+func TestIndexValidationErrors(t *testing.T) {
+	cases := map[string]string{
+		"unknown column": "CREATE TABLE t (id uuid primary key, n int, INDEX (missing))",
+		"on PK column":    "CREATE TABLE t (id uuid primary key, n int, INDEX (id))",
+		"duplicate column": "CREATE TABLE t (id uuid primary key, n int, INDEX (n), INDEX (n))",
+		"composite":        "CREATE TABLE t (id uuid primary key, a int, b int, INDEX (a, b))",
+	}
+	for name, sql := range cases {
+		t.Run(name, func(t *testing.T) {
+			db := openEmpty(t)
+			if _, err := db.Exec(sql); err == nil {
+				t.Fatalf("expected error for %q, got nil", name)
+			}
+		})
+	}
+}
+
+// S1: an index declaration is part of the schema and must survive a restart
+// (the catalog's CREATE record now carries the index section).
+func TestIndexSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "idx.wal")
+	db, err := Open(Options{Schema: Schema{}, WALPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Exec("CREATE TABLE users (id uuid primary key, email text, UNIQUE INDEX (email))")
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db2, err := Open(Options{Schema: Schema{}, WALPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	rt := resolvedTableByName(t, db2, "users")
+	if len(rt.indexes) != 1 || rt.indexes[0] != (resolvedIndex{name: "idx_email", ordinal: 1, unique: true}) {
+		t.Fatalf("index lost or changed after restart: %+v", rt.indexes)
+	}
+}
+
 // --- benchmarks: a runtime-created table must be as fast as a predeclared one ---
 
 func BenchmarkRuntimeCreatedInsert(b *testing.B) {

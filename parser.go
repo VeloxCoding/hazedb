@@ -81,6 +81,20 @@ func (p *parser) parseCreate() (*createStmt, error) {
 		return nil, err
 	}
 	for {
+		// Table-level index declaration ([UNIQUE] INDEX [name] (col)) instead of
+		// a column. "index"/"unique" are thus reserved as leading words here.
+		if t := p.peek(); t.kind == tkIdent && (t.text == "index" || t.text == "unique") {
+			ix, err := p.parseIndexClause()
+			if err != nil {
+				return nil, err
+			}
+			st.def.Indexes = append(st.def.Indexes, ix)
+			if p.peek().kind != tkComma {
+				break
+			}
+			p.advance()
+			continue
+		}
 		cn, err := p.expect(tkIdent, "column name")
 		if err != nil {
 			return nil, err
@@ -129,6 +143,45 @@ func (p *parser) parseCreate() (*createStmt, error) {
 		return nil, err
 	}
 	return st, nil
+}
+
+// parseIndexClause parses a table-level index declaration:
+//
+//	[UNIQUE] INDEX [name] (col)
+//
+// Single-column only in v1; a composite list errors.
+func (p *parser) parseIndexClause() (IndexDef, error) {
+	var ix IndexDef
+	if p.peek().text == "unique" {
+		p.advance()
+		ix.Unique = true
+		if p.peek().text == "index" {
+			p.advance()
+		}
+	} else {
+		w := p.advance() // "index"
+		if w.text != "index" {
+			return ix, fmt.Errorf("%w: expected INDEX at %d", ErrParse, w.pos)
+		}
+	}
+	if p.peek().kind == tkIdent { // optional index name before the '('
+		ix.Name = p.advance().text
+	}
+	if _, err := p.expect(tkLParen, "("); err != nil {
+		return ix, err
+	}
+	cn, err := p.expect(tkIdent, "index column")
+	if err != nil {
+		return ix, err
+	}
+	ix.Column = cn.text
+	if p.peek().kind == tkComma {
+		return ix, fmt.Errorf("%w: composite index not supported in v1 at %d", ErrParse, p.peek().pos)
+	}
+	if _, err := p.expect(tkRParen, ")"); err != nil {
+		return ix, err
+	}
+	return ix, nil
 }
 
 func parseColType(s string) (ColumnType, error) {
