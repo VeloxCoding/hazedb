@@ -54,6 +54,21 @@ type tableShard struct {
 	// rowIDs stay in the list (rows[rowID] is nil) and the scan skips them.
 	tails map[UUID][]uint64
 	live  int // count of non-tombstoned rows
+	// dirty lists PKs mutated on this shard since the last index merge (nil
+	// unless the table has secondary indexes). Appended under mu by every live
+	// write; drained by mergeIndexes. The read overlay unions it with the index
+	// so a not-yet-merged row is still found (then re-checked against the live
+	// row). See docs/secondary-indexes.md.
+	dirty []UUID
+}
+
+// markDirtyLocked records pk as needing an index merge. No-op when the table has
+// no secondary indexes. Caller holds s.mu (every live write already does), so
+// this adds no lock to the write path.
+func (t *table) markDirtyLocked(s *tableShard, pk UUID) {
+	if len(t.indexes) > 0 {
+		s.dirty = append(s.dirty, pk)
+	}
 }
 
 func newTable(def *resolvedTable, sizeHint int) *table {
@@ -118,6 +133,7 @@ func (t *table) insert(row Row) error {
 	s.rows = append(s.rows, row)
 	s.pk[pk] = rowID
 	s.live++
+	t.markDirtyLocked(s, pk)
 	return nil
 }
 
@@ -155,6 +171,7 @@ func (t *table) insertJournaled(row Row, journal func() error) error {
 	s.rows = append(s.rows, row)
 	s.pk[pk] = rowID
 	s.live++
+	t.markDirtyLocked(s, pk)
 	return nil
 }
 
@@ -186,6 +203,7 @@ func (t *table) updateByPKJournaled(pk UUID, ords []int, compute func(Row) ([]Va
 		for i, ord := range ords {
 			r[ord] = vals[i]
 		}
+		t.markDirtyLocked(s, pk)
 		return true, nil
 	}
 	var saved [8]Value
@@ -202,6 +220,7 @@ func (t *table) updateByPKJournaled(pk UUID, ords []int, compute func(Row) ([]Va
 		}
 		return false, err
 	}
+	t.markDirtyLocked(s, pk)
 	return true, nil
 }
 
@@ -225,6 +244,7 @@ func (t *table) updateByPKOneJournaled(pk UUID, ord int, compute func(Row) (Valu
 	}
 	if journal == nil {
 		r[ord] = val
+		t.markDirtyLocked(s, pk)
 		return true, nil
 	}
 	old := r[ord]
@@ -233,6 +253,7 @@ func (t *table) updateByPKOneJournaled(pk UUID, ord int, compute func(Row) (Valu
 		r[ord] = old
 		return false, err
 	}
+	t.markDirtyLocked(s, pk)
 	return true, nil
 }
 
@@ -258,6 +279,7 @@ func (t *table) deleteByPKJournaled(pk UUID, journal func() error) (bool, error)
 	s.rows[rowID] = nil
 	delete(s.pk, pk)
 	s.live--
+	t.markDirtyLocked(s, pk)
 	return true, nil
 }
 
@@ -389,6 +411,7 @@ func (t *table) update(pk UUID, mutate func(Row) Row) bool {
 		return false
 	}
 	s.rows[rowID] = nr
+	t.markDirtyLocked(s, pk)
 	return true
 }
 
@@ -456,8 +479,10 @@ func (t *table) updateWhereAll(match func(Row) bool, ords []int, compute func(Ro
 			return 0, err // atomic: WAL failed, apply nothing
 		}
 	}
+	pkOrd := t.def.pkOrdinal
 	for _, p := range pending {
 		p.s.rows[p.j] = p.nr
+		t.markDirtyLocked(p.s, p.nr[pkOrd].UUID())
 	}
 	return len(pending), nil
 }
@@ -478,6 +503,7 @@ func (t *table) deleteByPK(pk UUID) bool {
 	s.rows[rowID] = nil
 	delete(s.pk, pk)
 	s.live--
+	t.markDirtyLocked(s, pk)
 	return true
 }
 
@@ -521,6 +547,7 @@ func (t *table) deleteWhereAll(match func(Row) bool, encode func(pk Value) []byt
 		delete(p.s.pk, p.pk)
 		p.s.rows[p.j] = nil
 		p.s.live--
+		t.markDirtyLocked(p.s, p.pk)
 	}
 	return len(pending), nil
 }

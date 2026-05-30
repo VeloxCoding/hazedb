@@ -160,6 +160,72 @@ func (t *table) idxApply(pk UUID, newRow Row) {
 	}
 }
 
+// mergeIndexes reconciles every indexed table in the current catalog. The
+// explicit trigger (S4); a background goroutine drives it in S5.
+func (db *DB) mergeIndexes() {
+	cat := db.cat.Load()
+	for _, rt := range cat.byID {
+		if rt != nil && len(rt.indexes) > 0 {
+			rt.mergeIndexes()
+		}
+	}
+}
+
+// dirtyPKs returns every PK marked dirty (mutated since the last merge) across
+// all shards. The read overlay unions these with the index hits, so a
+// not-yet-merged row is still a candidate (then re-checked against its live
+// row). Copied out under each shard's read lock.
+func (t *table) dirtyPKs() []UUID {
+	var out []UUID
+	for i := range t.shards {
+		s := &t.shards[i]
+		s.mu.RLock()
+		if len(s.dirty) > 0 {
+			out = append(out, s.dirty...)
+		}
+		s.mu.RUnlock()
+	}
+	return out
+}
+
+// mergeIndexes reconciles the secondary indexes with the live rows for every
+// dirty PK, then clears the processed dirty entries. It takes each shard lock
+// only briefly (to snapshot, and later to drop the processed prefix); the
+// recompute itself runs against a lock-free getByPK.
+//
+// No-gap ordering: the dirty entries are snapshotted but NOT cleared before the
+// index is updated, so a concurrent read sees a row via dirty until it is in the
+// index — never in the gap between. Entries appended during the merge stay
+// (positions >= n) and are reconciled next time.
+func (t *table) mergeIndexes() {
+	if len(t.indexes) == 0 {
+		return
+	}
+	for i := range t.shards {
+		s := &t.shards[i]
+		s.mu.RLock()
+		n := len(s.dirty)
+		var batch []UUID
+		if n > 0 {
+			batch = append(batch, s.dirty[:n]...)
+		}
+		s.mu.RUnlock()
+		if n == 0 {
+			continue
+		}
+		for _, pk := range batch {
+			if r, ok := t.getByPK(pk); ok {
+				t.idxApply(pk, r)
+			} else {
+				t.idxApply(pk, nil)
+			}
+		}
+		s.mu.Lock()
+		s.dirty = s.dirty[n:] // drop the processed prefix; later appends remain
+		s.mu.Unlock()
+	}
+}
+
 // rebuildIndexes rebuilds every secondary index from a full scan of live rows.
 // Used after bulk writes (whose per-row deltas are not tracked incrementally)
 // and after WAL replay. Not atomic w.r.t. concurrent writes; callers that need

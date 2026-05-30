@@ -559,24 +559,42 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 		return colNames, nil, nil
 	}
 	wantKey := keyOf(keyVal)
-	pks := si.lookup(wantKey)
-	if len(pks) == 0 {
-		return colNames, nil, nil
-	}
-	// Hybrid read: the index only narrows the candidate set; getByPKCheckProject
-	// re-confirms each row's live value against wantKey, so a stale entry (from a
-	// lagging async index, S4+) yields no wrong row. starAll passes ords nil.
+	// Hybrid candidate set: index hits (pre-merge) UNION the dirty PKs (mutated
+	// since the last merge, value uncertain). getByPKCheckProject re-confirms
+	// each against its live row, so neither a stale index entry nor an unrelated
+	// dirty PK can produce a wrong row. starAll passes ords nil.
 	ords := pl.projOrdinals
 	if st.starAll {
 		ords = nil
 	}
+	pks := si.lookup(wantKey)
+	dirty := tbl.dirtyPKs()
+	if len(pks) == 0 && len(dirty) == 0 {
+		return colNames, nil, nil
+	}
+	seen := make(map[UUID]struct{}, len(pks)+len(dirty))
 	out := make([]Row, 0, len(pks))
-	for _, pk := range pks {
+	consider := func(pk UUID) bool { // returns true to stop (limit reached)
+		if _, dup := seen[pk]; dup {
+			return false
+		}
+		seen[pk] = struct{}{}
 		if r, ok := tbl.getByPKCheckProject(pk, pl.idxColOrd, wantKey, ords); ok {
 			out = append(out, r)
 			if st.limit >= 0 && len(out) >= st.limit {
-				break
+				return true
 			}
+		}
+		return false
+	}
+	for _, pk := range pks {
+		if consider(pk) {
+			return colNames, out, nil
+		}
+	}
+	for _, pk := range dirty {
+		if consider(pk) {
+			break
 		}
 	}
 	return colNames, out, nil
@@ -962,9 +980,6 @@ func (db *DB) execInsert(pl *plan, args []Value) (int, error) {
 	}); err != nil {
 		return 0, err
 	}
-	if len(tbl.indexes) > 0 {
-		tbl.idxApply(row[tbl.def.pkOrdinal].UUID(), row)
-	}
 	return 1, nil
 }
 
@@ -1028,7 +1043,6 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 			return 0, err
 		}
 		if ok {
-			db.idxApplyAfterUpdate(tbl, pk)
 			return 1, nil
 		}
 		return 0, nil
@@ -1106,7 +1120,6 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 			return 0, err
 		}
 		if ok {
-			db.idxApplyAfterUpdate(tbl, pk)
 			return 1, nil
 		}
 		return 0, nil
@@ -1124,23 +1137,7 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		}
 		journalAll = db.journalTxnBodies
 	}
-	n, err := tbl.updateWhereAll(match, pl.updateOrdinals, compute, encode, journalAll)
-	if err == nil && n > 0 && len(tbl.indexes) > 0 {
-		tbl.rebuildIndexes() // bulk deltas aren't tracked incrementally
-	}
-	return n, err
-}
-
-// idxApplyAfterUpdate refreshes the secondary indexes for a single updated row.
-// It re-reads the live row (a clone) so the reverse map sees the new value;
-// the eventual-consistency model tolerates a concurrent change landing first.
-func (db *DB) idxApplyAfterUpdate(tbl *tableRT, pk UUID) {
-	if len(tbl.indexes) == 0 {
-		return
-	}
-	if nr, ok := tbl.getByPK(pk); ok {
-		tbl.idxApply(pk, nr)
-	}
+	return tbl.updateWhereAll(match, pl.updateOrdinals, compute, encode, journalAll)
 }
 
 // execDelete dispatches on the WHERE shape, mirroring execUpdate. A
@@ -1183,9 +1180,6 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 			return 0, err
 		}
 		if ok {
-			if len(tbl.indexes) > 0 {
-				tbl.idxApply(pk, nil)
-			}
 			return 1, nil
 		}
 		return 0, nil
@@ -1213,9 +1207,5 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 		}
 		journalAll = db.journalTxnBodies
 	}
-	n, err := tbl.deleteWhereAll(match, encode, journalAll)
-	if err == nil && n > 0 && len(tbl.indexes) > 0 {
-		tbl.rebuildIndexes() // bulk deltas aren't tracked incrementally
-	}
-	return n, err
+	return tbl.deleteWhereAll(match, encode, journalAll)
 }

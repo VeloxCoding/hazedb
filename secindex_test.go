@@ -97,6 +97,67 @@ func TestIndexHybridRecheckFiltersStale(t *testing.T) {
 	}
 }
 
+// S4: with maintenance off the write path, a freshly written row is found via
+// the dirty overlay before any merge; after merge it lives in the index and the
+// dirty list is drained.
+func TestIndexDirtyOverlayThenMerge(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE users (id uuid primary key, email text, UNIQUE INDEX (email))")
+	id := NewUUIDv7()
+	db.Exec("INSERT INTO users (id, email) VALUES (?, ?)", id, "a@x")
+	tbl := db.cat.Load().byName["users"].table
+	si := tbl.indexFor(tbl.def.colByName["email"])
+
+	if got := si.lookup(keyOf(Str("a@x"))); len(got) != 0 {
+		t.Fatalf("index should be empty before merge, got %v", got)
+	}
+	if n := len(tbl.dirtyPKs()); n != 1 {
+		t.Fatalf("expected 1 dirty PK before merge, got %d", n)
+	}
+	if _, rows, _ := db.Query("SELECT id FROM users WHERE email = ?", "a@x"); len(rows) != 1 {
+		t.Fatal("row not found via dirty overlay before merge")
+	}
+
+	db.mergeIndexes()
+	if got := si.lookup(keyOf(Str("a@x"))); len(got) != 1 {
+		t.Fatalf("index should hold the row after merge, got %v", got)
+	}
+	if n := len(tbl.dirtyPKs()); n != 0 {
+		t.Fatalf("dirty not drained after merge: %d", n)
+	}
+	if _, rows, _ := db.Query("SELECT id FROM users WHERE email = ?", "a@x"); len(rows) != 1 {
+		t.Fatal("row not found via index after merge")
+	}
+}
+
+// S4: merge reconciles updates and deletes against the live rows.
+func TestIndexMergeReconciles(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE users (id uuid primary key, email text, INDEX (email))")
+	a, b := NewUUIDv7(), NewUUIDv7()
+	db.Exec("INSERT INTO users (id, email) VALUES (?, ?)", a, "a@x")
+	db.Exec("INSERT INTO users (id, email) VALUES (?, ?)", b, "b@x")
+	db.mergeIndexes()
+	db.Exec("UPDATE users SET email = ? WHERE id = ?", "a2@x", a)
+	db.Exec("DELETE FROM users WHERE id = ?", b)
+	db.mergeIndexes()
+
+	tbl := db.cat.Load().byName["users"].table
+	si := tbl.indexFor(tbl.def.colByName["email"])
+	if len(si.lookup(keyOf(Str("a@x")))) != 0 {
+		t.Fatal("old email still in index after merge")
+	}
+	if len(si.lookup(keyOf(Str("a2@x")))) != 1 {
+		t.Fatal("updated email not in index after merge")
+	}
+	if len(si.lookup(keyOf(Str("b@x")))) != 0 {
+		t.Fatal("deleted row still in index after merge")
+	}
+	if n := len(tbl.dirtyPKs()); n != 0 {
+		t.Fatalf("dirty not drained: %d", n)
+	}
+}
+
 // S2: a non-unique index returns every matching row (bucket of PKs).
 func TestIndexNonUniqueBucket(t *testing.T) {
 	db := openEmpty(t)

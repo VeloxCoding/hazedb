@@ -388,6 +388,7 @@ func (t *table) txInsertLocked(row Row) {
 	s.rows = append(s.rows, row)
 	s.pk[pk] = rowID
 	s.live++
+	t.markDirtyLocked(s, pk)
 }
 
 // txReplaceLocked overwrites the row at pk with nr in place (PK + PartitionKey
@@ -400,6 +401,7 @@ func (t *table) txReplaceLocked(pk UUID, nr Row) {
 	}
 	s := t.shardOf(pk)
 	s.rows[s.pk[pk]] = nr
+	t.markDirtyLocked(s, pk)
 }
 
 // txDeleteLocked tombstones the row at pk and removes its index entry.
@@ -417,4 +419,5 @@ func (t *table) txDeleteLocked(pk UUID) {
 	s.rows[rowID] = nil
 	delete(s.pk, pk)
 	s.live--
+	t.markDirtyLocked(s, pk)
 }
