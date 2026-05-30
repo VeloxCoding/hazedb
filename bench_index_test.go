@@ -68,8 +68,7 @@ func BenchmarkIndexInsert_WithIndex(b *testing.B)    { benchIndexInsert(b, true)
 func BenchmarkIndexInsert_WithoutIndex(b *testing.B) { benchIndexInsert(b, false) }
 
 // Merge cost over a backlog of dirty rows (boot/rebuild-scale work).
-func BenchmarkIndexMerge_10k(b *testing.B) {
-	const n = 10000
+func benchIndexMerge(b *testing.B, n int) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
@@ -77,9 +76,9 @@ func BenchmarkIndexMerge_10k(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		db.Exec("CREATE TABLE t (id uuid primary key, email text, INDEX (email))")
+		db.Exec("CREATE TABLE t (id uuid primary key, name text, email text, INDEX (email), INDEX (name))")
 		for j := 0; j < n; j++ {
-			db.Exec("INSERT INTO t (id, email) VALUES (?, ?)", NewUUIDv7(), "u"+strconv.Itoa(j))
+			db.Exec("INSERT INTO t (id, name, email) VALUES (?, ?, ?)", NewUUIDv7(), "n"+strconv.Itoa(j%100), "u"+strconv.Itoa(j))
 		}
 		b.StartTimer()
 		db.mergeIndexes()
@@ -87,3 +86,6 @@ func BenchmarkIndexMerge_10k(b *testing.B) {
 		db.Close()
 	}
 }
+
+func BenchmarkIndexMerge_10k(b *testing.B) { benchIndexMerge(b, 10000) }
+func BenchmarkIndexMerge_50k(b *testing.B) { benchIndexMerge(b, 50000) }
