@@ -49,3 +49,7 @@ show('exec_arr', hazedb_exec_arr(
     [$id2, 'bob', 25]
 ));                                               // expect {"affected":1}
 echo 'exec_arr_read=', json_encode(hazedb_query_arr('SELECT name, age FROM users WHERE id = ?', $id2)), "\n";
+
+// hazedb_get: single row as a flat assoc array, null when absent.
+echo 'get=', json_encode(hazedb_get('SELECT name, age FROM users WHERE id = ?', $id)), "\n"; // expect {"name":"alice","age":30}
+echo 'get_missing=', (hazedb_get('SELECT name FROM users WHERE id = ?', make_uuid()) === null ? 'NULL' : 'NOTNULL'), "\n"; // expect NULL

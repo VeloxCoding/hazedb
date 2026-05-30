@@ -81,6 +81,22 @@ PHP_FUNCTION(hazedb_query_arr)
 	RETURN_NULL();
 }
 
+PHP_FUNCTION(hazedb_get)
+{
+    zend_string *sql = NULL;
+    zend_string *id = NULL;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STR(sql)
+        Z_PARAM_STR(id)
+    ZEND_PARSE_PARAMETERS_END();
+    zend_array *result = go_hazedb_get(sql, id);
+    if (result) {
+        RETURN_ARR(result);
+    }
+
+	RETURN_NULL();
+}
+
 PHP_FUNCTION(hazedb_exec_arr)
 {
     zend_string *sql = NULL;

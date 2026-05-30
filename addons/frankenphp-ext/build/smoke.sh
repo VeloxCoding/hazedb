@@ -37,6 +37,8 @@ MSYS_NO_PATHCONV=1 docker run --rm \
             && echo "$OUT" | grep -q "^query_arr={\"columns\":\[\"name\",\"age\"\],\"rows\":\[\[\"alice\",30\]\]}" \
             && echo "$OUT" | grep -q "^exec_arr={\"affected\":1}" \
             && echo "$OUT" | grep -q "^exec_arr_read={\"columns\":\[\"name\",\"age\"\],\"rows\":\[\[\"bob\",25\]\]}" \
+            && echo "$OUT" | grep -q "^get={\"name\":\"alice\",\"age\":30}" \
+            && echo "$OUT" | grep -q "^get_missing=NULL" \
             && { echo "SMOKE: PASS"; exit 0; }
         echo "SMOKE: FAIL"; exit 1
     '

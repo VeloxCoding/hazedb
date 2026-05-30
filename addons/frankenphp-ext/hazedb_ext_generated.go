@@ -38,6 +38,11 @@ func go_hazedb_query_arr(sql *C.zend_string, argsStr *C.zend_string) unsafe.Poin
 	return hazedb_query_arr(sql, argsStr)
 }
 
+//export go_hazedb_get
+func go_hazedb_get(sql *C.zend_string, idStr *C.zend_string) unsafe.Pointer {
+	return hazedb_get(sql, idStr)
+}
+
 //export go_hazedb_exec_arr
 func go_hazedb_exec_arr(sql *C.zend_string, args *C.zend_array) unsafe.Pointer {
 	return hazedb_exec_arr(sql, args)

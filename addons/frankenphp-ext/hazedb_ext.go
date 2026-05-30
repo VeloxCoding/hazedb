@@ -29,6 +29,11 @@
 //	    of a JSON string — no json_encode / json.Decode. Read straight into typed
 //	    Values and applied via db.ExecValues.
 //
+//	hazedb_get(string $sql, string $id): ?array
+//	    Point-read fast path: one row as a flat assoc array ['col'=>val,...] via
+//	    db.QueryRow, or null if no row. Cheaper than hazedb_query_arr for
+//	    WHERE id = ? (one array, no envelope).
+//
 //	hazedb_ping(): string
 //	    Liveness probe for the extension itself: "pong" if a Caddy module has
 //	    registered a DB under "default", "pong (no db)" otherwise. Takes no
@@ -77,6 +82,23 @@ static void hzd_push_arr(zend_array *a, zend_array *child) {
 }
 static void hzd_set_arr(zend_array *a, const char *key, size_t klen, zend_array *child) {
     zval z; ZVAL_ARR(&z, child); zend_hash_str_update(a, key, klen, &z);
+}
+
+// keyed scalar setters: build a flat associative row (column name -> value),
+// for hazedb_get's single-row ['col'=>val,...] shape.
+static void hzd_set_long(zend_array *a, const char *k, size_t kl, zend_long v) {
+    zval z; ZVAL_LONG(&z, v); zend_hash_str_update(a, k, kl, &z);
+}
+static void hzd_set_bool(zend_array *a, const char *k, size_t kl, int b) {
+    zval z; ZVAL_BOOL(&z, b); zend_hash_str_update(a, k, kl, &z);
+}
+static void hzd_set_null(zend_array *a, const char *k, size_t kl) {
+    zval z; ZVAL_NULL(&z); zend_hash_str_update(a, k, kl, &z);
+}
+static void hzd_set_strn(zend_array *a, const char *k, size_t kl, const char *s, size_t n) {
+    zval z;
+    if (n == 0) { ZVAL_EMPTY_STRING(&z); } else { ZVAL_STRINGL(&z, s, n); }
+    zend_hash_str_update(a, k, kl, &z);
 }
 
 // --- array readers (PHP zend_array -> Go), for the args-in direction. ---
@@ -268,6 +290,75 @@ func hazedb_query_arr(sql *C.zend_string, argsStr *C.zend_string) unsafe.Pointer
 	}
 	setArr(env, "rows", rowsArr)
 	return unsafe.Pointer(env)
+}
+
+// setStr stores a Go string under a key (handles the empty case so
+// unsafe.StringData(nil) is never deref'd).
+func setStr(a *C.zend_array, kp *C.char, kl C.size_t, s string) {
+	var p *C.char
+	if len(s) > 0 {
+		p = (*C.char)(unsafe.Pointer(unsafe.StringData(s)))
+	}
+	C.hzd_set_strn(a, kp, kl, p, C.size_t(len(s)))
+}
+
+// setCell stores one cell under its column-name key (the assoc-row shape).
+func setCell(a *C.zend_array, key string, v hazedb.Value) {
+	kp := (*C.char)(unsafe.Pointer(unsafe.StringData(key)))
+	kl := C.size_t(len(key))
+	switch v.Kind {
+	case hazedb.KindNull:
+		C.hzd_set_null(a, kp, kl)
+	case hazedb.KindInt:
+		C.hzd_set_long(a, kp, kl, C.zend_long(v.Int()))
+	case hazedb.KindBool:
+		b := C.int(0)
+		if v.Bool() {
+			b = 1
+		}
+		C.hzd_set_bool(a, kp, kl, b)
+	case hazedb.KindString:
+		setStr(a, kp, kl, v.Str())
+	case hazedb.KindUUID:
+		setStr(a, kp, kl, v.UUID().String())
+	case hazedb.KindBytes:
+		bs := v.Bytes()
+		var p *C.char
+		if len(bs) > 0 {
+			p = (*C.char)(unsafe.Pointer(&bs[0]))
+		}
+		C.hzd_set_strn(a, kp, kl, p, C.size_t(len(bs)))
+	default:
+		C.hzd_set_null(a, kp, kl)
+	}
+}
+
+// hazedb_get is the point-read fast path: it returns a single row as one flat
+// associative PHP array (['col'=>val,...]) via db.QueryRow, or null if there is
+// no matching row / no DB / error. Cheaper than hazedb_query_arr for the common
+// WHERE id = ? read — it builds one array with keyed cells instead of the
+// {columns, rows} envelope (no nested row arrays, no separate columns array).
+// $id is the same string form as hazedb_query (direct UUID or JSON array).
+//
+// export_php:function hazedb_get(string $sql, string $id): ?array
+func hazedb_get(sql *C.zend_string, idStr *C.zend_string) unsafe.Pointer {
+	db := defaultSlot.Load()
+	if db == nil {
+		return nil
+	}
+	args, err := hazedb.QueryArgs(zendStringView(idStr))
+	if err != nil {
+		return nil
+	}
+	cols, row, err := db.QueryRow(zendStringView(sql), args...)
+	if err != nil || row == nil {
+		return nil
+	}
+	a := C.hzd_arr_new(C.uint32_t(len(cols)))
+	for i, c := range cols {
+		setCell(a, c, row[i])
+	}
+	return unsafe.Pointer(a)
 }
 
 // hazedb_exec_arr is hazedb_exec that takes a native PHP array of positional

@@ -17,6 +17,8 @@ function hazedb_exec(string $sql, string $args): ?string {}
 
 function hazedb_query_arr(string $sql, string $args): ?array {}
 
+function hazedb_get(string $sql, string $id): ?array {}
+
 function hazedb_exec_arr(string $sql, array $args): ?string {}
 
 function hazedb_ping(): string {}

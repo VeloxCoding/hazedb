@@ -54,7 +54,7 @@ for ($i = 0; $i < $iters; $i++) {
 }
 $decDt = microtime(true) - $t0;
 
-// --- measure C: hazedb_query_arr — native PHP array, no JSON encode/decode ---
+// --- measure C: hazedb_query_arr — native PHP array (envelope), no JSON ---
 for ($i = 0; $i < 50000; $i++) { hazedb_query_arr('SELECT name, age FROM users WHERE id = ?', $ids[$i % $N]); }
 $t0 = microtime(true);
 for ($i = 0; $i < $iters; $i++) {
@@ -62,8 +62,17 @@ for ($i = 0; $i < $iters; $i++) {
 }
 $arrDt = microtime(true) - $t0;
 
+// --- measure D: hazedb_get — single flat assoc array (point-read fast path) ---
+for ($i = 0; $i < 50000; $i++) { hazedb_get('SELECT name, age FROM users WHERE id = ?', $ids[$i % $N]); }
+$t0 = microtime(true);
+for ($i = 0; $i < $iters; $i++) {
+    $r = hazedb_get('SELECT name, age FROM users WHERE id = ?', $ids[$i % $N]);
+}
+$getDt = microtime(true) - $t0;
+
 printf("rows=%d iters=%d\n", $N, $iters);
 printf("RAW (json string, no decode) : time=%.3fs  qps=%d  ns/op=%.0f\n", $rawDt, (int)($iters / $rawDt), $rawDt * 1e9 / $iters);
 printf("DECODE (json + json_decode)  : time=%.3fs  qps=%d  ns/op=%.0f\n", $decDt, (int)($iters / $decDt), $decDt * 1e9 / $iters);
 printf("ARR (hazedb_query_arr)       : time=%.3fs  qps=%d  ns/op=%.0f\n", $arrDt, (int)($iters / $arrDt), $arrDt * 1e9 / $iters);
-printf("ARR vs DECODE: %.2fx faster, saves %.0f ns/op\n", $decDt / $arrDt, ($decDt - $arrDt) * 1e9 / $iters);
+printf("GET (hazedb_get assoc row)   : time=%.3fs  qps=%d  ns/op=%.0f\n", $getDt, (int)($iters / $getDt), $getDt * 1e9 / $iters);
+printf("GET vs DECODE: %.2fx faster | GET vs ARR: %.2fx faster\n", $decDt / $getDt, $arrDt / $getDt);
