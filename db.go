@@ -58,6 +58,12 @@ type DB struct {
 	// catalog has changed since (CREATE/DROP), so a plan never points at a
 	// stale table.
 	stmtCache sync.Map
+
+	// mergeStop/mergeDone drive the background secondary-index merger (nil when
+	// the merge loop is disabled). Closing mergeStop runs a final drain and the
+	// goroutine then closes mergeDone. See docs/secondary-indexes.md.
+	mergeStop chan struct{}
+	mergeDone chan struct{}
 }
 
 // Options control Open behaviour.
@@ -88,6 +94,12 @@ type Options struct {
 	// under the WAL lock. Strongest durability (no acknowledged-loss window),
 	// highest per-write cost. Overrides the ticker's sync cadence.
 	WALSyncPerWrite bool
+
+	// IndexMergeInterval is how often the background goroutine reconciles
+	// secondary indexes with the dirty rows. Zero selects a default (50ms); a
+	// negative value disables the goroutine (manual merge only — used by tests
+	// that assert pre-merge state). Cheap when no table has an index.
+	IndexMergeInterval time.Duration
 }
 
 // Open prepares the database. If WALPath is non-empty, the file is
@@ -132,11 +144,20 @@ func Open(opts Options) (*DB, error) {
 		w.startTicker(flushInterval)
 		db.wal = w
 	}
+	mergeInterval := opts.IndexMergeInterval
+	if mergeInterval == 0 {
+		mergeInterval = 50 * time.Millisecond
+	}
+	if mergeInterval > 0 {
+		db.startMergeLoop(mergeInterval)
+	}
 	return db, nil
 }
 
-// Close flushes and closes the WAL. Memory-only DBs return nil.
+// Close stops the index merger (with a final drain), then flushes and closes
+// the WAL. Memory-only DBs still stop the merger.
 func (db *DB) Close() error {
+	db.stopMergeLoop()
 	if db.wal != nil {
 		return db.wal.close()
 	}

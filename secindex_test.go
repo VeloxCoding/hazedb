@@ -2,7 +2,9 @@ package hazedb
 
 import (
 	"strconv"
+	"sync"
 	"testing"
+	"time"
 )
 
 // S2: a WHERE on an indexed column plans as an index lookup and returns the
@@ -155,6 +157,88 @@ func TestIndexMergeReconciles(t *testing.T) {
 	}
 	if n := len(tbl.dirtyPKs()); n != 0 {
 		t.Fatalf("dirty not drained: %d", n)
+	}
+}
+
+// S5: the golden invariant under concurrent writers, readers, and the
+// background merger. Run with -race. Two checks: (1) live — an index query never
+// returns a row that does not actually match (no false positive; the hybrid
+// re-check guarantees this); (2) quiescent — after writers stop and a drain,
+// the index query result equals a brute-force full scan for every value (no
+// false negative).
+func TestIndexConcurrentInvariant(t *testing.T) {
+	db, err := Open(Options{Schema: Schema{}, IndexMergeInterval: 2 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec("CREATE TABLE users (id uuid primary key, grp int, email text, INDEX (grp))")
+	const N, groups = 200, 10
+	ids := make([]UUID, N)
+	for i := range ids {
+		ids[i] = NewUUIDv7()
+		db.Exec("INSERT INTO users (id, grp, email) VALUES (?, ?, ?)", ids[i], i%groups, "e")
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for w := 0; w < 4; w++ { // writers churn grp values
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			r := seed
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				db.Exec("UPDATE users SET grp = ? WHERE id = ?", r%groups, ids[r%N])
+				r += 7
+			}
+		}(w)
+	}
+	for rd := 0; rd < 4; rd++ { // readers assert no false positive
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for k := 0; k < 3000; k++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				v := k % groups
+				_, rows, err := db.Query("SELECT grp FROM users WHERE grp = ?", v)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				for _, row := range rows {
+					if row[0].Int() != int64(v) {
+						t.Errorf("false positive: index query grp=%d returned a row with grp=%d", v, row[0].Int())
+						return
+					}
+				}
+			}
+		}()
+	}
+	time.Sleep(150 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	// Quiescent consistency: drain, then index query == brute-force scan.
+	db.mergeIndexes()
+	_, all, _ := db.Query("SELECT id, grp FROM users") // no WHERE -> full scan
+	want := make(map[int64]int)
+	for _, r := range all {
+		want[r[1].Int()]++
+	}
+	for v := int64(0); v < groups; v++ {
+		_, idxRows, _ := db.Query("SELECT id FROM users WHERE grp = ?", v)
+		if len(idxRows) != want[v] {
+			t.Errorf("grp=%d: index returned %d rows, full scan expects %d", v, len(idxRows), want[v])
+		}
 	}
 }
 

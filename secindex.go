@@ -1,6 +1,9 @@
 package hazedb
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // Secondary indexes — optional value->PK lookup structures on a non-PK column,
 // declared in DDL (INDEX (col)). See docs/secondary-indexes.md for the full
@@ -160,8 +163,41 @@ func (t *table) idxApply(pk UUID, newRow Row) {
 	}
 }
 
+// startMergeLoop launches the background merger: every interval it reconciles
+// all indexed tables. Mirrors the WAL flush ticker. Started by Open; stopped by
+// Close (which runs a final drain first).
+func (db *DB) startMergeLoop(interval time.Duration) {
+	db.mergeStop = make(chan struct{})
+	db.mergeDone = make(chan struct{})
+	go func() {
+		defer close(db.mergeDone)
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-db.mergeStop:
+				db.mergeIndexes() // final drain so a clean Close leaves no lag
+				return
+			case <-t.C:
+				db.mergeIndexes()
+			}
+		}
+	}()
+}
+
+// stopMergeLoop signals the merger to drain once and exit, then waits for it.
+// Idempotent; safe on a DB whose loop was never started.
+func (db *DB) stopMergeLoop() {
+	if db.mergeStop == nil {
+		return
+	}
+	close(db.mergeStop)
+	<-db.mergeDone
+	db.mergeStop = nil
+}
+
 // mergeIndexes reconciles every indexed table in the current catalog. The
-// explicit trigger (S4); a background goroutine drives it in S5.
+// explicit trigger (S4); the background loop (S5) drives it on a ticker.
 func (db *DB) mergeIndexes() {
 	cat := db.cat.Load()
 	for _, rt := range cat.byID {
@@ -201,6 +237,8 @@ func (t *table) mergeIndexes() {
 	if len(t.indexes) == 0 {
 		return
 	}
+	t.mergeMu.Lock()
+	defer t.mergeMu.Unlock()
 	for i := range t.shards {
 		s := &t.shards[i]
 		s.mu.RLock()

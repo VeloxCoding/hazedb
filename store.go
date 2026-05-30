@@ -36,6 +36,10 @@ type table struct {
 	// none). Maintained per docs/secondary-indexes.md; only non-partitioned
 	// tables may declare them (enforced in resolveSchema).
 	indexes []*secIndex
+	// mergeMu serialises mergeIndexes so two concurrent merges (e.g. the
+	// background ticker and an explicit drain) never both reslice a shard's
+	// dirty list. Only mergers take it; reads/writes never do.
+	mergeMu sync.Mutex
 	// pkDir is the table-wide PK→location directory for PARTITIONED tables
 	// (nil otherwise). Partitioned shards route by PartitionKey value, so the
 	// per-shard pk map can't enforce table-wide PK uniqueness or answer
