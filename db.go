@@ -3,6 +3,7 @@ package hazedb
 import (
 	"encoding/binary"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -259,12 +260,20 @@ func (db *DB) queryRowPlan(pl *plan, args []any) ([]string, Row, error) {
 // prepare returns a plan bound against cat. A cached plan is reused only if it
 // was bound against the same catalog version; otherwise it is re-parsed and
 // re-bound so it never references a table that has since changed.
+//
+// sql may be a non-owned view (e.g. the PHP extension aliasing zend_string
+// memory): the cache lookup only hashes/compares it and never retains it, so a
+// hit copies nothing. On a miss we clone it before parsing, because the AST
+// slices the SQL for identifiers and integer literals and the cache stores it
+// as a permanent key — both must own their bytes. Net effect: callers pass a
+// view and pay the copy only once per unique statement, not per call.
 func (db *DB) prepare(sql string, cat *catalog) (*plan, error) {
 	if cached, ok := db.stmtCache.Load(sql); ok {
 		if pl := cached.(*plan); pl.catVersion == cat.version {
 			return pl, nil
 		}
 	}
+	sql = strings.Clone(sql)
 	st, err := parseSQL(sql)
 	if err != nil {
 		return nil, err
