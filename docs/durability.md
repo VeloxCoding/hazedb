@@ -1,6 +1,8 @@
 # Durability — WAL buffer, SQLite system-of-record, in-memory serving copy
 
-**Status: proposed** (design note — nothing below is implemented yet).
+**Status: implemented** (opt-in; WAL segments + SQLite mirror + reclaim +
+SQLite-backed recovery all shipped and tested). The memory budget (§3) remains
+the one open piece.
 
 This note records the agreed durability design: keep hazedb's in-memory engine
 as the hot serving layer, batch the existing WAL into an **on-disk SQLite file**
@@ -8,6 +10,48 @@ that holds current state, and make recovery a single unified path. It answers
 three open gaps at once — *how big may the dataset get*, *how do we stop the WAL
 growing forever*, and *how do we recover quickly* — without putting disk on the
 hot write path.
+
+## As built (and where it refined the proposal)
+
+The drain is keyed on **WAL segment rotation**, not the byte-offset / dirty-set
+mechanics first sketched in §4 below. Two reasons the segment approach won:
+
+- The dirty-set is owned by the secondary-index merger, which **clears it every
+  ~50ms** — a 60s drainer cannot reuse it. Reading sealed segments sidesteps that.
+- A drainer only ever touches **sealed** (closed) segments, never the open one,
+  so the "don't read a file being appended to" question disappears by construction.
+
+What shipped (all opt-in via `Options`):
+
+- **Segmented WAL** (`WALRotateInterval`, default 5s when draining): `WALPath`
+  becomes a directory of `seg-<n>.wal` files plus one active segment. A ticker
+  seals the active segment and opens the next, between records, under the WAL
+  lock — so a rotation never splits a record or a transaction. Single-file mode
+  (the default) is unchanged. See [wal_segment.go](../wal_segment.go).
+- **SQLite mirror** (`SQLitePath`, `DrainInterval` default 60s,
+  `SegmentDrainMinAge` default 5s): a background loop replays each sealed segment
+  **faithfully** (one SQLite transaction per segment; INSERT/UPDATE/DELETE in WAL
+  order — *not* coalesced), recording the segment number in the same transaction
+  (`_hz_meta.last_drained_segment`), then **deletes the segment**. So the WAL
+  stays bounded at ~the undrained tail. Driver: `modernc.org/sqlite` (pure Go).
+  See [drain.go](../drain.go).
+- **Recovery** = load current state from SQLite (reconciling the catalog with
+  runtime-created tables via `_hz_tables`), then replay only segments past the
+  drained cursor on top. Boot and crash recovery are the same path. See
+  [recover_sqlite.go](../recover_sqlite.go).
+
+Measured (AMD Ryzen AI MAX+ 395, 32 threads, `golang:1.25`):
+
+| | result |
+| --- | --- |
+| insert, single-file WAL | ~320 ns/op |
+| insert, segmented WAL (5s rotate) | ~330 ns/op — rotation is off the write path |
+| drain throughput (one txn/segment, pure-Go SQLite) | ~203k rows/s |
+
+The drain runs faithful per-record replay; coalescing (§4) stays a future lever
+if drain throughput ever binds. The ~203k rows/s pure-Go rate vs the ~528k/s
+native-C rate measured earlier is the modernc-vs-cgo trade — at the 60s cadence
+there is ample headroom either way.
 
 It builds on two pieces that already exist and are tested: the typed-mutation
 **WAL** ([wal.go](../wal.go), fsync modes `WALSync` / `WALSyncPerWrite` in
