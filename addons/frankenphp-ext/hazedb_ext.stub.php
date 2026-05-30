@@ -11,15 +11,13 @@
 // You may edit the file and remove this comment if you plan to manually maintain
 // this file going forward.
 
-function hazedb_query(string $sql, string $args): ?string {}
+function hazedb_fetch(string $sql, mixed $args = null): ?array {}
 
-function hazedb_exec(string $sql, string $args): ?string {}
+function hazedb_fetchall(string $sql, mixed $args = null): ?array {}
 
-function hazedb_query_arr(string $sql, string $args): ?array {}
+function hazedb_fetchall_json(string $sql, mixed $args = null): ?string {}
 
-function hazedb_get(string $sql, string $id): ?array {}
-
-function hazedb_exec_arr(string $sql, array $args): ?string {}
+function hazedb_exec(string $sql, mixed $args = null): int {}
 
 function hazedb_ping(): string {}
 

@@ -33,15 +33,50 @@ zend_module_entry hazedb_ext_module_entry = {STANDARD_MODULE_HEADER,
                                          NULL,                      /* MINFO */
                                          "1.0.0",                   /* Version */
                                          STANDARD_MODULE_PROPERTIES};
-PHP_FUNCTION(hazedb_query)
+PHP_FUNCTION(hazedb_fetch)
 {
     zend_string *sql = NULL;
-    zend_string *args = NULL;
-    ZEND_PARSE_PARAMETERS_START(2, 2)
+    zval *args = NULL;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
         Z_PARAM_STR(sql)
-        Z_PARAM_STR(args)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ZVAL(args)
     ZEND_PARSE_PARAMETERS_END();
-    zend_string *result = go_hazedb_query(sql, args);
+    zend_array *result = go_hazedb_fetch(sql, args);
+    if (result) {
+        RETURN_ARR(result);
+    }
+
+	RETURN_NULL();
+}
+
+PHP_FUNCTION(hazedb_fetchall)
+{
+    zend_string *sql = NULL;
+    zval *args = NULL;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_STR(sql)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ZVAL(args)
+    ZEND_PARSE_PARAMETERS_END();
+    zend_array *result = go_hazedb_fetchall(sql, args);
+    if (result) {
+        RETURN_ARR(result);
+    }
+
+	RETURN_NULL();
+}
+
+PHP_FUNCTION(hazedb_fetchall_json)
+{
+    zend_string *sql = NULL;
+    zval *args = NULL;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_STR(sql)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ZVAL(args)
+    ZEND_PARSE_PARAMETERS_END();
+    zend_string *result = go_hazedb_fetchall_json(sql, args);
     if (result) {
         RETURN_STR(result);
     }
@@ -52,65 +87,14 @@ PHP_FUNCTION(hazedb_query)
 PHP_FUNCTION(hazedb_exec)
 {
     zend_string *sql = NULL;
-    zend_string *args = NULL;
-    ZEND_PARSE_PARAMETERS_START(2, 2)
+    zval *args = NULL;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
         Z_PARAM_STR(sql)
-        Z_PARAM_STR(args)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ZVAL(args)
     ZEND_PARSE_PARAMETERS_END();
-    zend_string *result = go_hazedb_exec(sql, args);
-    if (result) {
-        RETURN_STR(result);
-    }
-
-	RETURN_NULL();
-}
-
-PHP_FUNCTION(hazedb_query_arr)
-{
-    zend_string *sql = NULL;
-    zend_string *args = NULL;
-    ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_STR(sql)
-        Z_PARAM_STR(args)
-    ZEND_PARSE_PARAMETERS_END();
-    zend_array *result = go_hazedb_query_arr(sql, args);
-    if (result) {
-        RETURN_ARR(result);
-    }
-
-	RETURN_NULL();
-}
-
-PHP_FUNCTION(hazedb_get)
-{
-    zend_string *sql = NULL;
-    zend_string *id = NULL;
-    ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_STR(sql)
-        Z_PARAM_STR(id)
-    ZEND_PARSE_PARAMETERS_END();
-    zend_array *result = go_hazedb_get(sql, id);
-    if (result) {
-        RETURN_ARR(result);
-    }
-
-	RETURN_NULL();
-}
-
-PHP_FUNCTION(hazedb_exec_arr)
-{
-    zend_string *sql = NULL;
-    zend_array *args = NULL;
-    ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_STR(sql)
-        Z_PARAM_ARRAY_HT(args)
-    ZEND_PARSE_PARAMETERS_END();
-    zend_string *result = go_hazedb_exec_arr(sql, args);
-    if (result) {
-        RETURN_STR(result);
-    }
-
-	RETURN_NULL();
+    long result = go_hazedb_exec(sql, args);
+    RETURN_LONG(result);
 }
 
 PHP_FUNCTION(hazedb_ping)

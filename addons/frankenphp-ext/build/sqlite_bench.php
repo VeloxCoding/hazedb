@@ -1,6 +1,6 @@
 <?php
 // sqlite_bench.php — baseline: how many point-reads/sec PHP can do against an
-// in-memory SQLite (:memory:) database, mirroring the hazedb_query bench as
+// in-memory SQLite (:memory:) database, mirroring the hazedb_fetch bench as
 // closely as possible:
 //   - same logical table: users(id, name, age), id is the PK (TEXT — SQLite has
 //     no uuid type, so the canonical UUID string is stored, as hazedb accepts)
@@ -16,7 +16,7 @@
 //   PREPARE_EACH   : $pdo->prepare() inside the loop — what naive PHP code does.
 //
 // Result is fetched into a PHP array (PDO::FETCH_NUM) — i.e. usable data, the
-// fair equivalent of hazedb_query + json_decode (not the raw-JSON-string path).
+// fair equivalent of hazedb_fetch (a usable assoc row).
 
 $N     = (int)($argv[1] ?? 10000);
 $iters = (int)($argv[2] ?? 1000000);

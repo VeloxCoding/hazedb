@@ -5,48 +5,43 @@
 // "default" during Provision; defaultSlot here Loads it per call. A Caddy
 // config reload swaps the slot atomically — nothing to invalidate here.
 //
+// The surface mirrors PDO's vocabulary. $args takes either a native PHP array
+// of positional params ([$a, $b], like PDOStatement::execute) OR, for a single
+// param, the bare scalar ($id) — the scalar form is the fast path (one zval, no
+// array build/iteration). It is optional (default null = no args). No JSON
+// crosses the boundary either way; result rows come back as native PHP arrays
+// (assoc, keyed by column name) built via zval trampolines.
+//
 // PHP functions:
 //
-//	hazedb_query(string $sql, string $args): ?string
-//	    Run a SELECT. Returns {"columns":[...],"rows":[[...],...]} as a JSON
-//	    string, {"error":"..."} on a SQL error, or PHP null if no Caddy module
-//	    has registered a DB. $args (see QueryArgs): "" = none; a value starting
-//	    with '[' = a JSON array (multi-arg / typed); anything else = ONE arg
-//	    passed directly (a UUID string you already have → no json_encode).
+//	hazedb_fetch(string $sql, mixed $args = null): ?array
+//	    One row as a flat assoc array ['col'=>val,...] (≈ PDOStatement::fetch).
+//	    null if there is no matching row, no DB, or an error.
 //
-//	hazedb_exec(string $sql, string $args): ?string
-//	    Run INSERT / UPDATE / DELETE / CREATE TABLE / DROP TABLE — the write
-//	    path (this is the "insert" function, generalised). Same $args rule.
-//	    Returns {"affected":N}, an error envelope, or null (no DB).
+//	hazedb_fetchall(string $sql, mixed $args = null): ?array
+//	    All rows as a list of assoc arrays [['col'=>val,...],...]
+//	    (≈ fetchAll(PDO::FETCH_ASSOC)). Empty result = []; null on error / no DB.
 //
-//	hazedb_query_arr(string $sql, string $args): ?array
-//	    Like hazedb_query but returns a native PHP array (['columns'=>[...],
-//	    'rows'=>[[...]]]) built directly via zval trampolines — no JSON encode,
-//	    no PHP json_decode. null on no DB / query error.
+//	hazedb_fetchall_json(string $sql, mixed $args = null): ?string
+//	    Same data as hazedb_fetchall, returned as a JSON string [{...},...] for
+//	    pass-through (forward to an HTTP response / cache) with no PHP decode.
+//	    null on error / no DB.
 //
-//	hazedb_exec_arr(string $sql, array $args): ?string
-//	    Like hazedb_exec but takes a native PHP array of positional args instead
-//	    of a JSON string — no json_encode / json.Decode. Read straight into typed
-//	    Values and applied via db.ExecValues.
-//
-//	hazedb_get(string $sql, string $id): ?array
-//	    Point-read fast path: one row as a flat assoc array ['col'=>val,...] via
-//	    db.QueryRow, or null if no row. Cheaper than hazedb_query_arr for
-//	    WHERE id = ? (one array, no envelope).
+//	hazedb_exec(string $sql, mixed $args = null): int
+//	    INSERT / UPDATE / DELETE / CREATE TABLE / DROP TABLE. Returns the
+//	    affected row count (≈ PDOStatement::rowCount), or -1 on error / no DB.
 //
 //	hazedb_ping(): string
-//	    Liveness probe for the extension itself: "pong" if a Caddy module has
-//	    registered a DB under "default", "pong (no db)" otherwise. Takes no
-//	    args, never null — the minimal end-to-end check that the cgo bridge and
-//	    the shared-DB slot are wired up.
+//	    Liveness probe: "pong" if a Caddy module registered a DB under "default",
+//	    "pong (no db)" otherwise. Never null.
 //
-// cgo lifetime contract (see addons/frankenphp-ext/build/README.md pitfall #8):
-//   - Both sql and args_json are passed as zero-copy views: each function reads
-//     them synchronously while the PHP-arena memory is still valid. db.prepare
-//     clones the SQL itself on a cache miss (the only time it is retained), so
-//     the hot cache-hit path copies nothing — see db.prepare's contract.
-//   - response bytes are copied into a PHP-owned zend_string by
-//     phpStringFromBytes before returning.
+// cgo lifetime contract (see addons/frankenphp-ext/build/README.md pitfalls):
+//   - sql is a zero-copy view; db.prepare clones it on a cache miss (the only
+//     time it is retained), so the hot cache-hit path copies nothing.
+//   - string args are copied out of the zval (C.GoStringN) before being stored,
+//     so nothing aliases PHP-arena memory.
+//   - result strings/arrays are PHP-owned (zend_string_init / the zval
+//     trampolines copy into the request heap).
 
 package hazedb_ext
 
@@ -56,36 +51,15 @@ package hazedb_ext
 #include <Zend/zend_hash.h>
 #include <Zend/zend_types.h>
 
-// --- zval trampolines: cgo cannot call the ZVAL_ and zend_hash_ macros
-// directly, so wrap them as static-inline C (build/README.md pitfall #5). These
-// build a PHP array result straight from Go rows, so PHP gets a native array
-// with no JSON encode (Go) and no json_decode (PHP).
+// zval trampolines: cgo cannot call the ZVAL_ and zend_hash_ macros directly,
+// so wrap them as static-inline C (build/README.md pitfall #5).
 
+// --- build a PHP array result (Go rows -> PHP) ---
 static zend_array *hzd_arr_new(uint32_t n) { return zend_new_array(n); }
-
-static void hzd_push_long(zend_array *a, zend_long v) {
-    zval z; ZVAL_LONG(&z, v); zend_hash_next_index_insert(a, &z);
-}
-static void hzd_push_bool(zend_array *a, int b) {
-    zval z; ZVAL_BOOL(&z, b); zend_hash_next_index_insert(a, &z);
-}
-static void hzd_push_null(zend_array *a) {
-    zval z; ZVAL_NULL(&z); zend_hash_next_index_insert(a, &z);
-}
-static void hzd_push_strn(zend_array *a, const char *s, size_t n) {
-    zval z;
-    if (n == 0) { ZVAL_EMPTY_STRING(&z); } else { ZVAL_STRINGL(&z, s, n); }
-    zend_hash_next_index_insert(a, &z);
-}
 static void hzd_push_arr(zend_array *a, zend_array *child) {
     zval z; ZVAL_ARR(&z, child); zend_hash_next_index_insert(a, &z);
 }
-static void hzd_set_arr(zend_array *a, const char *key, size_t klen, zend_array *child) {
-    zval z; ZVAL_ARR(&z, child); zend_hash_str_update(a, key, klen, &z);
-}
-
-// keyed scalar setters: build a flat associative row (column name -> value),
-// for hazedb_get's single-row ['col'=>val,...] shape.
+// keyed scalar setters: build a flat assoc row (column name -> value)
 static void hzd_set_long(zend_array *a, const char *k, size_t kl, zend_long v) {
     zval z; ZVAL_LONG(&z, v); zend_hash_str_update(a, k, kl, &z);
 }
@@ -101,13 +75,12 @@ static void hzd_set_strn(zend_array *a, const char *k, size_t kl, const char *s,
     zend_hash_str_update(a, k, kl, &z);
 }
 
-// --- array readers (PHP zend_array -> Go), for the args-in direction. ---
+// --- read a PHP array of args (PHP -> Go) ---
 static uint32_t hzd_arr_count(zend_array *a) { return zend_hash_num_elements(a); }
 static zval *hzd_arr_get(zend_array *a, uint32_t i) { return zend_hash_index_find(a, i); }
-
-// hzd_zval_kind normalises the zval type to a small stable code we switch on in
-// Go (avoids depending on cgo exposing the IS_* macros):
-//   0 null  1 false  2 true  3 long  4 string  5 double  6 other
+// hzd_zval_kind normalises the zval type to a small stable code (avoids
+// depending on cgo exposing the IS_* macros):
+//   0 null  1 false  2 true  3 long  4 string  5 double  6 other  7 array
 static int hzd_zval_kind(zval *z) {
     switch (Z_TYPE_P(z)) {
         case IS_NULL:   return 0;
@@ -116,12 +89,14 @@ static int hzd_zval_kind(zval *z) {
         case IS_LONG:   return 3;
         case IS_STRING: return 4;
         case IS_DOUBLE: return 5;
+        case IS_ARRAY:  return 7;
         default:        return 6;
     }
 }
 static zend_long hzd_zval_long(zval *z) { return Z_LVAL_P(z); }
 static const char *hzd_zval_strptr(zval *z) { return Z_STRVAL_P(z); }
 static size_t hzd_zval_strlen(zval *z) { return Z_STRLEN_P(z); }
+static zend_array *hzd_zval_arr(zval *z) { return Z_ARRVAL_P(z); }
 */
 import "C"
 
@@ -132,7 +107,7 @@ import (
 
 	// Blank import so a single `xcaddy --with .../frankenphp-ext` also pulls in
 	// the Caddy HTTP handler module — one flag yields the full bundle (PHP cgo
-	// functions + the /query and /exec HTTP endpoints, sharing one *DB).
+	// functions + the HTTP endpoints, sharing one *DB).
 	_ "github.com/VeloxCoding/hazedb/caddymodule"
 )
 
@@ -142,9 +117,8 @@ import (
 var defaultSlot = hazedb.LookupDBSlot("default")
 
 // zendStringView returns a zero-copy Go string aliasing a zend_string's bytes.
-// Valid only for the duration of the calling PHP function — read paths only.
-// The SQL string is safe to pass as a view because db.prepare clones it on a
-// cache miss before retaining it (the cache-hit path never retains it).
+// Valid only for the duration of the calling PHP function. Safe for the SQL
+// string because db.prepare clones it on a cache miss before retaining it.
 func zendStringView(s *C.zend_string) string {
 	if s == nil {
 		return ""
@@ -165,131 +139,70 @@ func phpStringFromBytes(b []byte) unsafe.Pointer {
 	))
 }
 
-// hazedb_query runs a SELECT and returns the rows envelope as a JSON string.
-//
-// export_php:function hazedb_query(string $sql, string $args): ?string
-func hazedb_query(sql *C.zend_string, argsJSON *C.zend_string) unsafe.Pointer {
-	db := defaultSlot.Load()
-	if db == nil {
-		return nil
-	}
-	args, err := hazedb.QueryArgs(zendStringView(argsJSON))
-	if err != nil {
-		return phpStringFromBytes(hazedb.ErrorJSON(err.Error()))
-	}
-	cols, rows, err := db.Query(zendStringView(sql), args...)
-	if err != nil {
-		return phpStringFromBytes(hazedb.ErrorJSON(err.Error()))
-	}
-	body, err := hazedb.RowsToJSON(cols, rows)
-	if err != nil {
-		return phpStringFromBytes(hazedb.ErrorJSON(err.Error()))
-	}
-	return phpStringFromBytes(body)
-}
-
-// hazedb_exec runs a write (INSERT/UPDATE/DELETE/CREATE/DROP) and returns
-// {"affected":N} as a JSON string.
-//
-// export_php:function hazedb_exec(string $sql, string $args): ?string
-func hazedb_exec(sql *C.zend_string, argsJSON *C.zend_string) unsafe.Pointer {
-	db := defaultSlot.Load()
-	if db == nil {
-		return nil
-	}
-	args, err := hazedb.QueryArgs(zendStringView(argsJSON))
-	if err != nil {
-		return phpStringFromBytes(hazedb.ErrorJSON(err.Error()))
-	}
-	n, err := db.Exec(zendStringView(sql), args...)
-	if err != nil {
-		return phpStringFromBytes(hazedb.ErrorJSON(err.Error()))
-	}
-	return phpStringFromBytes(hazedb.ExecResultJSON(n))
-}
-
-// pushStr appends a Go string to a PHP array as a copied zend_string (the
-// trampoline handles the empty case so unsafe.StringData(nil) is never deref'd).
-func pushStr(a *C.zend_array, s string) {
-	var p *C.char
-	if len(s) > 0 {
-		p = (*C.char)(unsafe.Pointer(unsafe.StringData(s)))
-	}
-	C.hzd_push_strn(a, p, C.size_t(len(s)))
-}
-
-// setArr stores child under a string key in a (associative entry).
-func setArr(a *C.zend_array, key string, child *C.zend_array) {
-	C.hzd_set_arr(a, (*C.char)(unsafe.Pointer(unsafe.StringData(key))), C.size_t(len(key)), child)
-}
-
-// pushCell appends one result cell to a PHP row array, mapping the Value kind to
-// the native PHP scalar (UUID -> canonical string, Bytes -> raw byte string).
-func pushCell(a *C.zend_array, v hazedb.Value) {
-	switch v.Kind {
-	case hazedb.KindNull:
-		C.hzd_push_null(a)
-	case hazedb.KindInt:
-		C.hzd_push_long(a, C.zend_long(v.Int()))
-	case hazedb.KindBool:
-		b := C.int(0)
-		if v.Bool() {
-			b = 1
+// valueFromZval converts one scalar zval to a Value. Type mapping: int -> INT,
+// true/false -> BOOL, null -> NULL, string -> STRING unless it parses as a
+// canonical UUID -> UUID. Strings are copied (GoStringN) so storage never
+// aliases PHP memory. ok=false on a non-scalar / unsupported type (float,
+// nested array).
+func valueFromZval(z *C.zval) (hazedb.Value, bool) {
+	switch C.hzd_zval_kind(z) {
+	case 0:
+		return hazedb.Null(), true
+	case 1:
+		return hazedb.Bool(false), true
+	case 2:
+		return hazedb.Bool(true), true
+	case 3:
+		return hazedb.Int(int64(C.hzd_zval_long(z))), true
+	case 4:
+		s := C.GoStringN(C.hzd_zval_strptr(z), C.int(C.hzd_zval_strlen(z)))
+		if u, err := hazedb.ParseUUID(s); err == nil {
+			return hazedb.UUIDVal(u), true
 		}
-		C.hzd_push_bool(a, b)
-	case hazedb.KindString:
-		pushStr(a, v.Str())
-	case hazedb.KindUUID:
-		pushStr(a, v.UUID().String())
-	case hazedb.KindBytes:
-		bs := v.Bytes()
-		var p *C.char
-		if len(bs) > 0 {
-			p = (*C.char)(unsafe.Pointer(&bs[0]))
-		}
-		C.hzd_push_strn(a, p, C.size_t(len(bs)))
-	default:
-		C.hzd_push_null(a)
+		return hazedb.Str(s), true
+	default: // double, array, or other — not a positional scalar
+		return hazedb.Value{}, false
 	}
 }
 
-// hazedb_query_arr is hazedb_query that returns a native PHP array instead of a
-// JSON string: ['columns'=>[...], 'rows'=>[[...],...]]. It skips both the Go
-// JSON encode and the PHP json_decode the string form pays. Returns null on no
-// DB or query error (the array form carries no error envelope); an empty result
-// is a valid array with an empty 'rows'. $args is the same string form as
-// hazedb_query (direct UUID or JSON array).
-//
-// export_php:function hazedb_query_arr(string $sql, string $args): ?array
-func hazedb_query_arr(sql *C.zend_string, argsStr *C.zend_string) unsafe.Pointer {
-	db := defaultSlot.Load()
-	if db == nil {
-		return nil
+// argsFromMixed reads the $args param, which may be a native PHP array of
+// positional params ([$a, $b]) OR a single bare scalar ($id) — the latter is
+// the fast path for single-key reads (one zval, no array build/iteration). A
+// nil (omitted) or null $args yields no args.
+func argsFromMixed(a *C.zval) ([]hazedb.Value, bool) {
+	if a == nil {
+		return nil, true
 	}
-	args, err := hazedb.QueryArgs(zendStringView(argsStr))
-	if err != nil {
-		return nil
-	}
-	cols, rows, err := db.Query(zendStringView(sql), args...)
-	if err != nil {
-		return nil
-	}
-	env := C.hzd_arr_new(2)
-	colsArr := C.hzd_arr_new(C.uint32_t(len(cols)))
-	for _, c := range cols {
-		pushStr(colsArr, c)
-	}
-	setArr(env, "columns", colsArr)
-	rowsArr := C.hzd_arr_new(C.uint32_t(len(rows)))
-	for i := range rows {
-		ra := C.hzd_arr_new(C.uint32_t(len(rows[i])))
-		for _, cell := range rows[i] {
-			pushCell(ra, cell)
+	switch C.hzd_zval_kind(a) {
+	case 0: // null / omitted
+		return nil, true
+	case 7: // array of positional params
+		arr := C.hzd_zval_arr(a)
+		n := int(C.hzd_arr_count(arr))
+		if n == 0 {
+			return nil, true
 		}
-		C.hzd_push_arr(rowsArr, ra)
+		vals := make([]hazedb.Value, 0, n)
+		for i := 0; i < n; i++ {
+			z := C.hzd_arr_get(arr, C.uint32_t(i))
+			if z == nil {
+				vals = append(vals, hazedb.Null())
+				continue
+			}
+			v, ok := valueFromZval(z)
+			if !ok {
+				return nil, false
+			}
+			vals = append(vals, v)
+		}
+		return vals, true
+	default: // a bare scalar -> exactly one positional arg (fast path)
+		v, ok := valueFromZval(a)
+		if !ok {
+			return nil, false
+		}
+		return []hazedb.Value{v}, true
 	}
-	setArr(env, "rows", rowsArr)
-	return unsafe.Pointer(env)
 }
 
 // setStr stores a Go string under a key (handles the empty case so
@@ -303,6 +216,7 @@ func setStr(a *C.zend_array, kp *C.char, kl C.size_t, s string) {
 }
 
 // setCell stores one cell under its column-name key (the assoc-row shape).
+// UUID -> canonical string, Bytes -> raw byte string; ints/bools stay native.
 func setCell(a *C.zend_array, key string, v hazedb.Value) {
 	kp := (*C.char)(unsafe.Pointer(unsafe.StringData(key)))
 	kl := C.size_t(len(key))
@@ -333,87 +247,99 @@ func setCell(a *C.zend_array, key string, v hazedb.Value) {
 	}
 }
 
-// hazedb_get is the point-read fast path: it returns a single row as one flat
-// associative PHP array (['col'=>val,...]) via db.QueryRow, or null if there is
-// no matching row / no DB / error. Cheaper than hazedb_query_arr for the common
-// WHERE id = ? read — it builds one array with keyed cells instead of the
-// {columns, rows} envelope (no nested row arrays, no separate columns array).
-// $id is the same string form as hazedb_query (direct UUID or JSON array).
-//
-// export_php:function hazedb_get(string $sql, string $id): ?array
-func hazedb_get(sql *C.zend_string, idStr *C.zend_string) unsafe.Pointer {
-	db := defaultSlot.Load()
-	if db == nil {
-		return nil
-	}
-	args, err := hazedb.QueryArgs(zendStringView(idStr))
-	if err != nil {
-		return nil
-	}
-	cols, row, err := db.QueryRow(zendStringView(sql), args...)
-	if err != nil || row == nil {
-		return nil
-	}
+// rowToAssoc builds a single assoc PHP array from cols + one row.
+func rowToAssoc(cols []string, row hazedb.Row) *C.zend_array {
 	a := C.hzd_arr_new(C.uint32_t(len(cols)))
 	for i, c := range cols {
 		setCell(a, c, row[i])
 	}
-	return unsafe.Pointer(a)
+	return a
 }
 
-// hazedb_exec_arr is hazedb_exec that takes a native PHP array of positional
-// args instead of a JSON string, skipping the json_encode (PHP) and json.Decode
-// (Go) round-trip. Args are read straight from the zend_array into typed Values
-// and applied via db.ExecValues. Type mapping: PHP int -> INT, true/false ->
-// BOOL, null -> NULL, string -> STRING unless it parses as a canonical UUID ->
-// UUID (same rule as the JSON form). A float arg is rejected (hazedb has no
-// float type). Returns {"affected":N}, an error envelope, or null (no DB).
+// hazedb_fetch returns one row as a flat assoc PHP array, or null (no row / no
+// DB / error). ≈ PDOStatement::fetch(PDO::FETCH_ASSOC).
 //
-// export_php:function hazedb_exec_arr(string $sql, array $args): ?string
-func hazedb_exec_arr(sql *C.zend_string, args *C.zend_array) unsafe.Pointer {
+// export_php:function hazedb_fetch(string $sql, mixed $args = null): ?array
+func hazedb_fetch(sql *C.zend_string, args *C.zval) unsafe.Pointer {
 	db := defaultSlot.Load()
 	if db == nil {
 		return nil
 	}
-	n := int(C.hzd_arr_count(args))
-	var buf [8]hazedb.Value
-	var vals []hazedb.Value
-	if n <= len(buf) {
-		vals = buf[:0]
-	} else {
-		vals = make([]hazedb.Value, 0, n)
+	vals, ok := argsFromMixed(args)
+	if !ok {
+		return nil
 	}
-	for i := 0; i < n; i++ {
-		z := C.hzd_arr_get(args, C.uint32_t(i))
-		if z == nil {
-			vals = append(vals, hazedb.Null())
-			continue
-		}
-		switch C.hzd_zval_kind(z) {
-		case 0: // null
-			vals = append(vals, hazedb.Null())
-		case 1: // false
-			vals = append(vals, hazedb.Bool(false))
-		case 2: // true
-			vals = append(vals, hazedb.Bool(true))
-		case 3: // long
-			vals = append(vals, hazedb.Int(int64(C.hzd_zval_long(z))))
-		case 4: // string — owned copy (stored), UUID if canonical
-			s := C.GoStringN(C.hzd_zval_strptr(z), C.int(C.hzd_zval_strlen(z)))
-			if u, err := hazedb.ParseUUID(s); err == nil {
-				vals = append(vals, hazedb.UUIDVal(u))
-			} else {
-				vals = append(vals, hazedb.Str(s))
-			}
-		default: // double or other — unsupported
-			return phpStringFromBytes(hazedb.ErrorJSON("hazedb_exec_arr: unsupported arg type (floats not supported)"))
-		}
+	cols, row, err := db.QueryRowValues(zendStringView(sql), vals...)
+	if err != nil || row == nil {
+		return nil
+	}
+	return unsafe.Pointer(rowToAssoc(cols, row))
+}
+
+// hazedb_fetchall returns all rows as a list of assoc PHP arrays. Empty result
+// is an empty array (not null); null only on no DB / error.
+// ≈ PDOStatement::fetchAll(PDO::FETCH_ASSOC).
+//
+// export_php:function hazedb_fetchall(string $sql, mixed $args = null): ?array
+func hazedb_fetchall(sql *C.zend_string, args *C.zval) unsafe.Pointer {
+	db := defaultSlot.Load()
+	if db == nil {
+		return nil
+	}
+	vals, ok := argsFromMixed(args)
+	if !ok {
+		return nil
+	}
+	cols, rows, err := db.QueryValues(zendStringView(sql), vals...)
+	if err != nil {
+		return nil
+	}
+	out := C.hzd_arr_new(C.uint32_t(len(rows)))
+	for i := range rows {
+		C.hzd_push_arr(out, rowToAssoc(cols, rows[i]))
+	}
+	return unsafe.Pointer(out)
+}
+
+// hazedb_fetchall_json returns the same data as hazedb_fetchall as a JSON string
+// [{...},...] — for forwarding to an HTTP/JSON response without a PHP decode.
+//
+// export_php:function hazedb_fetchall_json(string $sql, mixed $args = null): ?string
+func hazedb_fetchall_json(sql *C.zend_string, args *C.zval) unsafe.Pointer {
+	db := defaultSlot.Load()
+	if db == nil {
+		return nil
+	}
+	vals, ok := argsFromMixed(args)
+	if !ok {
+		return nil
+	}
+	cols, rows, err := db.QueryValues(zendStringView(sql), vals...)
+	if err != nil {
+		return nil
+	}
+	body, _ := hazedb.RowsToJSONObjects(cols, rows)
+	return phpStringFromBytes(body)
+}
+
+// hazedb_exec runs a write and returns the affected row count, or -1 on error /
+// no DB. ≈ PDOStatement::execute(...) + rowCount().
+//
+// export_php:function hazedb_exec(string $sql, mixed $args = null): int
+func hazedb_exec(sql *C.zend_string, args *C.zval) int64 {
+	db := defaultSlot.Load()
+	if db == nil {
+		return -1
+	}
+	vals, ok := argsFromMixed(args)
+	if !ok {
+		return -1
 	}
 	affected, err := db.ExecValues(zendStringView(sql), vals...)
 	if err != nil {
-		return phpStringFromBytes(hazedb.ErrorJSON(err.Error()))
+		return -1
 	}
-	return phpStringFromBytes(hazedb.ExecResultJSON(affected))
+	return int64(affected)
 }
 
 // hazedb_ping reports that the extension is loaded and whether a DB is wired up.

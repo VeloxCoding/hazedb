@@ -23,29 +23,24 @@ func init() {
 	frankenphp.RegisterExtension(unsafe.Pointer(&C.hazedb_ext_module_entry))
 }
 
-//export go_hazedb_query
-func go_hazedb_query(sql *C.zend_string, argsJSON *C.zend_string) unsafe.Pointer {
-	return hazedb_query(sql, argsJSON)
+//export go_hazedb_fetch
+func go_hazedb_fetch(sql *C.zend_string, args *C.zval) unsafe.Pointer {
+	return hazedb_fetch(sql, args)
+}
+
+//export go_hazedb_fetchall
+func go_hazedb_fetchall(sql *C.zend_string, args *C.zval) unsafe.Pointer {
+	return hazedb_fetchall(sql, args)
+}
+
+//export go_hazedb_fetchall_json
+func go_hazedb_fetchall_json(sql *C.zend_string, args *C.zval) unsafe.Pointer {
+	return hazedb_fetchall_json(sql, args)
 }
 
 //export go_hazedb_exec
-func go_hazedb_exec(sql *C.zend_string, argsJSON *C.zend_string) unsafe.Pointer {
-	return hazedb_exec(sql, argsJSON)
-}
-
-//export go_hazedb_query_arr
-func go_hazedb_query_arr(sql *C.zend_string, argsStr *C.zend_string) unsafe.Pointer {
-	return hazedb_query_arr(sql, argsStr)
-}
-
-//export go_hazedb_get
-func go_hazedb_get(sql *C.zend_string, idStr *C.zend_string) unsafe.Pointer {
-	return hazedb_get(sql, idStr)
-}
-
-//export go_hazedb_exec_arr
-func go_hazedb_exec_arr(sql *C.zend_string, args *C.zend_array) unsafe.Pointer {
-	return hazedb_exec_arr(sql, args)
+func go_hazedb_exec(sql *C.zend_string, args *C.zval) int64 {
+	return hazedb_exec(sql, args)
 }
 
 //export go_hazedb_ping
