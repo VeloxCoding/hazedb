@@ -385,6 +385,41 @@ func TestOrderedIndexDeclared(t *testing.T) {
 	}
 }
 
+// O2: an ordered index builds a sorted view on merge and answers equality via
+// binary search (and via the dirty overlay before merge).
+func TestOrderedIndexEquality(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE posts (id uuid primary key, email text, ORDERED INDEX (email))")
+	for _, e := range []string{"c@x", "a@x", "b@x", "a@x"} {
+		db.Exec("INSERT INTO posts (id, email) VALUES (?, ?)", NewUUIDv7(), e)
+	}
+	// before merge: served via the dirty overlay
+	if _, rows, _ := db.Query("SELECT id FROM posts WHERE email = ?", "a@x"); len(rows) != 2 {
+		t.Fatalf("pre-merge equality via overlay: %d, want 2", len(rows))
+	}
+	db.mergeIndexes()
+
+	tbl := db.cat.Load().byName["posts"].table
+	si := tbl.indexFor(tbl.def.colByName["email"])
+	if len(si.sorted) != 4 {
+		t.Fatalf("sorted view len %d, want 4", len(si.sorted))
+	}
+	for i := 1; i < len(si.sorted); i++ {
+		if si.sorted[i].key.less(si.sorted[i-1].key) {
+			t.Fatal("sorted view is not in order")
+		}
+	}
+	if got := len(si.lookup(keyOf(Str("a@x")))); got != 2 {
+		t.Fatalf("ordered lookup a@x: %d, want 2", got)
+	}
+	if got := len(si.lookup(keyOf(Str("z@x")))); got != 0 {
+		t.Fatalf("ordered lookup miss z@x: %d, want 0", got)
+	}
+	if _, rows, _ := db.Query("SELECT id FROM posts WHERE email = ?", "b@x"); len(rows) != 1 {
+		t.Fatal("post-merge equality via ordered index wrong")
+	}
+}
+
 // AND of equalities: the planner picks one index for a conjunct and
 // residual-filters the full WHERE on the candidates. SELECT ... WHERE email = ?
 // AND name = ? returns only rows matching both.

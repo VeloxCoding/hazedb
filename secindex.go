@@ -1,6 +1,8 @@
 package hazedb
 
 import (
+	"bytes"
+	"sort"
 	"sync"
 	"time"
 )
@@ -43,6 +45,26 @@ func keyOf(v Value) indexKey {
 	return indexKey{kind: KindNull}
 }
 
+// less orders two keys of the SAME kind (all keys in one index share a kind):
+// numeric for int/bool, lexicographic for string/bytes, and the UUID's 16
+// big-endian bytes (so byte order == UUID order).
+func (k indexKey) less(o indexKey) bool {
+	switch k.kind {
+	case KindInt, KindBool:
+		return k.i < o.i
+	default:
+		return k.s < o.s
+	}
+}
+
+// ordEntry is one (key, pk) pair in an ordered index's sorted slice.
+type ordEntry struct {
+	key indexKey
+	pk  UUID
+}
+
+func uuidLess(a, b UUID) bool { return bytes.Compare(a[:], b[:]) < 0 }
+
 // secIndex is one secondary index: a forward map value->PKs and a reverse map
 // PK->current key, so a change can drop the stale forward entry without the
 // caller supplying the old value. Guarded by mu. UNIQUE is a read hint (the
@@ -53,8 +75,9 @@ type secIndex struct {
 	unique  bool
 	ordered bool // sorted index (equality + ranges + ORDER BY); see O2
 	mu      sync.RWMutex
-	fwd     map[indexKey][]UUID
-	rev     map[UUID]indexKey
+	fwd     map[indexKey][]UUID // hash mode: value -> PKs
+	rev     map[UUID]indexKey   // pk -> current key (both modes)
+	sorted  []ordEntry          // ordered mode: rev sorted by key, rebuilt on merge
 }
 
 func newSecIndex(ri resolvedIndex) *secIndex {
@@ -72,6 +95,16 @@ func newSecIndex(ri resolvedIndex) *secIndex {
 // old key, so callers never need to remember the pre-change value.
 func (si *secIndex) apply(pk UUID, newKey indexKey, indexable bool) {
 	si.mu.Lock()
+	if si.ordered {
+		// rev is authoritative; the sorted view is rebuilt once per merge.
+		if indexable {
+			si.rev[pk] = newKey
+		} else {
+			delete(si.rev, pk)
+		}
+		si.mu.Unlock()
+		return
+	}
 	if old, had := si.rev[pk]; had {
 		si.removeFwdLocked(old, pk)
 		delete(si.rev, pk)
@@ -80,6 +113,29 @@ func (si *secIndex) apply(pk UUID, newKey indexKey, indexable bool) {
 		si.fwd[newKey] = append(si.fwd[newKey], pk)
 		si.rev[pk] = newKey
 	}
+	si.mu.Unlock()
+}
+
+// rebuildSorted regenerates the sorted view from rev. The merger calls it once
+// after applying a batch (and recovery after a full scan), before dropping the
+// dirty entries, so a reader sees a row via the dirty overlay until it is in the
+// sorted view (no gap). Ordered indexes only. O(n log n).
+func (si *secIndex) rebuildSorted() {
+	si.mu.Lock()
+	s := make([]ordEntry, 0, len(si.rev))
+	for pk, key := range si.rev {
+		s = append(s, ordEntry{key: key, pk: pk})
+	}
+	sort.Slice(s, func(i, j int) bool {
+		if s[i].key.less(s[j].key) {
+			return true
+		}
+		if s[j].key.less(s[i].key) {
+			return false
+		}
+		return uuidLess(s[i].pk, s[j].pk) // stable tie-break among equal keys
+	})
+	si.sorted = s
 	si.mu.Unlock()
 }
 
@@ -106,13 +162,26 @@ func (si *secIndex) removeFwdLocked(k indexKey, pk UUID) {
 // bucket a concurrent writer may mutate).
 func (si *secIndex) lookup(k indexKey) []UUID {
 	si.mu.RLock()
+	defer si.mu.RUnlock()
+	if si.ordered {
+		// first entry with key >= k, then walk the equal-key run.
+		lo := sort.Search(len(si.sorted), func(i int) bool { return !si.sorted[i].key.less(k) })
+		var out []UUID
+		for i := lo; i < len(si.sorted); i++ {
+			e := si.sorted[i]
+			if k.less(e.key) {
+				break // past the equal range
+			}
+			out = append(out, e.pk)
+		}
+		return out
+	}
 	b := si.fwd[k]
 	var out []UUID
 	if len(b) > 0 {
 		out = make([]UUID, len(b))
 		copy(out, b)
 	}
-	si.mu.RUnlock()
 	return out
 }
 
@@ -235,16 +304,22 @@ func (t *table) dirtyPKs() []UUID {
 // only briefly (to snapshot, and later to drop the processed prefix); the
 // recompute itself runs against a lock-free getByPK.
 //
-// No-gap ordering: the dirty entries are snapshotted but NOT cleared before the
-// index is updated, so a concurrent read sees a row via dirty until it is in the
-// index — never in the gap between. Entries appended during the merge stay
-// (positions >= n) and are reconciled next time.
+// No-gap ordering: dirty entries are snapshotted and applied to the indexes
+// (hash: into fwd; ordered: into rev + the sorted view rebuilt) BEFORE they are
+// dropped, so a concurrent read sees a row via the dirty overlay until it is in
+// the index — never in the gap between. Entries appended during the merge stay
+// and are reconciled next time.
 func (t *table) mergeIndexes() {
 	if len(t.indexes) == 0 {
 		return
 	}
 	t.mergeMu.Lock()
 	defer t.mergeMu.Unlock()
+	type pending struct {
+		s *tableShard
+		n int
+	}
+	var drops []pending
 	for i := range t.shards {
 		s := &t.shards[i]
 		s.mu.RLock()
@@ -264,10 +339,22 @@ func (t *table) mergeIndexes() {
 				t.idxApply(pk, nil)
 			}
 		}
-		s.mu.Lock()
-		s.dirty = s.dirty[n:] // drop the processed prefix; later appends remain
-		s.mu.Unlock()
-		t.dirtyCount.Add(-int64(n))
+		drops = append(drops, pending{s, n})
+	}
+	if len(drops) == 0 {
+		return
+	}
+	// Rebuild ordered indexes' sorted view from rev BEFORE dropping dirty.
+	for _, si := range t.indexes {
+		if si.ordered {
+			si.rebuildSorted()
+		}
+	}
+	for _, d := range drops {
+		d.s.mu.Lock()
+		d.s.dirty = d.s.dirty[d.n:] // drop the processed prefix; later appends remain
+		d.s.mu.Unlock()
+		t.dirtyCount.Add(-int64(d.n))
 	}
 }
 
@@ -295,6 +382,7 @@ func (t *table) rebuildIndexes() {
 		si.mu.Lock()
 		si.fwd = make(map[indexKey][]UUID)
 		si.rev = make(map[UUID]indexKey)
+		si.sorted = nil
 		si.mu.Unlock()
 	}
 	pkOrd := t.def.pkOrdinal
@@ -307,6 +395,11 @@ func (t *table) rebuildIndexes() {
 		}
 		return true
 	})
+	for _, si := range t.indexes {
+		if si.ordered {
+			si.rebuildSorted()
+		}
+	}
 	for i := range t.shards {
 		s := &t.shards[i]
 		s.mu.Lock()
