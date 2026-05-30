@@ -163,6 +163,20 @@ func (db *DB) Exec(sql string, args ...any) (int, error) {
 	return db.execPlan(pl, args)
 }
 
+// ExecValues runs a write with pre-typed Value arguments, skipping the []any
+// arg-conversion layer Exec uses (no JSON decode, no interface boxing, no
+// per-arg type switch). It is the in-process fast path for callers that already
+// hold typed Values — notably the PHP extension reading a native zend_array via
+// cgo, which avoids the json_encode/json.Decode round-trip the string args form
+// pays. Returns the affected row count (0 for DDL).
+func (db *DB) ExecValues(sql string, args ...Value) (int, error) {
+	pl, err := db.prepare(sql, db.cat.Load())
+	if err != nil {
+		return 0, err
+	}
+	return db.execPlanValues(pl, args)
+}
+
 // execPlan runs a non-SELECT plan against raw args. Shared by Exec (which looks
 // the plan up by SQL each call) and *Stmt.Exec (which holds a compiled plan).
 func (db *DB) execPlan(pl *plan, args []any) (int, error) {
@@ -186,6 +200,38 @@ func (db *DB) execPlan(pl *plan, args []any) (int, error) {
 		return db.execDelete(pl, vargs)
 	}
 	return 0, fmt.Errorf("fastsql: Exec used with SELECT — use Query instead")
+}
+
+// execPlanValues is execPlan for pre-typed args: it clones each arg with
+// cloneValue (a no-op except for KindBytes, which must not alias caller memory
+// across the write boundary — the same guarantee toValue gives the []any path)
+// and dispatches to the same write executors.
+func (db *DB) execPlanValues(pl *plan, args []Value) (int, error) {
+	switch s := pl.st.(type) {
+	case *createStmt:
+		return 0, db.createTable(s.def)
+	case *dropStmt:
+		return 0, db.dropTable(s.name)
+	}
+	var argBuf [8]Value
+	var vargs []Value
+	if len(args) <= len(argBuf) {
+		vargs = argBuf[:len(args)]
+	} else {
+		vargs = make([]Value, len(args))
+	}
+	for i, a := range args {
+		vargs[i] = cloneValue(a)
+	}
+	switch pl.st.(type) {
+	case *insertStmt:
+		return db.execInsert(pl, vargs)
+	case *updateStmt:
+		return db.execUpdate(pl, vargs)
+	case *deleteStmt:
+		return db.execDelete(pl, vargs)
+	}
+	return 0, fmt.Errorf("fastsql: ExecValues used with SELECT — use Query instead")
 }
 
 // Query runs a SELECT. Returns the column names (in projection order)
