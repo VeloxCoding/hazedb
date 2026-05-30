@@ -101,6 +101,12 @@ type plan struct {
 	idxLookup bool
 	idxCols   []int
 	idxSrcs   []expr
+
+	// orderWalk is true when ORDER BY is on an ordered-indexed column and no
+	// equality index was chosen: the executor walks the sorted index (merged
+	// with the dirty overlay) in order and stops at LIMIT, instead of scanning +
+	// sorting. orderOrdinal names the column.
+	orderWalk bool
 }
 
 func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
@@ -193,6 +199,12 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 				pl.idxLookup = len(pl.idxCols) > 0
 			}
 		}
+		// ORDER BY on an ordered-indexed column, with no equality index chosen
+		// (applies with or without a WHERE): walk the sorted index in order
+		// instead of scanning + sorting.
+		if s.orderCol != "" && !pl.idxLookup && rt.orderedIndexOn(pl.orderOrdinal) {
+			pl.orderWalk = true
+		}
 	case *insertStmt:
 		pl.insertOrdinals = make([]int, 0, len(s.cols))
 		for _, c := range s.cols {
@@ -276,6 +288,16 @@ func detectColEq(e expr, rt *resolvedTable, ordinal int) (bool, expr) {
 // detectPKEq is detectColEq pinned to the PK column.
 func detectPKEq(e expr, rt *resolvedTable) (bool, expr) {
 	return detectColEq(e, rt, rt.pkOrdinal)
+}
+
+// orderedIndexOn reports whether column ord has an ORDERED secondary index.
+func (rt *resolvedTable) orderedIndexOn(ord int) bool {
+	for i := range rt.indexes {
+		if rt.indexes[i].ordinal == ord && rt.indexes[i].ordered {
+			return true
+		}
+	}
+	return false
 }
 
 // collectEqConjuncts walks an AND-chain of the WHERE and records every
@@ -786,6 +808,126 @@ func (db *DB) execSelectIdxOne(pl *plan, args []Value) ([]string, Row, error) {
 	return colNames, nil, nil
 }
 
+// execSelectOrderedWalk serves an ORDER BY on an ordered-indexed column by
+// walking the sorted index in order, merged with the dirty overlay (rows
+// mutated since the last merge), applying any residual WHERE, and stopping at
+// LIMIT — touching ~LIMIT rows, not the whole table. A non-dirty index entry is
+// fresh (its key equals the live value), so the index key drives the ordering
+// and the row is fetched only when selected. Dirty PKs are excluded from the
+// index walk (the entry may be stale) and supplied from their live rows.
+func (db *DB) execSelectOrderedWalk(pl *plan, args []Value) ([]string, []Row, error) {
+	st := pl.st.(*selectStmt)
+	tbl := pl.rt
+	colNames := pl.colNames
+	if st.limit == 0 {
+		return colNames, nil, nil
+	}
+	si := tbl.indexFor(pl.orderOrdinal)
+	if si == nil {
+		return colNames, nil, nil
+	}
+	ctx := evalCtx{cols: tbl.def.colByName, args: args}
+	matches := func(r Row) bool {
+		if st.where == nil {
+			return true
+		}
+		ctx.row = r
+		v, err := evalExpr(st.where, &ctx)
+		return err == nil && truthy(v)
+	}
+	project := func(r Row) Row {
+		if st.starAll {
+			return r
+		}
+		return projectClone(r, pl.projOrdinals)
+	}
+
+	snap := si.snapshot()
+	dirty := tbl.dirtyPKs()
+	dirtySet := make(map[UUID]struct{}, len(dirty))
+	type dcand struct {
+		key indexKey
+		row Row
+	}
+	var dc []dcand
+	for _, pk := range dirty {
+		if _, dup := dirtySet[pk]; dup {
+			continue
+		}
+		dirtySet[pk] = struct{}{}
+		if r, ok := tbl.getByPK(pk); ok && matches(r) {
+			dc = append(dc, dcand{keyOf(r[pl.orderOrdinal]), r})
+		}
+	}
+	sort.Slice(dc, func(i, j int) bool { return dc[i].key.less(dc[j].key) })
+
+	desc := st.orderDesc
+	before := func(a, b indexKey) bool { // a comes before b in the requested order
+		if desc {
+			return b.less(a)
+		}
+		return a.less(b)
+	}
+
+	capHint := st.limit
+	if capHint < 0 || capHint > 1024 {
+		capHint = 1024
+	}
+	out := make([]Row, 0, capHint)
+	ii, dj := 0, 0
+	if desc {
+		ii, dj = len(snap)-1, len(dc)-1
+	}
+	idxOK := func() bool { return ii >= 0 && ii < len(snap) }
+	dcOK := func() bool { return dj >= 0 && dj < len(dc) }
+	stepIdx := func() {
+		if desc {
+			ii--
+		} else {
+			ii++
+		}
+	}
+	stepDc := func() {
+		if desc {
+			dj--
+		} else {
+			dj++
+		}
+	}
+	takeIdx := func() {
+		pk := snap[ii].pk
+		stepIdx()
+		if r, ok := tbl.getByPK(pk); ok && matches(r) {
+			out = append(out, project(r))
+		}
+	}
+	for st.limit < 0 || len(out) < st.limit {
+		for idxOK() { // skip index entries shadowed by the dirty overlay
+			if _, d := dirtySet[snap[ii].pk]; !d {
+				break
+			}
+			stepIdx()
+		}
+		switch {
+		case idxOK() && dcOK():
+			if before(dc[dj].key, snap[ii].key) {
+				out = append(out, project(dc[dj].row))
+				stepDc()
+			} else {
+				takeIdx()
+			}
+		case dcOK():
+			out = append(out, project(dc[dj].row))
+			stepDc()
+		case idxOK():
+			takeIdx()
+		default:
+			return colNames, out, nil // both streams exhausted
+		}
+	}
+	return colNames, out, nil
+}
+
 // execSelect runs the SELECT plan. Returns the columns and a slice of
 // projected rows. Rows are deep-cloned before returning so the caller
 // may mutate them without affecting storage.
@@ -832,6 +974,12 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 	// each by PK and project. No scan.
 	if pl.idxLookup {
 		return db.execSelectIdx(pl, &ctx)
+	}
+
+	// Ordered-index ORDER BY: walk the sorted index (merged with the dirty
+	// overlay) in order and stop at LIMIT — no scan, no sort.
+	if pl.orderWalk {
+		return db.execSelectOrderedWalk(pl, args)
 	}
 
 	// Collect matching rows. A partition-pinned SELECT (WHERE partkey = ?)

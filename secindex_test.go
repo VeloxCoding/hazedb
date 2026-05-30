@@ -420,6 +420,66 @@ func TestOrderedIndexEquality(t *testing.T) {
 	}
 }
 
+// O3: a global ORDER BY on an ordered index walks the sorted view (no scan +
+// sort). Correct ASC/DESC/LIMIT, before and after merge, and merging the sorted
+// view with the not-yet-merged dirty overlay.
+func TestOrderedIndexOrderBy(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE posts (id uuid primary key, email text, ORDERED INDEX (email))")
+	for _, e := range []string{"d@x", "a@x", "e@x", "b@x", "c@x"} {
+		db.Exec("INSERT INTO posts (id, email) VALUES (?, ?)", NewUUIDv7(), e)
+	}
+	pl, _ := db.prepare("SELECT email FROM posts ORDER BY email ASC LIMIT 3", db.cat.Load())
+	if !pl.orderWalk {
+		t.Fatal("ORDER BY on an ordered index did not plan as an ordered walk")
+	}
+
+	get := func(sql string) []string {
+		_, rows, err := db.Query(sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := make([]string, len(rows))
+		for i, r := range rows {
+			out[i] = r[0].Str()
+		}
+		return out
+	}
+	eqS := func(a, b []string) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for i := range a {
+			if a[i] != b[i] {
+				return false
+			}
+		}
+		return true
+	}
+
+	for _, phase := range []string{"overlay", "merged"} {
+		if phase == "merged" {
+			db.mergeIndexes()
+		}
+		if got := get("SELECT email FROM posts ORDER BY email ASC"); !eqS(got, []string{"a@x", "b@x", "c@x", "d@x", "e@x"}) {
+			t.Fatalf("[%s] ASC all: %v", phase, got)
+		}
+		if got := get("SELECT email FROM posts ORDER BY email DESC LIMIT 2"); !eqS(got, []string{"e@x", "d@x"}) {
+			t.Fatalf("[%s] DESC LIMIT 2: %v", phase, got)
+		}
+		if got := get("SELECT email FROM posts ORDER BY email ASC LIMIT 3"); !eqS(got, []string{"a@x", "b@x", "c@x"}) {
+			t.Fatalf("[%s] ASC LIMIT 3: %v", phase, got)
+		}
+	}
+
+	// merged sorted view + not-yet-merged dirty overlay, interleaved in order
+	db.Exec("INSERT INTO posts (id, email) VALUES (?, ?)", NewUUIDv7(), "aa@x") // between a@x and b@x
+	db.Exec("INSERT INTO posts (id, email) VALUES (?, ?)", NewUUIDv7(), "f@x")  // after e@x
+	if got := get("SELECT email FROM posts ORDER BY email ASC LIMIT 4"); !eqS(got, []string{"a@x", "aa@x", "b@x", "c@x"}) {
+		t.Fatalf("snap+overlay ASC LIMIT 4: %v", got)
+	}
+}
+
 // AND of equalities: the planner picks one index for a conjunct and
 // residual-filters the full WHERE on the candidates. SELECT ... WHERE email = ?
 // AND name = ? returns only rows matching both.

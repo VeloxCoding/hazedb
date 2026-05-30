@@ -210,6 +210,16 @@ func intersectPKs(a, b []UUID) []UUID {
 	return out
 }
 
+// snapshot returns the current sorted view of an ordered index. rebuildSorted
+// always assigns a NEW slice (never mutates in place), so the returned header is
+// a stable, immutable view the caller can walk without holding mu.
+func (si *secIndex) snapshot() []ordEntry {
+	si.mu.RLock()
+	s := si.sorted
+	si.mu.RUnlock()
+	return s
+}
+
 // indexFor returns the table's secondary index on column ord, or nil.
 func (t *table) indexFor(ord int) *secIndex {
 	for _, si := range t.indexes {
