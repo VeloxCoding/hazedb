@@ -571,6 +571,21 @@ func (db *DB) execSelectPKOne(pl *plan, keyVal Value) ([]string, Row, error) {
 	return colNames, pr, nil
 }
 
+// offerLiveRow offers pk's live row to an ORDER BY top-N heap under the shard
+// read lock: pred (the full WHERE) and the order-column compare read the row in
+// place, and topN.offer clones it only if it makes the cut. So ORDER BY ... LIMIT
+// n over a large filtered set clones ~n rows, not the whole matched set.
+func (t *table) offerLiveRow(pk UUID, pred func(Row) bool, top *topN) {
+	s := t.shardOf(pk)
+	s.mu.RLock()
+	if rowID, ok := s.pk[pk]; ok {
+		if r := s.rows[rowID]; r != nil && pred(r) {
+			top.offer(r)
+		}
+	}
+	s.mu.RUnlock()
+}
+
 // execSelectIdx runs a SELECT whose WHERE pins one or more secondary-indexed
 // columns by equality. It resolves candidate PKs through the index(es)
 // (intersecting buckets for an AND of equalities) plus the dirty overlay, then
@@ -620,7 +635,38 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 	if len(pks) == 0 && len(dirty) == 0 {
 		return colNames, nil, nil
 	}
-	seen := make(map[UUID]struct{}, len(pks)+len(dirty))
+	// emit visits each candidate PK once, calling fn (stop on true). The index
+	// buckets are already unique, so a dedup set is only built when the dirty
+	// overlay is non-empty (a PK may then be in both) — the steady-state read
+	// (merged, dirty empty) walks the bucket with no per-candidate map.
+	emit := func(fn func(pk UUID) bool) {
+		if len(dirty) == 0 {
+			for _, pk := range pks {
+				if fn(pk) {
+					return
+				}
+			}
+			return
+		}
+		seen := make(map[UUID]struct{}, len(pks)+len(dirty))
+		visit := func(pk UUID) bool {
+			if _, dup := seen[pk]; dup {
+				return false
+			}
+			seen[pk] = struct{}{}
+			return fn(pk)
+		}
+		for _, pk := range pks {
+			if visit(pk) {
+				return
+			}
+		}
+		for _, pk := range dirty {
+			if visit(pk) {
+				return
+			}
+		}
+	}
 
 	// ORDER BY: gather every matching live row, sort by the order column, then
 	// LIMIT. The candidate set is the index-narrowed (filtered) subset — the
@@ -628,42 +674,37 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 	// it is cheap. (Sorting a near-whole-table subset is the caller's call; that
 	// is no longer a list view.)
 	if pl.orderOrdinal >= 0 {
-		var matched []Row
-		gather := func(pk UUID) {
-			if _, dup := seen[pk]; dup {
-				return
-			}
-			seen[pk] = struct{}{}
-			r, ok := tbl.getByPK(pk)
-			if !ok {
-				return
-			}
+		pred := func(r Row) bool {
 			ctx.row = r
-			if v, err := evalExpr(st.where, ctx); err != nil || !truthy(v) {
-				return
+			v, err := evalExpr(st.where, ctx)
+			return err == nil && truthy(v)
+		}
+		// ORDER BY + LIMIT: a top-N heap clones only ~limit rows, so the cost
+		// tracks the LIMIT, not the matched-set size (offer reads/clones the live
+		// row under the shard lock). st.limit == 0 already returned above.
+		if st.limit >= 0 {
+			top := &topN{ord: pl.orderOrdinal, desc: st.orderDesc, capN: st.limit}
+			emit(func(pk UUID) bool {
+				tbl.offerLiveRow(pk, pred, top)
+				return false
+			})
+			return colNames, projectRows(top.sorted(), st.starAll, pl.projOrdinals), nil
+		}
+		// ORDER BY without LIMIT: gather every match, then sort.
+		var matched []Row
+		emit(func(pk UUID) bool {
+			if r, ok := tbl.getByPK(pk); ok && pred(r) {
+				matched = append(matched, r)
 			}
-			matched = append(matched, r)
-		}
-		for _, pk := range pks {
-			gather(pk)
-		}
-		for _, pk := range dirty {
-			gather(pk)
-		}
+			return false
+		})
 		sortRowsByCol(matched, pl.orderOrdinal, st.orderDesc)
-		if st.limit >= 0 && st.limit < len(matched) {
-			matched = matched[:st.limit]
-		}
 		return colNames, projectRows(matched, st.starAll, pl.projOrdinals), nil
 	}
 
 	// No ORDER BY: project and stop as soon as LIMIT is reached.
 	out := make([]Row, 0, len(pks))
-	consider := func(pk UUID) bool { // returns true to stop (limit reached)
-		if _, dup := seen[pk]; dup {
-			return false
-		}
-		seen[pk] = struct{}{}
+	emit(func(pk UUID) bool {
 		r, ok := tbl.getByPK(pk)
 		if !ok {
 			return false
@@ -678,17 +719,7 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 			out = append(out, projectClone(r, pl.projOrdinals))
 		}
 		return st.limit >= 0 && len(out) >= st.limit
-	}
-	for _, pk := range pks {
-		if consider(pk) {
-			return colNames, out, nil
-		}
-	}
-	for _, pk := range dirty {
-		if consider(pk) {
-			break
-		}
-	}
+	})
 	return colNames, out, nil
 }
 

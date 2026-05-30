@@ -90,6 +90,35 @@ func benchIndexMerge(b *testing.B, n int) {
 func BenchmarkIndexMerge_10k(b *testing.B) { benchIndexMerge(b, 10000) }
 func BenchmarkIndexMerge_50k(b *testing.B) { benchIndexMerge(b, 50000) }
 
+// Index-assisted ORDER BY on a filtered list: WHERE author = ? ORDER BY day
+// DESC LIMIT 20. Varying the author's post count shows whether the cost scales
+// with the matched set (gather-all-then-sort) or just the LIMIT.
+func benchIndexOrderBy(b *testing.B, perAuthor int) {
+	db, err := Open(Options{Schema: Schema{}, IndexMergeInterval: -1, SizeHint: perAuthor * 2})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec("CREATE TABLE posts (id uuid primary key, author text, day int, INDEX (author))")
+	for _, author := range []string{"A", "B"} { // B is noise in another bucket
+		for i := 0; i < perAuthor; i++ {
+			db.Exec("INSERT INTO posts (id, author, day) VALUES (?, ?, ?)", NewUUIDv7(), author, i)
+		}
+	}
+	db.mergeIndexes()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, rows, err := db.Query("SELECT id, author, day FROM posts WHERE author = ? ORDER BY day DESC LIMIT 20", "A")
+		if err != nil || len(rows) != 20 {
+			b.Fatalf("rows=%d err=%v", len(rows), err)
+		}
+	}
+}
+
+func BenchmarkIndexOrderBy_50(b *testing.B)   { benchIndexOrderBy(b, 50) }
+func BenchmarkIndexOrderBy_5000(b *testing.B) { benchIndexOrderBy(b, 5000) }
+
 // Two non-unique indexes intersected: WHERE name = ? AND city = ?. ~1/6 of 50k
 // rows are "Peter" (~8300) spread over 8 cities, so ~1040 Peters per city. The
 // intersection fetches only that ~1040, not the whole ~8300 "Peter" bucket a
