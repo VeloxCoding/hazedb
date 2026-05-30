@@ -268,11 +268,11 @@ func TestIndexMultiplePerTable(t *testing.T) {
 
 	plE, _ := db.prepare("SELECT id FROM users WHERE email = ?", db.cat.Load())
 	plC, _ := db.prepare("SELECT id FROM users WHERE city = ?", db.cat.Load())
-	if !plE.idxLookup || plE.idxColOrd != 1 {
-		t.Fatalf("email query did not plan on the email index: %+v", plE.idxLookup)
+	if !plE.idxLookup || len(plE.idxCols) != 1 || plE.idxCols[0] != 1 {
+		t.Fatalf("email query did not plan on the email index: %+v", plE.idxCols)
 	}
-	if !plC.idxLookup || plC.idxColOrd != 2 {
-		t.Fatalf("city query did not plan on the city index")
+	if !plC.idxLookup || len(plC.idxCols) != 1 || plC.idxCols[0] != 2 {
+		t.Fatalf("city query did not plan on the city index: %+v", plC.idxCols)
 	}
 	if _, rows, _ := db.Query("SELECT id FROM users WHERE email = ?", "a@x"); len(rows) != 1 {
 		t.Fatal("email lookup wrong")
@@ -375,6 +375,47 @@ func TestIndexAndQuery(t *testing.T) {
 	}
 	if _, rows, _ := db.Query("SELECT id FROM users WHERE email = ? AND name = ?", "shared@x", "Carol"); len(rows) != 0 {
 		t.Fatalf("AND query with no match should be empty: %v", rows)
+	}
+}
+
+// Two non-unique indexes intersect: WHERE name = ? AND city = ? fetches only
+// the rows matching BOTH, not the whole name bucket or the whole city bucket.
+// The "1000 Peters in Amsterdam" case, at small scale.
+func TestIndexIntersection(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE users (id uuid primary key, name text, age int null, city text, INDEX (name), INDEX (city))")
+	ins := func(name, city string) {
+		db.Exec("INSERT INTO users (id, name, age, city) VALUES (?, ?, ?, ?)", NewUUIDv7(), name, 30, city)
+	}
+	for i := 0; i < 10; i++ {
+		ins("Peter", "Amsterdam") // both
+	}
+	for i := 0; i < 20; i++ {
+		ins("Peter", "Rotterdam") // name only
+	}
+	for i := 0; i < 30; i++ {
+		ins("Jan", "Amsterdam") // city only
+	}
+	db.mergeIndexes()
+
+	pl, _ := db.prepare("SELECT id FROM users WHERE name = ? AND city = ?", db.cat.Load())
+	if len(pl.idxCols) != 2 {
+		t.Fatalf("expected both indexes used, got %d", len(pl.idxCols))
+	}
+	if _, rows, _ := db.Query("SELECT id FROM users WHERE name = ? AND city = ?", "Peter", "Amsterdam"); len(rows) != 10 {
+		t.Fatalf("intersection wrong: got %d, want 10", len(rows))
+	}
+	// Sanity: each bucket alone is larger than the intersection.
+	if _, rows, _ := db.Query("SELECT id FROM users WHERE name = ?", "Peter"); len(rows) != 30 {
+		t.Fatalf("name bucket: got %d, want 30", len(rows))
+	}
+	if _, rows, _ := db.Query("SELECT id FROM users WHERE city = ?", "Amsterdam"); len(rows) != 40 {
+		t.Fatalf("city bucket: got %d, want 40", len(rows))
+	}
+	// Pre-merge (dirty overlay) must also intersect correctly.
+	ins("Peter", "Amsterdam") // 11th, not yet merged
+	if _, rows, _ := db.Query("SELECT id FROM users WHERE name = ? AND city = ?", "Peter", "Amsterdam"); len(rows) != 11 {
+		t.Fatalf("intersection via dirty overlay: got %d, want 11", len(rows))
 	}
 }
 

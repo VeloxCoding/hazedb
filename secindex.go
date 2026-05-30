@@ -114,6 +114,31 @@ func (si *secIndex) lookup(k indexKey) []UUID {
 	return out
 }
 
+// intersectPKs returns the PKs present in both a and b. It builds a set from
+// the smaller slice and probes it with the larger, so the cost is O(|a|+|b|)
+// with no row fetches. Index buckets hold each PK once, so no de-duplication is
+// needed. Used to combine two indexes' buckets (name = ? AND city = ?) before
+// fetching any row.
+func intersectPKs(a, b []UUID) []UUID {
+	if len(a) > len(b) {
+		a, b = b, a
+	}
+	if len(a) == 0 {
+		return nil
+	}
+	set := make(map[UUID]struct{}, len(a))
+	for _, pk := range a {
+		set[pk] = struct{}{}
+	}
+	out := make([]UUID, 0, len(a))
+	for _, pk := range b {
+		if _, ok := set[pk]; ok {
+			out = append(out, pk)
+		}
+	}
+	return out
+}
+
 // indexFor returns the table's secondary index on column ord, or nil.
 func (t *table) indexFor(ord int) *secIndex {
 	for _, si := range t.indexes {

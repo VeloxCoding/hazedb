@@ -89,3 +89,33 @@ func benchIndexMerge(b *testing.B, n int) {
 
 func BenchmarkIndexMerge_10k(b *testing.B) { benchIndexMerge(b, 10000) }
 func BenchmarkIndexMerge_50k(b *testing.B) { benchIndexMerge(b, 50000) }
+
+// Two non-unique indexes intersected: WHERE name = ? AND city = ?. ~1/6 of 50k
+// rows are "Peter" (~8300) spread over 8 cities, so ~1040 Peters per city. The
+// intersection fetches only that ~1040, not the whole ~8300 "Peter" bucket a
+// single-index plan would walk.
+func BenchmarkIndexIntersect_50k(b *testing.B) {
+	const n = 50000
+	db, err := Open(Options{Schema: Schema{}, IndexMergeInterval: -1, SizeHint: n})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec("CREATE TABLE users (id uuid primary key, name text, city text, INDEX (name), INDEX (city))")
+	cities := []string{"AMS", "RTM", "UTR", "DHG", "EIN", "GRN", "TIL", "ALM"}
+	for i := 0; i < n; i++ {
+		name := "other" + strconv.Itoa(i%40)
+		if i%6 == 0 {
+			name = "Peter"
+		}
+		db.Exec("INSERT INTO users (id, name, city) VALUES (?, ?, ?)", NewUUIDv7(), name, cities[i%8])
+	}
+	db.mergeIndexes()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, rows, err := db.Query("SELECT id, name, city FROM users WHERE name = ? AND city = ?", "Peter", "AMS"); err != nil || len(rows) == 0 {
+			b.Fatalf("rows=%d err=%v", len(rows), err)
+		}
+	}
+}

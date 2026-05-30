@@ -92,13 +92,15 @@ type plan struct {
 	partLookup bool
 	partSource expr
 
-	// idxLookup is true when a SELECT (no ORDER BY) pins a secondary-indexed
-	// column to a value (WHERE email = ?). The executor resolves candidate PKs
-	// through the index instead of scanning. idxColOrd is the indexed column;
-	// idxSource yields the value.
+	// idxLookup is true when a SELECT (no ORDER BY) pins one or more
+	// secondary-indexed columns by equality (WHERE name = ? AND city = ?). The
+	// executor resolves candidate PKs through the index(es) instead of scanning.
+	// idxCols / idxSrcs are parallel: the indexed column ordinals and the exprs
+	// yielding their values. Two or more => intersect their buckets before the
+	// residual full-WHERE filter.
 	idxLookup bool
-	idxColOrd int
-	idxSource expr
+	idxCols   []int
+	idxSrcs   []expr
 }
 
 func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
@@ -180,18 +182,14 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 				// scan (the index is unordered) — a v1 limitation.
 				eqs := map[int]expr{}
 				collectEqConjuncts(s.where, eqs)
-				var chosen *resolvedIndex
 				for i := range rt.indexes {
 					ri := &rt.indexes[i]
-					if _, has := eqs[ri.ordinal]; has && (chosen == nil || (ri.unique && !chosen.unique)) {
-						chosen = ri
+					if src, has := eqs[ri.ordinal]; has {
+						pl.idxCols = append(pl.idxCols, ri.ordinal)
+						pl.idxSrcs = append(pl.idxSrcs, src)
 					}
 				}
-				if chosen != nil {
-					pl.idxLookup = true
-					pl.idxColOrd = chosen.ordinal
-					pl.idxSource = eqs[chosen.ordinal]
-				}
+				pl.idxLookup = len(pl.idxCols) > 0
 			}
 		}
 	case *insertStmt:
@@ -580,24 +578,41 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 	st := pl.st.(*selectStmt)
 	tbl := pl.rt
 	colNames := pl.colNames
-	keyVal, err := evalExpr(pl.idxSource, ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	if keyVal.IsNull() || st.limit == 0 {
+	if st.limit == 0 {
 		return colNames, nil, nil
 	}
-	si := tbl.indexFor(pl.idxColOrd)
-	if si == nil {
-		return colNames, nil, nil
+	// Index side: one bucket per indexed equality conjunct, intersected. With
+	// two indexes (WHERE name = ? AND city = ?) this shrinks the candidate set
+	// to rows matching BOTH before any row is fetched — e.g. the 1000 Peters in
+	// Amsterdam, not all 8000 Peters. A NULL key matches nothing.
+	var pks []UUID
+	for i, ord := range pl.idxCols {
+		keyVal, err := evalExpr(pl.idxSrcs[i], ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		if keyVal.IsNull() {
+			return colNames, nil, nil
+		}
+		si := tbl.indexFor(ord)
+		if si == nil {
+			return colNames, nil, nil
+		}
+		bucket := si.lookup(keyOf(keyVal))
+		if i == 0 {
+			pks = bucket
+		} else {
+			pks = intersectPKs(pks, bucket)
+		}
+		if len(pks) == 0 {
+			break // index side empty; the dirty overlay below may still match
+		}
 	}
-	wantKey := keyOf(keyVal)
-	// Hybrid candidate set: index hits (pre-merge) UNION the dirty PKs (mutated
-	// since the last merge, value uncertain). Every candidate's live row is
-	// evaluated against the FULL WHERE, so neither a stale index entry, an
-	// unrelated dirty PK, nor an extra conjunct (AND name = ?) can yield a wrong
-	// row. starAll keeps the whole row; otherwise project the wanted columns.
-	pks := si.lookup(wantKey)
+	// Hybrid candidate set: the (intersected) index hits UNION the dirty PKs
+	// (mutated since the last merge, membership uncertain). Every candidate's
+	// live row is evaluated against the FULL WHERE, so neither a stale entry, an
+	// unrelated dirty PK, nor an extra conjunct can yield a wrong row. starAll
+	// keeps the whole row; otherwise project the wanted columns.
 	dirty := tbl.dirtyPKs()
 	if len(pks) == 0 && len(dirty) == 0 {
 		return colNames, nil, nil

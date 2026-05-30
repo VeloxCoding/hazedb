@@ -91,18 +91,24 @@ write-path cost: one append, no new locks, independent of the index count.
 
 For `WHERE indexedcol = ?`:
 
-1. **Index lookup**(value) → candidate PKs (pre-merge coverage).
-2. **Pending overlay**: walk each shard's pending list; apply
-   additions/removals/changes for *this* value to the candidate set (post-merge
-   coverage).
-3. For each resulting PK: **O(1) fetch** from its PK shard, **re-evaluate the
-   predicate on the live row**, project.
+1. **Index lookup**(value) → candidate PKs (pre-merge coverage). When the WHERE
+   pins *several* indexed columns by equality (`name = ? AND city = ?`), look up
+   each one's bucket and **intersect** them (smaller set first, a pure PK set
+   operation — no row fetches), so only rows matching all of them survive (the
+   1000 Peters in Amsterdam, not all 8000 Peters).
+2. **Pending overlay**: union the dirty PKs (mutated since the last merge,
+   membership uncertain) into the candidate set — always, regardless of the
+   intersection, since a not-yet-merged row may match.
+3. For each resulting PK: **O(1) fetch** from its PK shard, **evaluate the FULL
+   `WHERE` on the live row**, project. The full-WHERE check both re-validates the
+   indexed equality (so a stale entry is harmless) and applies any residual
+   conjuncts (`AND age > ?`, an `OR` group).
 
 **Why this is correct at any lag.** The index covers everything before the merge,
-pending covers everything after → the union misses no row. The live re-check
-filters false positives (a stale entry whose row has since changed or died — and
-tombstones are already skipped, [exec.go](../exec.go)). The index/pending only
-*narrows* the candidate set; the truth always comes from the live row.
+the dirty overlay everything after → the union misses no row. The live full-WHERE
+check filters false positives (a stale entry whose row has since changed or died
+— and tombstones are already skipped, [exec.go](../exec.go)). The index/overlay
+only *narrows* the candidate set; the truth always comes from the live row.
 
 ---
 
