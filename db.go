@@ -64,6 +64,13 @@ type DB struct {
 	// goroutine then closes mergeDone. See docs/secondary-indexes.md.
 	mergeStop chan struct{}
 	mergeDone chan struct{}
+
+	// sq is the on-disk SQLite mirror (nil when SQLitePath is unset). The drain
+	// loop feeds sealed WAL segments into it; drainStop/drainDone drive that
+	// goroutine, mirroring the merger. See docs/durability.md.
+	sq        *sqliteMirror
+	drainStop chan struct{}
+	drainDone chan struct{}
 }
 
 // Options control Open behaviour.
@@ -102,6 +109,21 @@ type Options struct {
 	// one. Forced on (default 5s) when SQLitePath is set. See docs/durability.md.
 	WALRotateInterval time.Duration
 
+	// SQLitePath enables the on-disk SQLite mirror at this path. A background
+	// loop drains sealed WAL segments into it (current state, compacted,
+	// queryable). Empty = no mirror. Requires WALPath; forces segmented mode.
+	SQLitePath string
+
+	// DrainInterval is how often sealed segments are drained into SQLite. Zero
+	// selects 1 minute; a negative value disables the loop (manual drain only,
+	// for tests). Ignored when SQLitePath is empty.
+	DrainInterval time.Duration
+
+	// SegmentDrainMinAge skips segments sealed more recently than this, so the
+	// drain only touches settled history (never the just-rotated segment). Zero
+	// selects 5s; negative disables the age gate. Ignored when SQLitePath empty.
+	SegmentDrainMinAge time.Duration
+
 	// IndexMergeInterval is how often the background goroutine reconciles
 	// secondary indexes with the dirty rows. Zero selects a default (50ms); a
 	// negative value disables the goroutine (manual merge only — used by tests
@@ -117,6 +139,9 @@ func Open(opts Options) (*DB, error) {
 	if sizeHint <= 0 {
 		sizeHint = 1024
 	}
+	if opts.SQLitePath != "" && opts.WALPath == "" {
+		return nil, fmt.Errorf("hazedb: SQLitePath requires WALPath (the mirror is fed from sealed WAL segments)")
+	}
 	// An empty schema is allowed — tables can be created at runtime.
 	cat, err := newCatalog(opts.Schema, sizeHint)
 	if err != nil {
@@ -130,7 +155,10 @@ func Open(opts Options) (*DB, error) {
 	db.cat.Store(cat)
 	if opts.WALPath != "" {
 		rotateInterval := opts.WALRotateInterval
-		segmented := rotateInterval > 0
+		segmented := rotateInterval > 0 || opts.SQLitePath != ""
+		if segmented && rotateInterval <= 0 {
+			rotateInterval = 5 * time.Second // default rotation cadence when draining
+		}
 		var w *wal
 		var err error
 		if segmented {
@@ -169,6 +197,26 @@ func Open(opts Options) (*DB, error) {
 		// Replay marked rows dirty but never built the indexes; rebuild them
 		// from the live rows now, so reads are index-fast before serving.
 		db.rebuildAllIndexes()
+
+		if opts.SQLitePath != "" {
+			minAge := opts.SegmentDrainMinAge
+			if minAge == 0 {
+				minAge = 5 * time.Second
+			}
+			m, err := newSQLiteMirror(opts.SQLitePath, db.cat.Load(), minAge)
+			if err != nil {
+				w.close()
+				return nil, err
+			}
+			db.sq = m
+			drainInterval := opts.DrainInterval
+			if drainInterval == 0 {
+				drainInterval = time.Minute
+			}
+			if drainInterval > 0 {
+				db.startDrainLoop(drainInterval)
+			}
+		}
 	}
 	mergeInterval := opts.IndexMergeInterval
 	if mergeInterval == 0 {
@@ -180,14 +228,23 @@ func Open(opts Options) (*DB, error) {
 	return db, nil
 }
 
-// Close stops the index merger (with a final drain), then flushes and closes
-// the WAL. Memory-only DBs still stop the merger.
+// Close stops the SQLite drain loop (which seals the active segment and runs a
+// final drain so the mirror is current), then the index merger, then flushes
+// and closes the WAL, then closes the mirror. Memory-only DBs still stop the
+// merger. The drain loop is stopped first, while the WAL is still open.
 func (db *DB) Close() error {
+	db.stopDrainLoop()
 	db.stopMergeLoop()
+	var err error
 	if db.wal != nil {
-		return db.wal.close()
+		err = db.wal.close()
 	}
-	return nil
+	if db.sq != nil {
+		if cerr := db.sq.close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}
+	return err
 }
 
 // FlushWAL forces bufio to fsync. Use before reading a record back

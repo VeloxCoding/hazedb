@@ -338,15 +338,25 @@ func (w *wal) replay(apply func(recType uint8, payload []byte) error) error {
 	return w.replayFile(w.f, apply)
 }
 
-// replayFile reads one open WAL file from the start to EOF, handing each
-// record's (type, payload) to apply.
+// replayFile replays one open WAL file into apply, counting each record in the
+// WAL's lsn (the recovery path). Reads via scanRecords.
+func (w *wal) replayFile(f *os.File, apply func(recType uint8, payload []byte) error) error {
+	return scanRecords(f, func(recType uint8, payload []byte) error {
+		w.lsn++
+		return apply(recType, payload)
+	})
+}
+
+// scanRecords reads f from the start to EOF, handing each complete record's
+// (type, payload) to apply. Pure — it touches no WAL state, so a drainer can
+// scan a sealed segment without disturbing the live WAL's counters.
 //
 // Tail tolerance: a truncated final record (short header/payload read, or a
 // declared length past EOF) is the incomplete tail of an interrupted write
 // and is discarded. A wrong magic, a version newer than this binary, or a CRC
-// mismatch on a fully-present record is hard corruption and aborts Open.
+// mismatch on a fully-present record is hard corruption and aborts the caller.
 // payload aliases the read buffer; the caller's decoders copy what they keep.
-func (w *wal) replayFile(f *os.File, apply func(recType uint8, payload []byte) error) error {
+func scanRecords(f *os.File, apply func(recType uint8, payload []byte) error) error {
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
@@ -400,7 +410,6 @@ func (w *wal) replayFile(f *os.File, apply func(recType uint8, payload []byte) e
 		if want != crc {
 			return fmt.Errorf("%w: crc mismatch at offset %d", ErrWALCorrupt, pos-int64(length)-4-8)
 		}
-		w.lsn++
 		if err := apply(recType, payload); err != nil {
 			return err
 		}
