@@ -96,7 +96,9 @@ func (w *wal) startActiveSegment() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.seg++
-	f, err := os.OpenFile(w.segPath(w.seg), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
+	// Fresh, empty segment written by a single appender under w.mu — no O_APPEND
+	// needed (it would force a kernel seek-to-end on every write).
+	f, err := os.OpenFile(w.segPath(w.seg), os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return fmt.Errorf("wal: open segment %q: %w", w.segPath(w.seg), err)
 	}
@@ -203,7 +205,7 @@ func (w *wal) rotate() error {
 		return w.err
 	}
 	w.seg++
-	f, err := os.OpenFile(w.segPath(w.seg), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(w.segPath(w.seg), os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		w.err = fmt.Errorf("wal: rotate open %q: %w", w.segPath(w.seg), err)
 		return w.err
