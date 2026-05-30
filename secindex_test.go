@@ -2,6 +2,7 @@ package hazedb
 
 import (
 	"path/filepath"
+	"sort"
 	"strconv"
 	"sync"
 	"testing"
@@ -477,6 +478,89 @@ func TestOrderedIndexOrderBy(t *testing.T) {
 	db.Exec("INSERT INTO posts (id, email) VALUES (?, ?)", NewUUIDv7(), "f@x")  // after e@x
 	if got := get("SELECT email FROM posts ORDER BY email ASC LIMIT 4"); !eqS(got, []string{"a@x", "aa@x", "b@x", "c@x"}) {
 		t.Fatalf("snap+overlay ASC LIMIT 4: %v", got)
+	}
+}
+
+// O4: the golden invariant for the ordered walk under concurrent writers,
+// readers, and the background merger (run with -race). Live: an ORDER BY result
+// is monotonic (no out-of-order row). Quiescent: the ordered walk equals a
+// brute-force scan-then-sort.
+func TestOrderedIndexConcurrentInvariant(t *testing.T) {
+	db, err := Open(Options{Schema: Schema{}, IndexMergeInterval: 2 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec("CREATE TABLE posts (id uuid primary key, score int, ORDERED INDEX (score))")
+	const N = 300
+	ids := make([]UUID, N)
+	for i := range ids {
+		ids[i] = NewUUIDv7()
+		db.Exec("INSERT INTO posts (id, score) VALUES (?, ?)", ids[i], i%50)
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for w := 0; w < 4; w++ { // writers churn score
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			r := seed
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				db.Exec("UPDATE posts SET score = ? WHERE id = ?", r%50, ids[r%N])
+				r += 7
+			}
+		}(w)
+	}
+	for rd := 0; rd < 4; rd++ { // readers: ORDER BY must come back monotonic
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for k := 0; k < 3000; k++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_, rows, err := db.Query("SELECT score FROM posts ORDER BY score ASC LIMIT 20")
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				for i := 1; i < len(rows); i++ {
+					if rows[i][0].Int() < rows[i-1][0].Int() {
+						t.Errorf("ordered walk not sorted: %d after %d", rows[i][0].Int(), rows[i-1][0].Int())
+						return
+					}
+				}
+			}
+		}()
+	}
+	time.Sleep(150 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	// Quiescent: ordered walk == brute-force scan + sort.
+	db.mergeIndexes()
+	_, all, _ := db.Query("SELECT score FROM posts")
+	scores := make([]int, len(all))
+	for i, r := range all {
+		scores[i] = int(r[0].Int())
+	}
+	sort.Ints(scores)
+	_, top, _ := db.Query("SELECT score FROM posts ORDER BY score ASC LIMIT 30")
+	if len(top) != 30 {
+		t.Fatalf("ordered walk returned %d rows, want 30", len(top))
+	}
+	for i := range top {
+		if int(top[i][0].Int()) != scores[i] {
+			t.Fatalf("walk[%d]=%d, scan-sorted=%d", i, top[i][0].Int(), scores[i])
+		}
 	}
 }
 
