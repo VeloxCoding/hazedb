@@ -558,21 +558,25 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 	if si == nil {
 		return colNames, nil, nil
 	}
-	pks := si.lookup(keyOf(keyVal))
+	wantKey := keyOf(keyVal)
+	pks := si.lookup(wantKey)
 	if len(pks) == 0 {
 		return colNames, nil, nil
 	}
+	// Hybrid read: the index only narrows the candidate set; getByPKCheckProject
+	// re-confirms each row's live value against wantKey, so a stale entry (from a
+	// lagging async index, S4+) yields no wrong row. starAll passes ords nil.
+	ords := pl.projOrdinals
+	if st.starAll {
+		ords = nil
+	}
 	out := make([]Row, 0, len(pks))
 	for _, pk := range pks {
-		if st.starAll {
-			if r, ok := tbl.getByPK(pk); ok {
-				out = append(out, r)
+		if r, ok := tbl.getByPKCheckProject(pk, pl.idxColOrd, wantKey, ords); ok {
+			out = append(out, r)
+			if st.limit >= 0 && len(out) >= st.limit {
+				break
 			}
-		} else if pr, ok := tbl.getByPKProject(pk, pl.projOrdinals); ok {
-			out = append(out, pr)
-		}
-		if st.limit >= 0 && len(out) >= st.limit {
-			break
 		}
 	}
 	return colNames, out, nil

@@ -71,6 +71,32 @@ func TestIndexBulkRebuild(t *testing.T) {
 	}
 }
 
+// S3: the hybrid read re-checks each candidate against the live row, so a stale
+// index entry (a phantom PK, or a PK whose live value no longer matches) yields
+// no wrong row. Injected directly to simulate a lagging async index.
+func TestIndexHybridRecheckFiltersStale(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE users (id uuid primary key, email text, INDEX (email))")
+	id := NewUUIDv7()
+	db.Exec("INSERT INTO users (id, email) VALUES (?, ?)", id, "real@x")
+
+	tbl := db.cat.Load().byName["users"].table
+	si := tbl.indexFor(tbl.def.colByName["email"])
+	phantom := NewUUIDv7() // never inserted
+	si.mu.Lock()
+	// "ghost@x" bucket: a phantom PK (absent row) and the real id (whose live
+	// email is "real@x", not "ghost@x"). Both must be filtered by the re-check.
+	si.fwd[keyOf(Str("ghost@x"))] = []UUID{phantom, id}
+	si.mu.Unlock()
+
+	if _, rows, _ := db.Query("SELECT id FROM users WHERE email = ?", "ghost@x"); len(rows) != 0 {
+		t.Fatalf("hybrid re-check did not filter stale entries: %v", rows)
+	}
+	if _, rows, _ := db.Query("SELECT id FROM users WHERE email = ?", "real@x"); len(rows) != 1 {
+		t.Fatal("hybrid re-check dropped a valid row")
+	}
+}
+
 // S2: a non-unique index returns every matching row (bucket of PKs).
 func TestIndexNonUniqueBucket(t *testing.T) {
 	db := openEmpty(t)
