@@ -351,6 +351,40 @@ func TestIndexRebuildAfterRestart(t *testing.T) {
 	}
 }
 
+// O1: ORDERED INDEX parses, resolves with the ordered flag, survives a restart,
+// and (until O2) still serves equality like a hash index.
+func TestOrderedIndexDeclared(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ord.wal")
+	db, err := Open(Options{Schema: Schema{}, WALPath: path, IndexMergeInterval: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE TABLE posts (id uuid primary key, email text, ORDERED INDEX (email))"); err != nil {
+		t.Fatal(err)
+	}
+	rt := db.cat.Load().byName["posts"].table
+	if len(rt.def.indexes) != 1 || !rt.def.indexes[0].ordered {
+		t.Fatalf("ordered flag not resolved: %+v", rt.def.indexes)
+	}
+	id := NewUUIDv7()
+	db.Exec("INSERT INTO posts (id, email) VALUES (?, ?)", id, "a@x")
+	if _, rows, _ := db.Query("SELECT id FROM posts WHERE email = ?", "a@x"); len(rows) != 1 {
+		t.Fatal("equality on ordered index broken")
+	}
+	db.Close()
+
+	db2, err := Open(Options{Schema: Schema{}, WALPath: path, IndexMergeInterval: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	rt2 := db2.cat.Load().byName["posts"].table
+	if len(rt2.def.indexes) != 1 || !rt2.def.indexes[0].ordered {
+		t.Fatalf("ordered flag lost after restart: %+v", rt2.def.indexes)
+	}
+}
+
 // AND of equalities: the planner picks one index for a conjunct and
 // residual-filters the full WHERE on the candidates. SELECT ... WHERE email = ?
 // AND name = ? returns only rows matching both.

@@ -83,7 +83,7 @@ func (p *parser) parseCreate() (*createStmt, error) {
 	for {
 		// Table-level index declaration ([UNIQUE] INDEX [name] (col)) instead of
 		// a column. "index"/"unique" are thus reserved as leading words here.
-		if t := p.peek(); t.kind == tkIdent && (t.text == "index" || t.text == "unique") {
+		if t := p.peek(); t.kind == tkIdent && (t.text == "index" || t.text == "unique" || t.text == "ordered") {
 			ix, err := p.parseIndexClause()
 			if err != nil {
 				return nil, err
@@ -147,22 +147,27 @@ func (p *parser) parseCreate() (*createStmt, error) {
 
 // parseIndexClause parses a table-level index declaration:
 //
-//	[UNIQUE] INDEX [name] (col)
+//	[UNIQUE] [ORDERED] INDEX [name] (col)
 //
-// Single-column only in v1; a composite list errors.
+// ORDERED makes it a sorted index (equality + ranges + ORDER BY); the default
+// is a hash index (equality only). Single-column only in v1; a composite errors.
 func (p *parser) parseIndexClause() (IndexDef, error) {
 	var ix IndexDef
-	if p.peek().text == "unique" {
-		p.advance()
-		ix.Unique = true
-		if p.peek().text == "index" {
+	for { // optional modifiers in any order before INDEX
+		switch p.peek().text {
+		case "unique":
 			p.advance()
+			ix.Unique = true
+			continue
+		case "ordered":
+			p.advance()
+			ix.Ordered = true
+			continue
 		}
-	} else {
-		w := p.advance() // "index"
-		if w.text != "index" {
-			return ix, fmt.Errorf("%w: expected INDEX at %d", ErrParse, w.pos)
-		}
+		break
+	}
+	if w := p.advance(); w.text != "index" {
+		return ix, fmt.Errorf("%w: expected INDEX at %d", ErrParse, w.pos)
 	}
 	if p.peek().kind == tkIdent { // optional index name before the '('
 		ix.Name = p.advance().text

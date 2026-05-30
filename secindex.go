@@ -51,6 +51,7 @@ func keyOf(v Value) indexKey {
 type secIndex struct {
 	ordinal int
 	unique  bool
+	ordered bool // sorted index (equality + ranges + ORDER BY); see O2
 	mu      sync.RWMutex
 	fwd     map[indexKey][]UUID
 	rev     map[UUID]indexKey
@@ -60,6 +61,7 @@ func newSecIndex(ri resolvedIndex) *secIndex {
 	return &secIndex{
 		ordinal: ri.ordinal,
 		unique:  ri.unique,
+		ordered: ri.ordered,
 		fwd:     make(map[indexKey][]UUID),
 		rev:     make(map[UUID]indexKey),
 	}

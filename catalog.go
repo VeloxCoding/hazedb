@@ -171,6 +171,9 @@ func encodeCreateTable(buf []byte, tableID uint16, td TableDef) []byte {
 		if ix.Unique {
 			flags |= 1
 		}
+		if ix.Ordered {
+			flags |= 2
+		}
 		buf = append(buf, flags)
 	}
 	return buf
@@ -236,7 +239,7 @@ func decodeCreateTable(b []byte) (uint16, TableDef, error) {
 		}
 		flags := b[off]
 		off++
-		td.Indexes = append(td.Indexes, IndexDef{Name: name, Column: col, Unique: flags&1 != 0})
+		td.Indexes = append(td.Indexes, IndexDef{Name: name, Column: col, Unique: flags&1 != 0, Ordered: flags&2 != 0})
 	}
 	return tableID, td, nil
 }
