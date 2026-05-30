@@ -255,6 +255,53 @@ func TestIndexNonUniqueBucket(t *testing.T) {
 	}
 }
 
+// S7: two indexes on one table. Each plans its own lookup; an update to one
+// indexed column moves only that index; a delete drops the row from both.
+func TestIndexMultiplePerTable(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE users (id uuid primary key, email text, city text, UNIQUE INDEX (email), INDEX (city))")
+	a, b := NewUUIDv7(), NewUUIDv7()
+	db.Exec("INSERT INTO users (id, email, city) VALUES (?, ?, ?)", a, "a@x", "AMS")
+	db.Exec("INSERT INTO users (id, email, city) VALUES (?, ?, ?)", b, "b@x", "AMS")
+	db.mergeIndexes()
+
+	plE, _ := db.prepare("SELECT id FROM users WHERE email = ?", db.cat.Load())
+	plC, _ := db.prepare("SELECT id FROM users WHERE city = ?", db.cat.Load())
+	if !plE.idxLookup || plE.idxColOrd != 1 {
+		t.Fatalf("email query did not plan on the email index: %+v", plE.idxLookup)
+	}
+	if !plC.idxLookup || plC.idxColOrd != 2 {
+		t.Fatalf("city query did not plan on the city index")
+	}
+	if _, rows, _ := db.Query("SELECT id FROM users WHERE email = ?", "a@x"); len(rows) != 1 {
+		t.Fatal("email lookup wrong")
+	}
+	if _, rows, _ := db.Query("SELECT id FROM users WHERE city = ?", "AMS"); len(rows) != 2 {
+		t.Fatal("city lookup wrong")
+	}
+
+	db.Exec("UPDATE users SET email = ? WHERE id = ?", "a2@x", a) // moves only the email index
+	db.mergeIndexes()
+	if _, rows, _ := db.Query("SELECT id FROM users WHERE email = ?", "a@x"); len(rows) != 0 {
+		t.Fatal("old email lingered")
+	}
+	if _, rows, _ := db.Query("SELECT id FROM users WHERE email = ?", "a2@x"); len(rows) != 1 {
+		t.Fatal("new email missing")
+	}
+	if _, rows, _ := db.Query("SELECT id FROM users WHERE city = ?", "AMS"); len(rows) != 2 {
+		t.Fatal("city index disturbed by an email-only update")
+	}
+
+	db.Exec("DELETE FROM users WHERE id = ?", a) // drops from both indexes
+	db.mergeIndexes()
+	if _, rows, _ := db.Query("SELECT id FROM users WHERE email = ?", "a2@x"); len(rows) != 0 {
+		t.Fatal("deleted row's email lingered")
+	}
+	if _, rows, _ := db.Query("SELECT id FROM users WHERE city = ?", "AMS"); len(rows) != 1 {
+		t.Fatal("city index not updated on delete")
+	}
+}
+
 // S6: churn within non-unique buckets — moving a PK between buckets (update) and
 // removing one (delete), across merges, must keep both buckets exact. Exercises
 // removeFwdLocked's swap-remove on multi-PK buckets.
