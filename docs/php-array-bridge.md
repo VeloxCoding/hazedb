@@ -2,51 +2,60 @@
 
 **Status: implemented** (FrankenPHP extension under [`addons/frankenphp-ext`](../addons/frankenphp-ext)).
 
-This note records why and how PHP exchanges data with hazedb as **native PHP
-arrays** instead of JSON strings, the design alternatives weighed, the measured
-results, and exactly which files changed. It documents shipped work — it is not
-an open proposal.
+This note records how PHP exchanges data with hazedb as **native PHP arrays**
+(no JSON either way), the PDO-shaped API that resulted, the design alternatives
+weighed, the measured results, and exactly which files changed. It documents
+shipped work — not an open proposal.
 
 ---
 
 ## 1. Summary
 
-The PHP extension originally passed all multi-value arguments and all results as
-**JSON strings** (`json_encode` in PHP → `json.Decode` in Go, and back). That
+The extension originally passed all multi-value args and all results as **JSON
+strings** (`json_encode` in PHP → `json.Decode` in Go, and back). That
 round-trip dominated the per-call cost: ~1.1 µs of Go-side JSON decode per
-insert and a ~447 ns `json_decode` tax per read — more than the entire rest of
-the call.
+insert and a ~447 ns `json_decode` tax per read.
 
 The fix is a small **zval trampoline layer** (static-inline C wrapping the Zend
-macros cgo cannot call) plus a typed Go write path, exposing three functions
-that skip JSON entirely:
+macros cgo cannot call) plus typed Go entry points, exposing a **PDO-shaped**
+API that skips JSON entirely:
 
-- `hazedb_get($sql, $id): ?array` — point read → one flat assoc array.
-- `hazedb_query_arr($sql, $args): ?array` — multi-row read → `{columns, rows}`.
-- `hazedb_exec_arr($sql, array $args): ?string` — write with a native array of args.
+| function | ≈ PDO | returns |
+|---|---|---|
+| `hazedb_fetch($sql, $args=null)` | `fetch(PDO::FETCH_ASSOC)` | one assoc row, or `null` |
+| `hazedb_fetchall($sql, $args=null)` | `fetchAll(PDO::FETCH_ASSOC)` | list of assoc rows; `[]` if none |
+| `hazedb_fetchall_json($sql, $args=null)` | — | the same data as a JSON string (pass-through) |
+| `hazedb_exec($sql, $args=null)` | `execute(...)` + `rowCount()` | affected `int`, or `-1` on error |
 
-Net effect (in-memory, in-process from PHP): point reads **~1.16M → ~2.85M
-qps**, inserts **~445K → ~875K qps**. Packaging is unchanged — the trampolines
-compile into the same single FrankenPHP binary.
+`$args` (`mixed`, optional) takes either a native PHP **array** of positional
+params (`[$a, $b]`, like `execute`) **or**, for a single param, the **bare
+scalar** (`$id`) — the scalar form is the fast path (~80 ns/call cheaper; no
+array built in PHP or read in Go). Result cells come back as **native PHP types**
+(int, bool, string) — not stringified the way PDO+SQLite does by default.
+
+Measured in one FrankenPHP process (PHP 8.5.6), in-memory:
+
+| | hazedb | SQLite `:memory:` | factor |
+|---|---|---|---|
+| INSERT (independent) | ~940K qps | ~370K (autocommit) / ~850K (batched) | ~2.5× autocommit; beats batched |
+| point read → assoc row | ~2.07M qps (`hazedb_fetch`) | ~1.06M (prepared + FETCH_ASSOC) | ~2× |
 
 ---
 
 ## 2. The problem
 
 The PHP surface is string-only by nature (the first functions were
-string-in/string-out, which needs no C glue). To pass *several* typed values
-through one string parameter, args were serialised as a JSON array; results came
-back as a JSON envelope the caller had to `json_decode`. Measured costs:
+string-in/string-out, which needs no C glue). To pass several typed values
+through one string parameter, args were JSON-encoded; results came back as a
+JSON envelope the caller had to `json_decode`. Measured costs:
 
-| step | cost | where |
-|---|---|---|
-| Args JSON decode (Go), 3-element array | ~1100 ns / ~20 allocs | `QueryArgs` → `json.Decode` |
-| `json_decode` of a result (PHP) | ~447 ns (≈55% of the decoded call) | PHP runtime |
+| step | cost |
+|---|---|
+| Args JSON decode (Go), 3-element array | ~1100 ns / ~20 allocs |
+| `json_decode` of a result (PHP) | ~447 ns (≈55% of the decoded call) |
 
-So for an **insert**, half the per-call cost was the JSON args round-trip; for a
-**read returning usable data**, more than half was PHP's `json_decode`. Single-key
-reads already avoided JSON on the args side (the direct-UUID form), but the
-result still came back as a string to decode.
+For an insert, half the per-call cost was the JSON args round-trip; for a read
+returning usable data, more than half was PHP's `json_decode`.
 
 ---
 
@@ -54,16 +63,21 @@ result still came back as a string to decode.
 
 | option | verdict |
 |---|---|
-| **Keep JSON** | Simple, dependency-free, but pays the full round-trip both ways. |
-| **Hand-rolled flat-array args parser** (still a JSON string, faster Go decode) | Removes ~half the args tax, but PHP still `json_encode`s. Partial. |
-| **goccy/go-json** for encode/decode | Measured ~1.3× over stdlib for this shape — *slower* than the hand-rolled JSON encoder already in `wire.go`, and adds a core dependency. Rejected. |
-| **MessagePack** | No Go-side win over hand-rolled JSON; adds a PHP extension dependency; payload size is irrelevant in-process. Rejected. |
-| **Native PHP arrays via zval trampolines** | Removes JSON on both sides entirely. Needs static-inline C glue (cgo can't call the Zend array macros), but stays in one binary. **Chosen.** |
+| **Keep JSON** | Simple, but pays the full round-trip both ways. |
+| **Hand-rolled flat-array args parser** (still a JSON string) | Removes ~half the args tax, but PHP still `json_encode`s. Partial. |
+| **goccy/go-json** | ~1.3× over stdlib for this shape — *slower* than the hand-rolled JSON encoder in `wire.go`, and adds a core dependency. Rejected. |
+| **MessagePack** | No Go-side win over hand-rolled JSON; needs a PHP extension; payload size is irrelevant in-process. Rejected. |
+| **Native PHP arrays via zval trampolines** | Removes JSON on both sides. Needs static-inline C glue, but stays in one binary. **Chosen.** |
 
 The native-array path wins because it deletes the serialisation step rather than
-speeding it up. The decision was gated on a pure-Go measurement first (see §6):
-the typed write path proved ~4.2× faster than the JSON-args path before any C
-glue was written.
+speeding it up. The decision was gated on a pure-Go measurement first: the typed
+write path proved ~4.2× faster than the JSON-args path before any C glue was
+written.
+
+**API naming** landed on PDO's vocabulary (`fetch`/`fetchall`/`exec`) so it is
+instantly familiar. The single-vs-many distinction is two functions (`fetch` vs
+`fetchall`), matching PDO's `fetch()` vs `fetchAll()` — it is the caller's
+explicit choice, never inferred from the data or the args.
 
 ---
 
@@ -71,51 +85,31 @@ glue was written.
 
 Two layers.
 
-**Core (Go), in [`db.go`](../db.go):** a typed write entry point that bypasses
-the `[]any`/JSON conversion `Exec` uses.
+**Core (Go) — typed entry points** that bypass the `[]any`/JSON conversion:
 
-- [`ExecValues(sql string, args ...Value)`](../db.go) — prepare + dispatch with
-  pre-typed `Value`s, no JSON, no interface boxing, no per-arg type switch.
-- `execPlanValues` clones each arg with `cloneValue` (a no-op except for
-  `KindBytes`, which must not alias caller memory across the write boundary —
-  the same guarantee `toValue` gives the `[]any` path).
-- Reads reuse the existing [`QueryRow`](../db.go) / `Query` — no new core read
-  function was needed; they already return typed rows.
+- [`ExecValues(sql, args ...Value)`](../db.go) — write with pre-typed Values.
+- [`QueryValues`](../db.go) / [`QueryRowValues`](../db.go) — read counterparts.
+- [`RowsToJSONObjects`](../wire.go) — hand-rolled `[{...},...]` encoder for
+  `hazedb_fetchall_json`.
 
-**Extension (cgo), in
-[`hazedb_ext.go`](../addons/frankenphp-ext/hazedb_ext.go):** a zval trampoline
-layer plus the three functions.
+These clone bytes only at the write boundary (`cloneValue`); reads never store
+args, so they pass Values straight through.
 
-- **Build trampolines** (Go rows → PHP array): `hzd_arr_new`, `hzd_push_*`
-  (numeric-indexed), `hzd_set_arr` / `hzd_set_*` (keyed). Used to construct the
-  result arrays.
-- **Read trampolines** (PHP array → Go): `hzd_arr_count`, `hzd_arr_get`,
-  `hzd_zval_kind` (normalises the zval type to a small stable code), and the
-  value accessors. Used to read native args.
+**Extension (cgo) — the zval trampolines + the four functions** in
+[`hazedb_ext.go`](../addons/frankenphp-ext/hazedb_ext.go):
 
-### API shape — which function when
+- **Build** (Go rows → PHP): `hzd_arr_new`, `hzd_push_arr`, and keyed setters
+  `hzd_set_long/bool/null/strn` (assoc rows keyed by column name).
+- **Read** (PHP args array → Go): `hzd_arr_count`, `hzd_arr_get`,
+  `hzd_zval_kind` (normalises the zval type) and the value accessors →
+  `valuesFromZval` builds `[]Value`.
 
-Reads come in **two array variants, by row count**:
+### Which function when
 
-- **single row → `hazedb_get`** — returns one flat associative array
-  (`['name'=>…, 'age'=>…]`), or `null` if the row is absent. The point-read fast
-  path (`WHERE id = ?`).
-- **multiple rows → `hazedb_query_arr`** — returns the `{columns, rows}`
-  envelope (`['columns'=>[…], 'rows'=>[[…],…]]`). Use for lists / scans.
-
-(`hazedb_exec_arr` is the write variant; `hazedb_query` stays for raw
-JSON-string pass-through.) Full reference:
-
-| function | use for | shape returned |
-|---|---|---|
-| `hazedb_get($sql, $id)` | point read (`WHERE id = ?`) — the hot path | one flat assoc array `['name'=>…, 'age'=>…]`, or `null` |
-| `hazedb_query_arr($sql, $args)` | multi-row reads / lists | `['columns'=>[…], 'rows'=>[[…],…]]`, or `null` on error |
-| `hazedb_exec_arr($sql, array $args)` | writes (insert/update/delete) | `{"affected":N}` string, error envelope, or `null` |
-| `hazedb_query($sql, $args)` | pass-through (proxy to HTTP / cache) | raw JSON string |
-
-`hazedb_get` is both fastest and most ergonomic for the dominant case
-(`$u = hazedb_get(...); echo $u['name'];`); `hazedb_query_arr` covers multi-row;
-the JSON-string `hazedb_query` stays for when PHP just forwards the bytes.
+- **single row** → `hazedb_fetch` → flat assoc `['name'=>…]` or `null`.
+- **many rows** → `hazedb_fetchall` → `[['name'=>…],…]` (`[]` if none).
+- **forward as JSON** (HTTP/cache, no PHP decode) → `hazedb_fetchall_json`.
+- **write** → `hazedb_exec` → affected `int`.
 
 ---
 
@@ -123,144 +117,109 @@ the JSON-string `hazedb_query` stays for when PHP just forwards the bytes.
 
 | file | change |
 |---|---|
-| [`db.go`](../db.go) | `ExecValues` + `execPlanValues` — typed write path (no JSON/boxing). |
-| [`wire.go`](../wire.go) | (related) `RowsToJSON` hand-rolled — the JSON-string path's encoder, ~5× faster than stdlib; baseline for the array comparison. |
-| [`addons/frankenphp-ext/hazedb_ext.go`](../addons/frankenphp-ext/hazedb_ext.go) | The zval trampoline layer (build + read), `hazedb_query_arr`, `hazedb_exec_arr`, `hazedb_get`, and the Go helpers (`pushCell`/`setCell`/`pushStr`/`setStr`). |
-| `addons/frankenphp-ext/hazedb_ext.{c,_arginfo.h,_generated.go}`, `hazedb_ext.stub.php` | Regenerated wrappers (by `regenerate.sh`). Commit alongside `hazedb_ext.go`. |
-| [`addons/frankenphp-ext/build/test.php`](../addons/frankenphp-ext/build/test.php) + [`smoke.sh`](../addons/frankenphp-ext/build/smoke.sh) | Correctness checks: `query_arr` re-encodes byte-identical to the JSON path; `exec_arr` insert → read-back; `get` → assoc row + `null` when absent. |
-| [`bench_typed_args_test.go`](../bench_typed_args_test.go) | `TestExecValuesParity` + 3-way insert benchmark (JSON args / `[]any` / typed Values) isolating the JSON tax. |
-| `addons/frankenphp-ext/build/bench.php` | Read bench: raw / json_decode / query_arr / get. |
-| `addons/frankenphp-ext/build/hazedb_insert_bench.php` | Insert bench: JSON-args vs array-args. |
-| `addons/frankenphp-ext/build/sqlite_bench.php`, `sqlite_insert_bench.php` | SQLite `:memory:` baselines (read + insert). |
-
-Commits: `faca45e` (core `ExecValues`), `453b770` (trampolines + `query_arr` +
-`exec_arr`), `cfe3886` (`hazedb_get`).
+| [`db.go`](../db.go) | `ExecValues` + `QueryValues` + `QueryRowValues` (typed entry points). |
+| [`exec.go`](../exec.go) | `evalLitOrParamValue` (Value-arg PK eval). |
+| [`wire.go`](../wire.go) | `RowsToJSON` hand-rolled; `RowsToJSONObjects` (list-of-objects). |
+| [`addons/frankenphp-ext/hazedb_ext.go`](../addons/frankenphp-ext/hazedb_ext.go) | The zval trampolines + `hazedb_fetch` / `hazedb_fetchall` / `hazedb_fetchall_json` / `hazedb_exec` / `hazedb_ping` + `valuesFromZval` / `setCell` helpers. |
+| `addons/frankenphp-ext/hazedb_ext.{c,_arginfo.h,_generated.go}`, `.stub.php` | Generated wrappers (`regenerate.sh`). Commit with `hazedb_ext.go`. |
+| `addons/frankenphp-ext/build/test.php` + `smoke.sh` | Correctness checks (emit `*_ok=yes` markers). |
+| `bench_typed_args_test.go`, `bench_encode_test.go` | `TestExecValuesParity`, `TestQueryValuesParity`, `TestEncodeParity` + insert/encode benchmarks. |
+| `addons/frankenphp-ext/build/{bench,hazedb_insert_bench,sqlite_bench,sqlite_insert_bench,compare_bench}.php` | Benchmark harness (hazedb + SQLite `:memory:` baselines). |
 
 ### The C layer in detail
 
 **There is no hand-maintained `.c` file.** The trampolines live inline in the
-cgo preamble — the `/* … */` block directly above `import "C"` in
-[`hazedb_ext.go`](../addons/frankenphp-ext/hazedb_ext.go). The
-`.c` / `.h` / `_arginfo.h` / `_generated.go` / `.stub.php` files are
-machine-generated by `regenerate.sh` from the `// export_php:` directives and
-must not be edited by hand.
+cgo preamble (the `/* … */` block above `import "C"`) of `hazedb_ext.go`; the
+generated files are machine-made and must not be edited.
 
-**Trampolines** — 17 `static`-inline C functions wrapping the Zend macros cgo
-cannot call directly (build/README pitfall #5):
-
-*Build, numeric-indexed list (Go rows → PHP array):*
-
-| function | wraps |
+| trampoline | wraps |
 |---|---|
-| `hzd_arr_new(n)` | `zend_new_array(n)` (pre-sized) |
-| `hzd_push_long` / `hzd_push_bool` / `hzd_push_null` | `ZVAL_LONG/BOOL/NULL` + `zend_hash_next_index_insert` |
-| `hzd_push_strn(a,s,n)` | `ZVAL_STRINGL` (copies) or `ZVAL_EMPTY_STRING`, then append |
-| `hzd_push_arr(a,child)` | `ZVAL_ARR` + append (nested rows) |
-
-*Build, keyed/associative (column name → value), for `hazedb_get` and the envelope keys:*
-
-| function | wraps |
-|---|---|
-| `hzd_set_arr(a,key,klen,child)` | `ZVAL_ARR` + `zend_hash_str_update` |
-| `hzd_set_long` / `hzd_set_bool` / `hzd_set_null` / `hzd_set_strn` | `ZVAL_*` + `zend_hash_str_update` |
-
-*Read (PHP array → Go), for the args-in direction:*
-
-| function | wraps |
-|---|---|
+| `hzd_arr_new(n)` | `zend_new_array(n)` |
+| `hzd_push_arr(a, child)` | `ZVAL_ARR` + `zend_hash_next_index_insert` (append a row to the list) |
+| `hzd_set_long/bool/null/strn(a, key, klen, …)` | `ZVAL_*` + `zend_hash_str_update` (assoc cell by column name) |
 | `hzd_arr_count(a)` | `zend_hash_num_elements` |
-| `hzd_arr_get(a,i)` | `zend_hash_index_find` (positional/list arrays) |
-| `hzd_zval_kind(z)` | normalises `Z_TYPE_P` → `0` null, `1` false, `2` true, `3` long, `4` string, `5` double, `6` other (avoids depending on cgo exposing the `IS_*` macros) |
-| `hzd_zval_long` / `hzd_zval_strptr` / `hzd_zval_strlen` | `Z_LVAL_P` / `Z_STRVAL_P` / `Z_STRLEN_P` |
+| `hzd_arr_get(a, i)` | `zend_hash_index_find` |
+| `hzd_zval_kind(z)` | `Z_TYPE_P` → `0` null `1` false `2` true `3` long `4` string `5` double `6` other |
+| `hzd_zval_long/strptr/strlen(z)` | `Z_LVAL_P` / `Z_STRVAL_P` / `Z_STRLEN_P` |
 
-Ownership: strings are **copied** into PHP (`ZVAL_STRINGL`) or out to Go
-(`C.GoStringN`), so neither side aliases the other's memory; the result array is
-returned with a single ref that `RETURN_ARR` takes.
-
-**Generated files** (by `regenerate.sh`, from the directives):
-
-| file | role |
-|---|---|
-| `hazedb_ext.c` | one `PHP_FUNCTION(...)` per directive — parses params (`Z_PARAM_STR` / `Z_PARAM_ARRAY_HT`), calls the matching `go_*` export, returns `RETURN_STR` / `RETURN_ARR` / `RETURN_NULL`; plus the `zend_module_entry`. |
-| `hazedb_ext_arginfo.h` | arg/return type metadata (`ZEND_BEGIN_ARG_*`, `IS_ARRAY` / `IS_STRING`) + the `ext_functions[]` table. |
-| `hazedb_ext_generated.go` | the `//export go_*` shims that call the hand-written Go functions, + `frankenphp.RegisterExtension`. |
-| `hazedb_ext.stub.php` | the PHP signatures (IDE / documentation). |
-
-The hand-written Go functions (`hazedb_get`, `hazedb_query_arr`,
-`hazedb_exec_arr` and the `pushCell` / `setCell` / `pushStr` / `setStr` helpers)
-call the trampolines; the generated `go_*` shims call those Go functions.
+Generated files: `hazedb_ext.c` = one `PHP_FUNCTION(...)` per directive (param
+parse → `go_*` export → `RETURN_ARR`/`RETURN_STR`/`RETURN_LONG`/`RETURN_NULL`);
+`_arginfo.h` = type metadata + the `ext_functions[]` table; `_generated.go` =
+the `//export go_*` shims + `RegisterExtension`; `.stub.php` = PHP signatures.
 
 ---
 
 ## 6. Measured results
 
-All in-memory, in-process from PHP (FrankenPHP, PHP 8.5.6), AMD Ryzen AI MAX+
-395; SQLite baselines in `php:8.4-cli`. Numbers are steady-state; re-run the
-benches under `build/` to reproduce.
+All in the **same** FrankenPHP binary (PHP 8.5.6), AMD Ryzen AI MAX+ 395 —
+hazedb and the SQLite baselines run in one environment (the binary ships
+`pdo_sqlite`/`sqlite3`). Reproduce with the `build/` scripts (`compare_bench.php`
+over HTTP runs both back-to-back). Numbers vary with host load; ratios are
+stable because both are measured in one process.
 
 **Go-side write ceiling** (`bench_typed_args_test.go`):
 
 | path | ns/op | allocs/op |
 |---|---|---|
 | JSON args (`QueryArgs` + `Exec`) | ~1515 | 22 |
-| `[]any` args (skip JSON) | ~395 | 2 |
 | typed `Values` (`ExecValues`) | ~360 | 1 |
 
-The JSON decode alone is ~1120 ns / 20 allocs of pure overhead. A CPU profile of
-the typed path shows **zero** arg-handling cost remaining — the rest is the
-storage floor (PK map ~37%, row build ~18%).
+The JSON decode alone was ~1120 ns / 20 allocs. A CPU profile of the typed path
+shows zero arg-handling cost remaining — the rest is the storage floor.
 
 **Inserts** (independent, in-memory):
 
+| path | qps |
+|---|---|
+| **`hazedb_exec` (native array)** | **~940K** |
+| SQLite `:memory:` autocommit | ~370K |
+| SQLite `:memory:` batched (reference) | ~850K |
+
+`hazedb_exec` ≈ 2.5× SQLite autocommit and **beats** SQLite's batched best case —
+with independent inserts.
+
+**Reads** (point read by PK → usable assoc row):
+
 | path | qps | ns/op |
 |---|---|---|
-| `hazedb_exec` (JSON args) | ~445K | ~2230 |
-| **`hazedb_exec_arr` (native array)** | **~875K** | **~1140** |
-| SQLite `:memory:` autocommit | ~383K | ~2610 |
-| SQLite `:memory:` batched (reference) | ~980K | ~1020 |
+| **`hazedb_fetch($sql, $id)` — scalar arg** | **~2.4M** | ~417 |
+| `hazedb_fetch($sql, [$id])` — array arg | ~2.0M | ~500 |
+| SQLite `:memory:` prepared + FETCH_ASSOC | ~1.06M | ~940 |
 
-`hazedb_exec_arr` ≈ 2× the JSON form, ~2.3× SQLite autocommit, ~90% of SQLite's
-batched best case — with independent inserts.
+`hazedb_fetch` ≈ 2–2.3× SQLite for the same usable assoc shape.
 
-**Reads** (PHP gets usable data):
-
-| path | qps | ns/op |
-|---|---|---|
-| `hazedb_query` + `json_decode` | ~1.16M | ~860 |
-| `hazedb_query_arr` (envelope) | ~1.6M | ~630 |
-| **`hazedb_get` (flat assoc)** | **~2.85M** | **~350** |
-| SQLite `:memory:` prepared-reuse | ~1.28M | ~780 |
-| `hazedb_query` raw JSON string (not usable) | ~3.0M | ~330 |
-
-`hazedb_get` ≈ 2.5× `json_decode`, ~1.8× `query_arr`, ~2.2× SQLite — and lands at
-roughly the raw-JSON-string speed while returning a directly usable array.
+**Array-args cost and the scalar fast path.** Wrapping a single id as `[$id]`
+costs ~80 ns/call — PHP builds a one-element array and Go reads the
+`zend_array`. The `mixed $args` param therefore accepts a **bare scalar** too:
+`hazedb_fetch($sql, $id)` reads one zval directly (no array build/iterate) and
+recovers that cost (~2.4M vs ~2.0M). Arrays remain the form for multi-param
+calls; the scalar form is the fast path for the dominant single-key read.
 
 ---
 
 ## 7. Gotchas & ABI notes
 
-- **frankenphp-gen array ABI** (verified empirically): an `array` parameter
-  requires the Go param to be `*C.zend_array` (a `Z_PARAM_ARRAY_HT`); a `?array`
-  return makes the Go function return `unsafe.Pointer` (a `zend_array*`) and the
-  C wrapper does `RETURN_ARR`. `regenerate.sh` patches `RETURN_EMPTY_ARRAY`→
-  `RETURN_NULL` so a nil return surfaces as PHP `null`.
+- **frankenphp-gen ABI** (verified empirically):
+  - `array $args` → Go `*C.zend_array` (`Z_PARAM_ARRAY_HT`).
+  - `mixed $args = null` → Go `*C.zval` (`Z_PARAM_OPTIONAL` + `Z_PARAM_ZVAL`);
+    Go gets a **nil** `*C.zval` when omitted. This is what lets `$args` be either
+    an array or a bare scalar — Go branches on `Z_TYPE`.
+  - `?array` return → Go `unsafe.Pointer` (a `zend_array*`) + `RETURN_ARR`;
+    `regenerate.sh` patches `RETURN_EMPTY_ARRAY`→`RETURN_NULL` so nil → PHP null.
+  - `int` return → Go `int64` + `RETURN_LONG` (no nullable scalar, hence `exec`
+    uses `-1` as the error sentinel).
 - **cgo cannot call the `ZVAL_` / `zend_hash_` macros directly** — hence the
-  static-inline C trampolines in the `hazedb_ext.go` preamble (build/README
-  pitfall #5).
+  static-inline trampolines (build/README pitfall #5).
 - **`*/` inside a cgo comment closes the block.** A doc line containing
-  `ZVAL_*/zend_hash_*` once terminated the `/* */` cgo preamble early and the C
-  was parsed as Go. Keep `*/` out of cgo-preamble prose.
-- **String lifetime.** Args read from a zval are copied into Go memory
-  (`C.GoStringN`) before being stored, so nothing aliases PHP-arena memory. The
-  SQL string is a zero-copy view (`db.prepare` clones it on a cache miss).
-- **`hazedb_get` is point-read only** (single row); use `hazedb_query_arr` for
-  multi-row.
-- **Building a `zend_array` is not free** (~300 ns for an envelope): that is why
-  `query_arr`'s read win is modest (~1.3×) while `hazedb_get` — which builds one
-  array instead of four — is ~2.5×.
-- **Packaging unchanged.** The trampolines are extra C in the same extension;
-  one `xcaddy` build still produces a single FrankenPHP binary with hazedb baked
-  in.
+  `ZVAL_*/zend_hash_*` once terminated the `/* */` preamble early and the C was
+  parsed as Go. Keep `*/` out of cgo-preamble prose.
+- **String lifetime.** Args are copied out of the zval (`C.GoStringN`) before
+  storage; the SQL string is a zero-copy view (`db.prepare` clones on a miss).
+- **Native types out** — int/bool/string come back as the real PHP type, unlike
+  PDO+SQLite's default stringify. UUID/BYTES come back as strings.
+- **Building a `zend_array` is not free** (~300 ns for a small assoc row) — that
+  cost, plus the array-args read, is why `fetch` (~470 ns) does not match the raw
+  json-string speed.
 
 ---
 
@@ -268,10 +227,8 @@ roughly the raw-JSON-string speed while returning a directly usable array.
 
 - **Storage floor.** After removing the JSON tax, inserts sit on the storage
   engine (PK map + row alloc). The largest lever (a single-probe find-or-insert
-  on the PK map) was measured earlier at only ~8% and shelved as not worth the
-  complexity.
-- **Pooled result buffer** for the JSON-string path (zero-alloc steady state)
-  remains an option for `hazedb_query`.
-- **Assoc rows for multi-row** (`query_arr` returning `[['name'=>…],…]`) could be
-  offered if the per-row keyed shape is wanted, at the cost of per-cell key
-  copies.
+  on the PK map) was measured earlier at only ~8% and shelved.
+- **Pooled result buffer** for `hazedb_fetchall_json` (zero-alloc steady state).
+
+(The scalar-arg fast path — `mixed $args` accepting a bare scalar — is
+**implemented**; see §6.)

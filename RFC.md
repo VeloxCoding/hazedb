@@ -2,7 +2,7 @@
 
 **Status:** M1–M6 implemented (store, SQL, WAL durability, UUIDv7 PK, partitioning, runtime catalog + `CREATE`/`DROP TABLE`, single-table transactions); M7–M8 open. See *Implementation status* for what is running vs designed.  
 **Module:** `github.com/VeloxCoding/hazedb`  
-**Updated:** 2026-05-30 (rev. 23 — point-op benchmarks re-measured under go1.25; ~18× SQLite `:memory:` on reads)
+**Updated:** 2026-05-30 (rev. 24 — PHP cgo binding reshaped to a PDO-style native-array API: `hazedb_fetch`/`hazedb_fetchall`/`hazedb_exec`)
 
 ---
 
@@ -72,7 +72,7 @@ The remainder of this RFC describes the **target architecture** — the full des
 | Feature | Milestone |
 |---|---|
 | WAL segments + snapshot checkpoint | M7 |
-| FrankenPHP cgo binding (`hazedb_exec`/`hazedb_query`, `hazedb_exec_transaction`) | M8 |
+| FrankenPHP cgo binding — native-array API (`hazedb_fetch`/`hazedb_fetchall`/`hazedb_exec`) shipped; `hazedb_exec_transaction` open | M8 |
 | Optional typed-struct query wrapper (ergonomics; not a speed mechanism) | post-1.0 |
 
 ---
@@ -461,11 +461,11 @@ The wrapper calls the identical executor and copies each `Row` into the typed st
 The primary cgo entry points map straight onto the runtime engine:
 
 ```php
-hazedb_query("SELECT body FROM messages WHERE id = ?", $id)  // → JSON rows
-hazedb_exec("INSERT INTO messages (id, body) VALUES (?, ?)", $id, "hello")
+hazedb_fetch("SELECT body FROM messages WHERE id = ?", [$id])      // → ['body'=>...] or null
+hazedb_exec("INSERT INTO messages (id, body) VALUES (?, ?)", [$id, "hello"])  // → affected count
 ```
 
-One SQL parse per distinct string (cached thereafter), one cgo crossing per call. An optional generated per-query C wrapper (matching the typed-struct wrapper above) can skip JSON encoding for declared queries, but is not required for the boundary to be fast.
+One SQL parse per distinct string (cached thereafter), one cgo crossing per call. Args are a native PHP array (PDO-style) and result rows come back as native PHP arrays built via zval trampolines — no JSON crosses the boundary in either direction. See [docs/php-array-bridge.md](docs/php-array-bridge.md) for the full design + benchmarks.
 
 ---
 
