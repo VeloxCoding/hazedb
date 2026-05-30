@@ -143,6 +143,9 @@ func Open(opts Options) (*DB, error) {
 		}
 		w.startTicker(flushInterval)
 		db.wal = w
+		// Replay marked rows dirty but never built the indexes; rebuild them
+		// from the live rows now, so reads are index-fast before serving.
+		db.rebuildAllIndexes()
 	}
 	mergeInterval := opts.IndexMergeInterval
 	if mergeInterval == 0 {

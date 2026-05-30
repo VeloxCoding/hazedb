@@ -1,6 +1,7 @@
 package hazedb
 
 import (
+	"path/filepath"
 	"strconv"
 	"sync"
 	"testing"
@@ -299,6 +300,54 @@ func TestIndexMultiplePerTable(t *testing.T) {
 	}
 	if _, rows, _ := db.Query("SELECT id FROM users WHERE city = ?", "AMS"); len(rows) != 1 {
 		t.Fatal("city index not updated on delete")
+	}
+}
+
+// S8: after a restart the index is rebuilt from the replayed live rows. The
+// reopened DB has the merger disabled, so si.lookup reflects only what the
+// post-replay rebuild produced (not the overlay or a later merge).
+func TestIndexRebuildAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "idxrec.wal")
+	db, err := Open(Options{Schema: Schema{}, WALPath: path, IndexMergeInterval: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, b, c := NewUUIDv7(), NewUUIDv7(), NewUUIDv7()
+	db.Exec("CREATE TABLE users (id uuid primary key, email text, INDEX (email))")
+	db.Exec("INSERT INTO users (id, email) VALUES (?, ?)", a, "a@x")
+	db.Exec("INSERT INTO users (id, email) VALUES (?, ?)", b, "b@x")
+	db.Exec("INSERT INTO users (id, email) VALUES (?, ?)", c, "c@x")
+	db.Exec("UPDATE users SET email = ? WHERE id = ?", "a2@x", a)
+	db.Exec("DELETE FROM users WHERE id = ?", b)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(Options{Schema: Schema{}, WALPath: path, IndexMergeInterval: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	tbl := db2.cat.Load().byName["users"].table
+	si := tbl.indexFor(tbl.def.colByName["email"])
+	if n := len(tbl.dirtyPKs()); n != 0 {
+		t.Fatalf("dirty not cleared after post-replay rebuild: %d", n)
+	}
+	if len(si.lookup(keyOf(Str("a2@x")))) != 1 {
+		t.Fatal("updated email missing from rebuilt index")
+	}
+	if len(si.lookup(keyOf(Str("a@x")))) != 0 {
+		t.Fatal("pre-update email present in rebuilt index")
+	}
+	if len(si.lookup(keyOf(Str("b@x")))) != 0 {
+		t.Fatal("deleted row present in rebuilt index")
+	}
+	if len(si.lookup(keyOf(Str("c@x")))) != 1 {
+		t.Fatal("untouched email missing from rebuilt index")
+	}
+	if _, rows, _ := db2.Query("SELECT id FROM users WHERE email = ?", "a2@x"); len(rows) != 1 {
+		t.Fatal("index query wrong after restart")
 	}
 }
 

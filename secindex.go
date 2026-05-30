@@ -264,10 +264,22 @@ func (t *table) mergeIndexes() {
 	}
 }
 
-// rebuildIndexes rebuilds every secondary index from a full scan of live rows.
-// Used after bulk writes (whose per-row deltas are not tracked incrementally)
-// and after WAL replay. Not atomic w.r.t. concurrent writes; callers that need
-// that serialise externally.
+// rebuildAllIndexes rebuilds every indexed table in the current catalog. Called
+// once after WAL replay so the indexes are correct and ready before serving,
+// regardless of how the rows were loaded (replay today, a snapshot later).
+func (db *DB) rebuildAllIndexes() {
+	cat := db.cat.Load()
+	for _, rt := range cat.byID {
+		if rt != nil && len(rt.indexes) > 0 {
+			rt.rebuildIndexes()
+		}
+	}
+}
+
+// rebuildIndexes rebuilds every secondary index from a full scan of live rows
+// and clears the dirty lists (the rebuild supersedes any pending deltas). Used
+// after WAL replay. Not atomic w.r.t. concurrent writes; callers serialise (it
+// runs at boot, before the merger and request serving start).
 func (t *table) rebuildIndexes() {
 	if len(t.indexes) == 0 {
 		return
@@ -288,4 +300,10 @@ func (t *table) rebuildIndexes() {
 		}
 		return true
 	})
+	for i := range t.shards {
+		s := &t.shards[i]
+		s.mu.Lock()
+		s.dirty = nil // replay marked rows dirty; the full rebuild covers them
+		s.mu.Unlock()
+	}
 }
