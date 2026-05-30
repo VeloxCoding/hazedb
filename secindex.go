@@ -114,30 +114,6 @@ func (si *secIndex) lookup(k indexKey) []UUID {
 	return out
 }
 
-// getByPKCheckProject is the hybrid read's per-candidate fetch: under the shard
-// read lock it confirms the row's checkOrd column STILL equals wantKey (the live
-// re-check that makes a stale index entry harmless), and only then clones/
-// projects. Returns (nil,false) when the row is absent or no longer matches.
-// ords nil means all columns. Indexed tables are never partitioned, so there is
-// no pkDir branch.
-func (t *table) getByPKCheckProject(pk UUID, checkOrd int, wantKey indexKey, ords []int) (Row, bool) {
-	s := t.shardOf(pk)
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	rowID, ok := s.pk[pk]
-	if !ok {
-		return nil, false
-	}
-	r := s.rows[rowID]
-	if r == nil || keyOf(r[checkOrd]) != wantKey {
-		return nil, false
-	}
-	if ords == nil {
-		return r.Clone(), true
-	}
-	return projectClone(r, ords), true
-}
-
 // indexFor returns the table's secondary index on column ord, or nil.
 func (t *table) indexFor(ord int) *secIndex {
 	for _, si := range t.indexes {

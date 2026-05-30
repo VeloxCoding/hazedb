@@ -172,15 +172,25 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 					pl.partSource = src
 				}
 			} else if len(rt.indexes) > 0 && s.orderCol == "" {
-				// Secondary-index point/bucket lookup. ORDER BY falls back to the
+				// Secondary-index lookup. Find an indexed column constrained by
+				// equality anywhere in the WHERE's AND-chain; use that index to
+				// get candidates and evaluate the FULL WHERE on each (so extra
+				// conjuncts like AND name = ? are residual-filtered). Prefer a
+				// UNIQUE index (better selectivity). ORDER BY falls back to the
 				// scan (the index is unordered) — a v1 limitation.
-				for _, ri := range rt.indexes {
-					if ok, src := detectColEq(s.where, rt, ri.ordinal); ok {
-						pl.idxLookup = true
-						pl.idxColOrd = ri.ordinal
-						pl.idxSource = src
-						break
+				eqs := map[int]expr{}
+				collectEqConjuncts(s.where, eqs)
+				var chosen *resolvedIndex
+				for i := range rt.indexes {
+					ri := &rt.indexes[i]
+					if _, has := eqs[ri.ordinal]; has && (chosen == nil || (ri.unique && !chosen.unique)) {
+						chosen = ri
 					}
+				}
+				if chosen != nil {
+					pl.idxLookup = true
+					pl.idxColOrd = chosen.ordinal
+					pl.idxSource = eqs[chosen.ordinal]
 				}
 			}
 		}
@@ -267,6 +277,29 @@ func detectColEq(e expr, rt *resolvedTable, ordinal int) (bool, expr) {
 // detectPKEq is detectColEq pinned to the PK column.
 func detectPKEq(e expr, rt *resolvedTable) (bool, expr) {
 	return detectColEq(e, rt, rt.pkOrdinal)
+}
+
+// collectEqConjuncts walks an AND-chain of the WHERE and records every
+// `col = lit/param` equality as ordinal -> value expr. Only AND nodes are
+// descended (an OR cannot be answered from a single index). colRef ords are
+// already bound by validateExpr. Used to pick a secondary index for a query
+// whose WHERE may carry extra conjuncts beyond the indexed equality.
+func collectEqConjuncts(e expr, out map[int]expr) {
+	bop, ok := e.(*binOp)
+	if !ok {
+		return
+	}
+	switch bop.op {
+	case tkAnd:
+		collectEqConjuncts(bop.lhs, out)
+		collectEqConjuncts(bop.rhs, out)
+	case tkEq:
+		if cr, ok := bop.lhs.(*colRef); ok && cr.ord >= 0 && isLitOrParam(bop.rhs) {
+			out[cr.ord] = bop.rhs
+		} else if cr, ok := bop.rhs.(*colRef); ok && cr.ord >= 0 && isLitOrParam(bop.lhs) {
+			out[cr.ord] = bop.lhs
+		}
+	}
 }
 
 func isLitOrParam(e expr) bool {
@@ -560,13 +593,10 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 	}
 	wantKey := keyOf(keyVal)
 	// Hybrid candidate set: index hits (pre-merge) UNION the dirty PKs (mutated
-	// since the last merge, value uncertain). getByPKCheckProject re-confirms
-	// each against its live row, so neither a stale index entry nor an unrelated
-	// dirty PK can produce a wrong row. starAll passes ords nil.
-	ords := pl.projOrdinals
-	if st.starAll {
-		ords = nil
-	}
+	// since the last merge, value uncertain). Every candidate's live row is
+	// evaluated against the FULL WHERE, so neither a stale index entry, an
+	// unrelated dirty PK, nor an extra conjunct (AND name = ?) can yield a wrong
+	// row. starAll keeps the whole row; otherwise project the wanted columns.
 	pks := si.lookup(wantKey)
 	dirty := tbl.dirtyPKs()
 	if len(pks) == 0 && len(dirty) == 0 {
@@ -579,13 +609,20 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 			return false
 		}
 		seen[pk] = struct{}{}
-		if r, ok := tbl.getByPKCheckProject(pk, pl.idxColOrd, wantKey, ords); ok {
-			out = append(out, r)
-			if st.limit >= 0 && len(out) >= st.limit {
-				return true
-			}
+		r, ok := tbl.getByPK(pk)
+		if !ok {
+			return false
 		}
-		return false
+		ctx.row = r
+		if v, err := evalExpr(st.where, ctx); err != nil || !truthy(v) {
+			return false
+		}
+		if st.starAll {
+			out = append(out, r)
+		} else {
+			out = append(out, projectClone(r, pl.projOrdinals))
+		}
+		return st.limit >= 0 && len(out) >= st.limit
 	}
 	for _, pk := range pks {
 		if consider(pk) {

@@ -351,6 +351,33 @@ func TestIndexRebuildAfterRestart(t *testing.T) {
 	}
 }
 
+// AND of equalities: the planner picks one index for a conjunct and
+// residual-filters the full WHERE on the candidates. SELECT ... WHERE email = ?
+// AND name = ? returns only rows matching both.
+func TestIndexAndQuery(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE users (id uuid primary key, name text, age int null, email text, INDEX (email), INDEX (name))")
+	a, b, c := NewUUIDv7(), NewUUIDv7(), NewUUIDv7()
+	db.Exec("INSERT INTO users (id, name, age, email) VALUES (?, ?, ?, ?)", a, "Alice", 30, "shared@x")
+	db.Exec("INSERT INTO users (id, name, age, email) VALUES (?, ?, ?, ?)", b, "Bob", 25, "shared@x")
+	db.Exec("INSERT INTO users (id, name, age, email) VALUES (?, ?, ?, ?)", c, "Alice", 40, "other@x")
+
+	pl, _ := db.prepare("SELECT id FROM users WHERE email = ? AND name = ?", db.cat.Load())
+	if !pl.idxLookup {
+		t.Fatal("AND query did not plan as an index lookup")
+	}
+	_, rows, err := db.Query("SELECT id, name, email FROM users WHERE email = ? AND name = ?", "shared@x", "Alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0][1].Str() != "Alice" || rows[0][2].Str() != "shared@x" {
+		t.Fatalf("AND query returned wrong rows: %v", rows)
+	}
+	if _, rows, _ := db.Query("SELECT id FROM users WHERE email = ? AND name = ?", "shared@x", "Carol"); len(rows) != 0 {
+		t.Fatalf("AND query with no match should be empty: %v", rows)
+	}
+}
+
 // S6: churn within non-unique buckets — moving a PK between buckets (update) and
 // removing one (delete), across merges, must keep both buckets exact. Exercises
 // removeFwdLocked's swap-remove on multi-PK buckets.
