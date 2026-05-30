@@ -25,10 +25,12 @@ if (!function_exists('hazedb_fetch')) {
 }
 
 $N        = (int)($_GET['n']    ?? 50000);  // rows inserted
-$IT_PT    = (int)($_GET['pt']   ?? 30000);  // point-read iterations
+$IT_PK    = (int)($_GET['pk']   ?? 30000);  // point-read by PK (id)
+$IT_PT    = (int)($_GET['pt']   ?? 30000);  // point-read by indexed email
 $IT_AND   = (int)($_GET['and']  ?? 15000);  // double-WHERE iterations
 $IT_OBIG  = (int)($_GET['obig'] ?? 4000);   // ORDER BY over a big bucket (city)
 $IT_OSML  = (int)($_GET['osml'] ?? 15000);  // ORDER BY over a small bucket (name)
+$IT_OEM   = (int)($_GET['oem']  ?? 2000);   // global ORDER BY email ASC LIMIT 100
 
 function make_uuid(): string {
     $b = random_bytes(16);
@@ -84,15 +86,19 @@ $sqIns = microtime(true) - $t;
 usleep(800000); // let hazedb's background merger finish indexing before reads
 
 // =================== query definitions (identical text) ===================
+$Q_PK   = 'SELECT id, name, age, email, city FROM users WHERE id = ?';
 $Q_PT   = 'SELECT id, name, age, email, city FROM users WHERE email = ?';
 $Q_AND  = 'SELECT id, name, age FROM users WHERE name = ? AND city = ?';
 $Q_OBIG = 'SELECT id, name, age FROM users WHERE city = ? ORDER BY age DESC LIMIT 20';
 $Q_OSML = 'SELECT id, name, age FROM users WHERE name = ? ORDER BY age ASC LIMIT 20';
+$Q_OEM  = 'SELECT id, name, age, email, city FROM users ORDER BY email ASC LIMIT 100';
 
+$selPK   = $pdo->prepare($Q_PK);
 $selPT   = $pdo->prepare($Q_PT);
 $selAND  = $pdo->prepare($Q_AND);
 $selOBIG = $pdo->prepare($Q_OBIG);
 $selOSML = $pdo->prepare($Q_OSML);
+$selOEM  = $pdo->prepare($Q_OEM);
 
 // time a hazedb closure vs a sqlite closure over `iters`, with a short warmup
 function duel(int $iters, callable $hz, callable $sq): array {
@@ -106,7 +112,13 @@ function duel(int $iters, callable $hz, callable $sq): array {
     return [$dh, $ds];
 }
 
-// point read by unique email -> one assoc row
+// point read by PK (id) -> one assoc row
+[$pkH, $pkS] = duel($IT_PK,
+    fn($i) => hazedb_fetch($Q_PK, [$ids[$i % $N]]),
+    function ($i) use ($selPK, $ids, $N) { $selPK->execute([$ids[$i % $N]]); $selPK->fetch(PDO::FETCH_ASSOC); }
+);
+
+// point read by unique indexed email -> one assoc row
 [$ptH, $ptS] = duel($IT_PT,
     fn($i) => hazedb_fetch($Q_PT, [$emails[$i % $N]]),
     function ($i) use ($selPT, $emails, $N) { $selPT->execute([$emails[$i % $N]]); $selPT->fetch(PDO::FETCH_ASSOC); }
@@ -131,6 +143,15 @@ $nN = count($NAMES); $nC = count($CITIES);
     function ($i) use ($selOSML, $NAMES, $nN) { $selOSML->execute([$NAMES[$i % $nN]]); $selOSML->fetchAll(PDO::FETCH_ASSOC); }
 );
 
+// GLOBAL ORDER BY email ASC LIMIT 100 (no filter). email is indexed on both, but
+// SQLite can WALK its btree index in order (no sort); hazedb's hash index cannot
+// order, so it scans all rows + keeps a top-100 heap. The case where an ordered
+// index would help hazedb (not built).
+[$oemH, $oemS] = duel($IT_OEM,
+    fn($i) => hazedb_fetchall($Q_OEM),
+    function ($i) use ($selOEM) { $selOEM->execute(); $selOEM->fetchAll(PDO::FETCH_ASSOC); }
+);
+
 // =================== report ===================
 printf("env=PHP %s (one FrankenPHP process)  rows=%d\n", PHP_VERSION, $N);
 printf("table=users(id,name,age,email,city)  indexes: email,name,city (both engines)\n");
@@ -148,7 +169,9 @@ $line = function (string $label, float $h, float $s, int $n) {
 echo "INSERT (single-row, autocommit both)\n";
 $line("INSERT", $hzIns, $sqIns, $N);
 echo "\nREADS (identical SQL, identical indexes)\n";
-$line("point: WHERE email = ?", $ptH, $ptS, $IT_PT);
+$line("point: WHERE id = ?  (PK)", $pkH, $pkS, $IT_PK);
+$line("point: WHERE email = ?  (index)", $ptH, $ptS, $IT_PT);
 $line("AND: WHERE name = ? AND city = ?", $andH, $andS, $IT_AND);
 $line("ORDER BY age DESC LIMIT 20 (city)", $obigH, $obigS, $IT_OBIG);
 $line("ORDER BY age ASC LIMIT 20 (name)", $osmlH, $osmlS, $IT_OSML);
+$line("ORDER BY email ASC LIMIT 100 (global)", $oemH, $oemS, $IT_OEM);
