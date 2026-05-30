@@ -206,3 +206,10 @@ whole async mechanism is correct regardless of timing.
   if reads are shown to contend.
 - **Memory**: the index + pending are extra residency; pending is bounded by the
   merge lag.
+- **Large-bucket `ORDER BY`**: index-assisted `ORDER BY` scales with the bucket
+  (rows sharing the filter value), not the `LIMIT`. Fine for normal list views;
+  for a single huge hot key (a 10k-message thread) three deferred levers apply —
+  residual-only re-check (skip re-evaluating the index-guaranteed conjunct),
+  batched per-shard locking, and a key-only top-N (clone only the final `LIMIT`).
+  Profiled shares and trade-offs in [php-sql-layer.md](php-sql-layer.md). Deferred:
+  they only pay off for huge hot buckets, against keeping the path simple.

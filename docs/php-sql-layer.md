@@ -88,6 +88,36 @@ testbed reproduces the SQLite comparison):
 rejected); single-column only (no composite); `UNIQUE` does not reject
 duplicates (uniqueness is the operator's promise, used only to read faster).
 
+### `ORDER BY` cost on very large buckets
+
+Index-assisted `ORDER BY` scales with how many rows share the filter value (the
+bucket), not with the `LIMIT`. A `LIMIT n` keeps only the top `n` via a heap, so
+it stays light for normal list views (tens–hundreds of rows per key: an author's
+posts, a category's products). A *single* key holding thousands of rows — a forum
+thread with 10k messages, a category with 50k items — re-checks and ranks the
+whole bucket: measured ~200 µs for a 5000-row bucket with `LIMIT 20`. Still far
+cheaper than a full scan, but it grows with the bucket.
+
+Three known levers, **deferred** — each only pays off for these huge, hot
+single-key buckets, and is weighed against keeping the code simple (profiled
+shares of that path):
+
+1. **Residual-only re-check (~23% CPU).** Every candidate is re-validated against
+   the *full* `WHERE`, including the indexed equality the index already
+   guarantees. Re-confirming that conjunct with a cheap key compare and running
+   the general evaluator only for the *residual* (`AND age > ?`) would skip the
+   evaluator entirely for a pure `WHERE col = ?`.
+2. **Batched shard lock (~16% CPU).** Candidates are fetched one shard-lock at a
+   time (one lock pair per row). Grouping candidates by shard and locking each
+   shard once would cut thousands of lock pairs to ~32.
+3. **Key-only top-N (~78% of allocs).** The heap clones rows that transiently
+   enter the top-N. Collecting `(sort-key, pk)` first and cloning only the final
+   `LIMIT` rows removes those clones — at the cost of a small consistency window
+   between reading the key and fetching the row.
+
+For the common (filtered, modest-bucket) list view none of these matter; see
+[secondary-indexes.md](secondary-indexes.md) for the design.
+
 ## Not supported — will error or fail to parse
 
 - **No `JOIN`** — one table per query.
