@@ -56,8 +56,15 @@ A query that pins an indexed column by equality uses the index. When several
 indexed columns are pinned in an `AND` (`WHERE name = ? AND city = ?`), it
 **intersects** their index buckets — fetching only the rows matching *both*
 (e.g. the 1000 Peters in Amsterdam, not all 8000 Peters) — then applies the rest
-of the `WHERE` as a residual filter. `OR`, `ORDER BY`, and ranges (`<`, `>`) fall
-back to a scan (a range or OR conjunct is just left to the residual filter).
+of the `WHERE` as a residual filter. A range (`<`, `>`) or `OR` conjunct is left
+to that residual filter, not the index.
+
+**`ORDER BY` on a filtered list** is index-assisted: `WHERE author = ? ORDER BY
+date DESC LIMIT 20` resolves the author's rows through the index, then sorts that
+(small) subset and applies the `LIMIT` — the everyday list-view pattern, no full
+scan. A *bare* `ORDER BY` with no indexed equality (e.g. *all* posts by date)
+still scans then sorts; a global ordered index would change that, and is not
+built yet.
 
 **Async, but always correct.** Indexes are maintained *off the write path*: a
 write only flags its row, and a background merger reconciles the index shortly

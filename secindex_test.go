@@ -419,6 +419,69 @@ func TestIndexIntersection(t *testing.T) {
 	}
 }
 
+// Index-assisted ORDER BY on a filtered subset: WHERE author = ? ORDER BY day
+// [ASC|DESC] [LIMIT n]. The index narrows to the author's rows; the executor
+// sorts that subset. Exercised both before a merge (dirty overlay) and after.
+func TestIndexOrderBy(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE posts (id uuid primary key, author text, day int, INDEX (author))")
+	for _, d := range []int{3, 1, 2} {
+		db.Exec("INSERT INTO posts (id, author, day) VALUES (?, ?, ?)", NewUUIDv7(), "A", d)
+	}
+	db.Exec("INSERT INTO posts (id, author, day) VALUES (?, ?, ?)", NewUUIDv7(), "B", 9)
+
+	pl, _ := db.prepare("SELECT day FROM posts WHERE author = ? ORDER BY day ASC", db.cat.Load())
+	if !pl.idxLookup {
+		t.Fatal("WHERE author = ? ORDER BY day did not use the index")
+	}
+
+	toDays := func(rows []Row) []int64 {
+		out := make([]int64, len(rows))
+		for i, r := range rows {
+			out[i] = r[0].Int()
+		}
+		return out
+	}
+	eqI := func(a, b []int64) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for i := range a {
+			if a[i] != b[i] {
+				return false
+			}
+		}
+		return true
+	}
+	q := func(sql string, args ...any) []int64 {
+		_, rows, err := db.Query(sql, args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return toDays(rows)
+	}
+
+	// run the same assertions via the dirty overlay (no merge) and via the index
+	for _, phase := range []string{"overlay", "merged"} {
+		if phase == "merged" {
+			db.mergeIndexes()
+		}
+		if got := q("SELECT day FROM posts WHERE author = ? ORDER BY day ASC", "A"); !eqI(got, []int64{1, 2, 3}) {
+			t.Fatalf("[%s] ASC: %v", phase, got)
+		}
+		if got := q("SELECT day FROM posts WHERE author = ? ORDER BY day DESC", "A"); !eqI(got, []int64{3, 2, 1}) {
+			t.Fatalf("[%s] DESC: %v", phase, got)
+		}
+		if got := q("SELECT day FROM posts WHERE author = ? ORDER BY day DESC LIMIT 2", "A"); !eqI(got, []int64{3, 2}) {
+			t.Fatalf("[%s] DESC LIMIT 2: %v", phase, got)
+		}
+		// author B's row must not leak in
+		if got := q("SELECT day FROM posts WHERE author = ? ORDER BY day ASC", "A"); len(got) != 3 {
+			t.Fatalf("[%s] author A count: %v", phase, got)
+		}
+	}
+}
+
 // S6: churn within non-unique buckets — moving a PK between buckets (update) and
 // removing one (delete), across merges, must keep both buckets exact. Exercises
 // removeFwdLocked's swap-remove on multi-PK buckets.

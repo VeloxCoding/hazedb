@@ -173,13 +173,14 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 					pl.partLookup = true
 					pl.partSource = src
 				}
-			} else if len(rt.indexes) > 0 && s.orderCol == "" {
-				// Secondary-index lookup. Find an indexed column constrained by
-				// equality anywhere in the WHERE's AND-chain; use that index to
-				// get candidates and evaluate the FULL WHERE on each (so extra
-				// conjuncts like AND name = ? are residual-filtered). Prefer a
-				// UNIQUE index (better selectivity). ORDER BY falls back to the
-				// scan (the index is unordered) — a v1 limitation.
+			} else if len(rt.indexes) > 0 {
+				// Secondary-index lookup. Collect every indexed column constrained
+				// by equality in the WHERE's AND-chain; the executor intersects
+				// their buckets and evaluates the FULL WHERE on each candidate
+				// (residual-filtering extra conjuncts). An ORDER BY is honoured by
+				// sorting the candidate set — the filtered-list pattern (WHERE
+				// author = ? ORDER BY date). A query with no indexed equality
+				// conjunct (a bare ORDER BY, or only a range) falls back to scan.
 				eqs := map[int]expr{}
 				collectEqConjuncts(s.where, eqs)
 				for i := range rt.indexes {
@@ -570,10 +571,12 @@ func (db *DB) execSelectPKOne(pl *plan, keyVal Value) ([]string, Row, error) {
 	return colNames, pr, nil
 }
 
-// execSelectIdx runs a SELECT pinned to a secondary-indexed column (WHERE col =
-// ?). It resolves candidate PKs through the index, then fetches and projects
-// each by PK. The synchronous-maintenance baseline (S2) trusts the index match;
-// S3 adds a live re-check so a concurrently-changed row is filtered.
+// execSelectIdx runs a SELECT whose WHERE pins one or more secondary-indexed
+// columns by equality. It resolves candidate PKs through the index(es)
+// (intersecting buckets for an AND of equalities) plus the dirty overlay, then
+// evaluates the full WHERE on each live row. With an ORDER BY it gathers all
+// matches and sorts before LIMIT (the filtered-list pattern); otherwise it
+// projects and stops at LIMIT.
 func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 	st := pl.st.(*selectStmt)
 	tbl := pl.rt
@@ -618,6 +621,43 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 		return colNames, nil, nil
 	}
 	seen := make(map[UUID]struct{}, len(pks)+len(dirty))
+
+	// ORDER BY: gather every matching live row, sort by the order column, then
+	// LIMIT. The candidate set is the index-narrowed (filtered) subset — the
+	// "list view" pattern (WHERE author = ? ORDER BY date LIMIT 20) — so sorting
+	// it is cheap. (Sorting a near-whole-table subset is the caller's call; that
+	// is no longer a list view.)
+	if pl.orderOrdinal >= 0 {
+		var matched []Row
+		gather := func(pk UUID) {
+			if _, dup := seen[pk]; dup {
+				return
+			}
+			seen[pk] = struct{}{}
+			r, ok := tbl.getByPK(pk)
+			if !ok {
+				return
+			}
+			ctx.row = r
+			if v, err := evalExpr(st.where, ctx); err != nil || !truthy(v) {
+				return
+			}
+			matched = append(matched, r)
+		}
+		for _, pk := range pks {
+			gather(pk)
+		}
+		for _, pk := range dirty {
+			gather(pk)
+		}
+		sortRowsByCol(matched, pl.orderOrdinal, st.orderDesc)
+		if st.limit >= 0 && st.limit < len(matched) {
+			matched = matched[:st.limit]
+		}
+		return colNames, projectRows(matched, st.starAll, pl.projOrdinals), nil
+	}
+
+	// No ORDER BY: project and stop as soon as LIMIT is reached.
 	out := make([]Row, 0, len(pks))
 	consider := func(pk UUID) bool { // returns true to stop (limit reached)
 		if _, dup := seen[pk]; dup {
