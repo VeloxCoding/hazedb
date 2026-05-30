@@ -41,9 +41,13 @@ function rate(float $dt, int $n): string {
 }
 
 // --- data pools (generated outside timing) ---
+// 199 names is COPRIME with 10 cities, so a given name spreads across all
+// cities (name[i%199], city[i%10]): name bucket ~N/199, city bucket ~N/10, and
+// name AND city ~N/1990 — a genuinely small intersection of two large buckets,
+// not a correlated subset.
 $NAMES  = [];
-for ($i = 0; $i < 200; $i++) { $NAMES[] = "name$i"; }   // ~N/200 rows per name
-$CITIES = ['AMS', 'RTM', 'UTR', 'DHG', 'EIN', 'GRN', 'TIL', 'ALM', 'BRD', 'NIJ']; // ~N/10 per city
+for ($i = 0; $i < 199; $i++) { $NAMES[] = "name$i"; }
+$CITIES = ['AMS', 'RTM', 'UTR', 'DHG', 'EIN', 'GRN', 'TIL', 'ALM', 'BRD', 'NIJ'];
 
 $ids = $emails = $names = $cities = $ages = [];
 for ($i = 0; $i < $N; $i++) {
