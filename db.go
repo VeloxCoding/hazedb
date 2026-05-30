@@ -303,6 +303,51 @@ func (db *DB) queryRowPlan(pl *plan, args []any) ([]string, Row, error) {
 	return cols, rows[0], nil
 }
 
+// QueryValues is Query with pre-typed args — the read counterpart of ExecValues,
+// for in-process callers (the PHP extension) that already hold typed Values and
+// want to skip the []any/JSON conversion. Reads never store the args, so no
+// per-arg clone is needed.
+func (db *DB) QueryValues(sql string, args ...Value) ([]string, []Row, error) {
+	pl, err := db.prepare(sql, db.cat.Load())
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, ok := pl.st.(*selectStmt); !ok {
+		return nil, nil, fmt.Errorf("fastsql: Query used with non-SELECT — use Exec instead")
+	}
+	if pl.pkLookup {
+		keyVal, err := evalLitOrParamValue(pl.pkSource, args)
+		if err != nil {
+			return nil, nil, err
+		}
+		return db.execSelectPK(pl, keyVal)
+	}
+	return db.execSelect(pl, args)
+}
+
+// QueryRowValues is QueryRow with pre-typed args (see QueryValues).
+func (db *DB) QueryRowValues(sql string, args ...Value) ([]string, Row, error) {
+	pl, err := db.prepare(sql, db.cat.Load())
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, ok := pl.st.(*selectStmt); !ok {
+		return nil, nil, fmt.Errorf("fastsql: QueryRow used with non-SELECT — use Exec instead")
+	}
+	if pl.pkLookup {
+		keyVal, err := evalLitOrParamValue(pl.pkSource, args)
+		if err != nil {
+			return nil, nil, err
+		}
+		return db.execSelectPKOne(pl, keyVal)
+	}
+	cols, rows, err := db.execSelect(pl, args)
+	if err != nil || len(rows) == 0 {
+		return cols, nil, err
+	}
+	return cols, rows[0], nil
+}
+
 // prepare returns a plan bound against cat. A cached plan is reused only if it
 // was bound against the same catalog version; otherwise it is re-parsed and
 // re-bound so it never references a table that has since changed.

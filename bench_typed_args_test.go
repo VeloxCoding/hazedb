@@ -14,6 +14,7 @@ package hazedb
 // Run: go test -run x -bench Insert_ -benchmem -count=3
 
 import (
+	"encoding/json"
 	"strconv"
 	"testing"
 )
@@ -74,6 +75,56 @@ func TestExecValuesParity(t *testing.T) {
 	if string(a) != string(b) {
 		t.Fatalf("ExecValues row != Exec row:\n  values: %s\n  any   : %s", a, b)
 	}
+}
+
+// TestQueryValuesParity asserts the typed read paths (QueryValues /
+// QueryRowValues) and the objects encoder match the []any paths.
+func TestQueryValuesParity(t *testing.T) {
+	const N = 200
+	db := Open0(t, N)
+	// PK read
+	_, rowA, errA := db.QueryRow("SELECT name, age FROM users WHERE id = ?", tid(7))
+	_, rowB, errB := db.QueryRowValues("SELECT name, age FROM users WHERE id = ?", UUIDVal(tid(7)))
+	if errA != nil || errB != nil {
+		t.Fatalf("errs: %v / %v", errA, errB)
+	}
+	if rowA == nil || rowB == nil || rowA[0].Str() != rowB[0].Str() || rowA[1].Int() != rowB[1].Int() {
+		t.Fatalf("QueryRowValues mismatch: %v vs %v", rowA, rowB)
+	}
+	// scan read
+	cols, rowsA, _ := db.Query("SELECT name, age FROM users WHERE age >= 0 LIMIT 50")
+	_, rowsB, _ := db.QueryValues("SELECT name, age FROM users WHERE age >= 0 LIMIT 50")
+	if len(rowsA) != len(rowsB) || len(rowsA) == 0 {
+		t.Fatalf("QueryValues count mismatch: %d vs %d", len(rowsA), len(rowsB))
+	}
+	// objects encoder is valid JSON of the right cardinality
+	js, _ := RowsToJSONObjects(cols, rowsA)
+	var arr []map[string]any
+	if err := json.Unmarshal(js, &arr); err != nil {
+		t.Fatalf("RowsToJSONObjects invalid: %v\n%s", err, js)
+	}
+	if len(arr) != len(rowsA) {
+		t.Fatalf("objects len %d != rows %d", len(arr), len(rowsA))
+	}
+	if _, ok := arr[0]["name"]; !ok {
+		t.Fatalf("object missing 'name' key: %s", js)
+	}
+}
+
+// Open0 opens a seeded bench DB outside a *testing.B.
+func Open0(t *testing.T, n int) *DB {
+	t.Helper()
+	db, err := Open(Options{Schema: benchSchema(), SizeHint: n})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	for i := 0; i < n; i++ {
+		if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "name", i%100); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return db
 }
 
 func BenchmarkInsert_PHPJSONArgs(b *testing.B) {

@@ -45,6 +45,37 @@ func RowsToJSON(cols []string, rows []Row) ([]byte, error) {
 	return appendJSONRows(make([]byte, 0, est), cols, rows), nil
 }
 
+// RowsToJSONObjects renders a result set as a JSON array of objects keyed by
+// column name — [{"col":val,...},...] — the shape a fetchall-style caller
+// forwards straight to an HTTP/JSON response. Same hand-rolled, single-buffer
+// approach as RowsToJSON; never errors (error kept for API symmetry).
+func RowsToJSONObjects(cols []string, rows []Row) ([]byte, error) {
+	ncols := len(cols)
+	est := 2 + len(rows)*(8+ncols*24)
+	b := make([]byte, 0, est)
+	b = append(b, '[')
+	for i := range rows {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		b = append(b, '{')
+		for j, cell := range rows[i] {
+			if j > 0 {
+				b = append(b, ',')
+			}
+			if j < ncols {
+				b = appendJSONString(b, cols[j])
+			} else {
+				b = appendJSONString(b, "")
+			}
+			b = append(b, ':')
+			b = appendValueJSON(b, cell)
+		}
+		b = append(b, '}')
+	}
+	return append(b, ']'), nil
+}
+
 const jsonHexDigits = "0123456789abcdef"
 
 // appendJSONString appends s as a JSON string literal, escaping only the

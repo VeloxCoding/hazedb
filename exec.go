@@ -458,6 +458,22 @@ func evalLitOrParamAny(e expr, args []any) (Value, error) {
 	}
 }
 
+// evalLitOrParamValue is evalLitOrParamAny for pre-typed Value args (the
+// QueryValues / QueryRowValues path) — no toValue conversion needed.
+func evalLitOrParamValue(e expr, args []Value) (Value, error) {
+	switch x := e.(type) {
+	case *litValue:
+		return x.v, nil
+	case *paramRef:
+		if x.index < 0 || x.index >= len(args) {
+			return Value{}, fmt.Errorf("%w: param index %d out of range", ErrParamMismatch, x.index)
+		}
+		return args[x.index], nil
+	default:
+		return Value{}, fmt.Errorf("internal: expected literal or parameter, got %T", e)
+	}
+}
+
 func (db *DB) execSelectPK(pl *plan, keyVal Value) ([]string, []Row, error) {
 	st := pl.st.(*selectStmt)
 	tbl := pl.rt
