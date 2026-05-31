@@ -215,6 +215,18 @@ whole async mechanism is correct regardless of timing.
   batched per-shard locking, and a key-only top-N (clone only the final `LIMIT`).
   Profiled shares and trade-offs in [php-sql-layer.md](php-sql-layer.md). Deferred:
   they only pay off for huge hot buckets, against keeping the path simple.
+- **Sorted buckets for allocation-free intersection — considered & rejected (v0.1.13).**
+  `intersectPKs` builds a `map[UUID]struct{}` per multi-index `AND` query; keeping
+  buckets PK-sorted would allow a two-pointer intersection with no map. Rejected
+  for now: profiling `WHERE name=? AND city=?` (~1040 of 50k rows) put the
+  intersection map at only **~15%** of the query's ~958 KB/op — the bulk (~71%) is
+  fetching and projecting the result rows (`Row.Clone` + `projectClone` +
+  `execSelectIdx`), which the change does not touch, and the two-pointer's own
+  `out` slice (~11%) stays regardless. The cost is permanent and on the write
+  side (sorted buckets = insertion cost per append, or a per-merge re-sort), to
+  optimize a narrow query shape that is not shown hot. If this path ever profiles
+  hot, prefer a bounded scratch-map pool (`sync.Pool`) first — it removes the map
+  allocation with no change to bucket storage or the write path.
 
 ## 12. Ordered indexes (implemented)
 
