@@ -208,3 +208,41 @@ func BenchmarkQueryJSON_Stream_1k(b *testing.B)        { benchJSON(b, 1000, true
 func BenchmarkQueryJSON_Materialized_1k(b *testing.B)  { benchJSON(b, 1000, false) }
 func BenchmarkQueryJSON_Stream_10k(b *testing.B)       { benchJSON(b, 10000, true) }
 func BenchmarkQueryJSON_Materialized_10k(b *testing.B) { benchJSON(b, 10000, false) }
+
+// Benchmark: QueryJSON (fresh buffer per call) vs QueryJSONInto (one reused
+// scratch buffer, the pooled-adapter pattern). Isolates the output-buffer
+// allocation + growth that a read-and-forward caller can amortise away.
+func benchJSONInto(b *testing.B, n int, reuse bool) {
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: n})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec("CREATE TABLE users (id uuid primary key, name text, email text, age int)")
+	for i := 0; i < n; i++ {
+		db.Exec("INSERT INTO users (id, name, email, age) VALUES (?, ?, ?, ?)",
+			NewUUIDv7(), "user"+strconv.Itoa(i), "user"+strconv.Itoa(i)+"@example.com", i)
+	}
+	const sql = "SELECT id, name, email, age FROM users"
+	var scratch []byte
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if reuse {
+			var body []byte
+			if _, body, _ = db.QueryJSONInto(scratch[:0], sql); len(body) == 0 {
+				b.Fatal("empty")
+			}
+			scratch = body // keep the grown backing for the next call
+		} else {
+			if _, body, _ := db.QueryJSON(sql); len(body) == 0 {
+				b.Fatal("empty")
+			}
+		}
+	}
+}
+
+func BenchmarkQueryJSON_Fresh_1k(b *testing.B)  { benchJSONInto(b, 1000, false) }
+func BenchmarkQueryJSON_Reuse_1k(b *testing.B)  { benchJSONInto(b, 1000, true) }
+func BenchmarkQueryJSON_Fresh_10k(b *testing.B) { benchJSONInto(b, 10000, false) }
+func BenchmarkQueryJSON_Reuse_10k(b *testing.B) { benchJSONInto(b, 10000, true) }

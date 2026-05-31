@@ -152,23 +152,33 @@ func (db *DB) QueryEach(sql string, args []Value, visit func(cols []string, row 
 // read-and-forward path (an HTTP/JSON response) this avoids materializing rows
 // only to re-encode and discard them.
 func (db *DB) QueryJSON(sql string, args ...Value) ([]string, []byte, error) {
+	return db.QueryJSONInto(make([]byte, 0, 256), sql, args...)
+}
+
+// QueryJSONInto is QueryJSON that appends into the caller-supplied buffer dst,
+// returning the columns and the grown slice. Pass dst[:0] to reuse a pooled
+// scratch buffer: a hot read-and-forward caller (the PHP/HTTP fetchall_json
+// path) that keeps one buffer per worker and copies the result out immediately
+// pays no per-call allocation for the JSON envelope — only the amortised growth
+// to the high-water mark. The returned slice may share dst's backing array.
+func (db *DB) QueryJSONInto(dst []byte, sql string, args ...Value) ([]string, []byte, error) {
 	pl, err := db.prepare(sql, db.cat.Load())
 	if err != nil {
 		return nil, nil, err
 	}
 	if _, ok := pl.st.(*selectStmt); !ok {
-		return nil, nil, fmt.Errorf("fastsql: QueryJSON used with non-SELECT — use Exec instead")
+		return nil, nil, fmt.Errorf("fastsql: QueryJSONInto used with non-SELECT — use Exec instead")
 	}
 	cols := pl.colNames
-	buf := make([]byte, 0, 256)
-	buf = append(buf, '[')
+	prefix := pl.colJSONPrefix
+	buf := append(dst, '[')
 	first := true
 	if _, err = db.selectEach(pl, args, func(row Row) bool {
 		if !first {
 			buf = append(buf, ',')
 		}
 		first = false
-		buf = appendRowJSONObject(buf, cols, row)
+		buf = appendRowJSONObjectPre(buf, prefix, row)
 		return true
 	}); err != nil {
 		return nil, nil, err

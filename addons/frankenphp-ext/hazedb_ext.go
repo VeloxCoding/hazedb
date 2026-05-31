@@ -267,6 +267,12 @@ type rowScratch struct {
 
 var scratchPool = sync.Pool{New: func() any { return new(rowScratch) }}
 
+// jsonBufPool holds reusable JSON output buffers for hazedb_fetchall_json, so a
+// worker reuses one backing array instead of allocating (and growing from a tiny
+// seed) per call. *[]byte, not []byte, so Put stores the grown slice header
+// without boxing it into a fresh allocation.
+var jsonBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 1024); return &b }}
+
 // fillKeys packs the column names into keybuf + (n+1) offsets, once per query
 // since the keys are identical for every row.
 func (sc *rowScratch) fillKeys(cols []string) {
@@ -402,14 +408,22 @@ func hazedb_fetchall_json(sql *C.zend_string, args *C.zval) unsafe.Pointer {
 	if !ok {
 		return nil
 	}
-	// Stream straight to JSON bytes: QueryJSON encodes the live rows into one
-	// buffer, skipping the []Row clone QueryValues + RowsToJSONObjects would
-	// build and immediately discard.
-	_, body, err := db.QueryJSON(zendStringView(sql), vals...)
+	// Stream straight to JSON bytes into a POOLED per-worker buffer: QueryJSONInto
+	// encodes the live rows into one buffer (no []Row clone), and reusing the
+	// buffer across calls drops the per-call envelope allocation — for a result
+	// of any size the 256 B->payload doubling otherwise throws away ~4x the final
+	// size every call. phpStringFromBytes copies the bytes into the Zend heap
+	// before we return the buffer to the pool, so nothing aliases reused storage.
+	bp := jsonBufPool.Get().(*[]byte)
+	_, body, err := db.QueryJSONInto((*bp)[:0], zendStringView(sql), vals...)
 	if err != nil {
+		jsonBufPool.Put(bp)
 		return nil
 	}
-	return phpStringFromBytes(body)
+	*bp = body // keep the grown backing for the next call on this worker
+	res := phpStringFromBytes(body)
+	jsonBufPool.Put(bp)
+	return res
 }
 
 // hazedb_exec runs a write and returns the affected row count, or -1 on error /

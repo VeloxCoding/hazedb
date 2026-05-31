@@ -67,6 +67,10 @@ type plan struct {
 	// and returned by every Query on this (cached) plan. Read-only: it is
 	// shared across concurrent callers, so callers must not mutate it.
 	colNames []string
+	// colJSONPrefix is each column's pre-escaped object-key fragment ("col":),
+	// computed once at plan time so QueryJSON appends it per row instead of
+	// re-escaping the (constant) column name on every row. Read-only, shared.
+	colJSONPrefix [][]byte
 	// SELECT ORDER BY: ordinal of the order column. -1 if none.
 	orderOrdinal int
 	// INSERT column ordinals matching the values list.
@@ -159,6 +163,12 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 			for i, c := range s.cols {
 				pl.colNames[i] = c.col
 			}
+		}
+		// Pre-escape each column's "col": object-key fragment once, so the
+		// per-row JSON encoder appends bytes instead of re-escaping a constant.
+		pl.colJSONPrefix = make([][]byte, len(pl.colNames))
+		for i, name := range pl.colNames {
+			pl.colJSONPrefix[i] = append(appendJSONString(nil, name), ':')
 		}
 		if s.orderCol != "" {
 			ord, ok := rt.colByName[s.orderCol]

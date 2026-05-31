@@ -84,6 +84,26 @@ func appendRowJSONObject(b []byte, cols []string, row Row) []byte {
 	return append(b, '}')
 }
 
+// appendRowJSONObjectPre appends one row as a {"col":val,...} object using
+// pre-escaped key fragments (each prefix is `"col":`, built once at plan time),
+// so the constant column names are not re-escaped per row. The row may alias
+// live arena storage; every cell is copied into b here, so nothing is retained.
+func appendRowJSONObjectPre(b []byte, prefix [][]byte, row Row) []byte {
+	b = append(b, '{')
+	for j, cell := range row {
+		if j > 0 {
+			b = append(b, ',')
+		}
+		if j < len(prefix) {
+			b = append(b, prefix[j]...)
+		} else {
+			b = append(b, '"', '"', ':')
+		}
+		b = appendValueJSON(b, cell)
+	}
+	return append(b, '}')
+}
+
 const jsonHexDigits = "0123456789abcdef"
 
 // appendJSONString appends s as a JSON string literal, escaping only the
