@@ -117,7 +117,12 @@ func (si *secIndex) apply(pk UUID, newKey indexKey, indexable bool) {
 		si.mu.Unlock()
 		return
 	}
-	if old, had := si.rev[pk]; had {
+	old, had := si.rev[pk]
+	if had && indexable && old == newKey {
+		si.mu.Unlock()
+		return // key unchanged: fwd already holds pk under it — skip the remove+append churn
+	}
+	if had {
 		si.removeFwdLocked(old, pk)
 		delete(si.rev, pk)
 	}

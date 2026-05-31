@@ -245,6 +245,23 @@ whole async mechanism is correct regardless of timing.
   optimize a narrow query shape that is not shown hot. If this path ever profiles
   hot, prefer a bounded scratch-map pool (`sync.Pool`) first — it removes the map
   allocation with no change to bucket storage or the write path.
+- **Per-shard batch dedup in the merger — considered & deferred (v0.1.13).** Under
+  update churn a shard's `dirty` can hold the same PK many times before a merge
+  runs; the merge then does a redundant `getByPKProjectInto` + `apply` per copy
+  (merge cost scales with total dirty entries, not the working set — measured
+  ~8.6 ms to reconcile 100 hot rows churned 500× vs ~2.3 µs un-churned). The
+  larger, cheaper half was taken instead: `apply` now skips the fwd remove+append
+  when the key is unchanged (`rev[pk] == newKey`), which on that churn case cut
+  ~3× and removed ~all the allocations with no map and no tuning knob. The
+  residual is the K× `getByPKProjectInto` per duplicate (~63 ns each); collapsing
+  it needs deduping the batch to unique PKs. Deferred because the trigger is
+  awkward — gating on `len(batch)` misfires on a large but dup-FREE batch (a 50k
+  unique-insert merge would build a 50k-entry dedup map that finds nothing), and
+  the real signal (dup ratio) isn't known without scanning. If a real churn
+  workload shows the residual hurts, add it with a REUSED scratch map (not a
+  per-merge alloc), per shard (a PK lives in exactly one shard, so per-shard dedup
+  catches all its copies). NOT on the write path — that would tax every write to
+  help the rare hot-churn case.
 
 ## 12. Ordered indexes (implemented)
 
