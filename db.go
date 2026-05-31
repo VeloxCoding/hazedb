@@ -131,6 +131,16 @@ func Open(opts Options) (*DB, error) {
 				m.close()
 				return nil, err
 			}
+			// Segment numbers must stay above the drained cursor across restarts.
+			// close() drops the empty trailing segment and the drain deletes the
+			// segments it consumes, so the highest on-disk segment can fall back
+			// below lastDrained (an empty dir resets the counter to 1). Without
+			// this, a new active segment could reuse a number <= lastDrained and
+			// drainOnce would skip it forever — post-restart writes would never
+			// reach the mirror and would be lost on the next recovery.
+			if w.seg < m.lastDrained {
+				w.seg = m.lastDrained
+			}
 			if err := w.startActiveSegment(); err != nil {
 				w.close()
 				m.close()

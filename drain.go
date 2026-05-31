@@ -233,6 +233,9 @@ func buildDrainTable(td TableDef) *drainTable {
 
 // valueToArg converts a hazedb cell into a database/sql argument. Byte-backed
 // values (BYTES, UUID) are copied so the driver never aliases WAL-decode memory.
+// The copy must be a NON-NIL slice even when empty: database/sql stores a nil
+// []byte as SQL NULL, which would erase the empty-bytes vs NULL distinction —
+// so make+copy is used rather than append([]byte(nil), …) (nil for empty input).
 func valueToArg(v Value) any {
 	switch v.Kind {
 	case KindNull:
@@ -248,10 +251,14 @@ func valueToArg(v Value) any {
 		return v.Str()
 	case KindBytes:
 		b := v.Bytes()
-		return append([]byte(nil), b...)
+		cp := make([]byte, len(b))
+		copy(cp, b)
+		return cp
 	case KindUUID:
 		u := v.UUID()
-		return append([]byte(nil), u[:]...)
+		cp := make([]byte, len(u))
+		copy(cp, u[:])
+		return cp
 	}
 	return nil
 }
