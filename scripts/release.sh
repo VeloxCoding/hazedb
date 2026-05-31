@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # release.sh — cut an ALIGNED hazedb release: ONE commit that BOTH module tags
 # point at, so a checkout of either tag has a self-consistent caddymodule/go.mod.
-# Run from the repo root on a clean `main`, with the Go toolchain and push
-# credentials available.
+#
+# CANONICAL WAY TO RUN: the "Release" GitHub Actions workflow
+# (.github/workflows/release.yml) — Actions tab -> Run workflow -> version. CI is
+# the one place that has the Go toolchain, push auth (GITHUB_TOKEN), and a clean
+# LF checkout all together, so the chicken-and-egg dance below runs reliably.
+# Running it locally needs the Go toolchain AND push credentials in the SAME
+# shell — which a split host/Docker dev box does not have, so prefer CI.
 #
 #   scripts/release.sh v0.1.14
 #
@@ -57,15 +62,16 @@ git commit -m "release $v: align caddymodule core require"
 git tag -a "$v" -m "$v"
 git push origin "$v"
 
-# 3. Refresh the caddymodule's go.sum against the just-published core, fold it
-#    into the same commit, and re-point the core tag at the result. The force is
-#    checksum-safe (see header): caddymodule-only edits do not change the core
-#    module's zip.
+# 3. Refresh the caddymodule's go.mod+go.sum against the just-published core, fold
+#    them into the same commit, and re-point the core tag at the result. The force
+#    is checksum-safe (see header): caddymodule-only edits do not change the core
+#    module's zip. (tidy usually only rewrites go.sum for a patch bump, but it can
+#    also adjust go.mod's indirect set — stage both so neither is left dangling.)
 ( cd caddymodule
   GOPROXY=direct go mod tidy
   go build ./... && go vet ./... )
-if ! git diff --quiet -- caddymodule/go.sum; then
-  git add caddymodule/go.sum
+if ! git diff --quiet -- caddymodule/go.mod caddymodule/go.sum; then
+  git add caddymodule/go.mod caddymodule/go.sum
   git commit --amend --no-edit
   git tag -f -a "$v" -m "$v"
   git push -f origin "$v"

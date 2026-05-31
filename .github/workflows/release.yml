@@ -1,0 +1,45 @@
+# Release — cut an aligned hazedb release from CI, the one place with the Go
+# toolchain, push auth, and a clean LF checkout together. Trigger from the
+# Actions tab (Run workflow) with the version; the job runs scripts/release.sh,
+# which tags the core, aligns + tags caddymodule, and smoke-tests a clean
+# external install. See scripts/release.sh for the why.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (vMAJOR.MINOR.PATCH, e.g. v0.1.15)"
+        required: true
+
+# release.sh pushes the bump commit + both tags (and force-moves the core tag).
+permissions:
+  contents: write
+
+# Never let two releases run at once.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0 # full history so tag creation/annotation is clean
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Cut aligned release
+        run: ./scripts/release.sh "${{ inputs.version }}"
