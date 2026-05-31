@@ -21,20 +21,23 @@ mechanics first sketched in §4 below. Two reasons the segment approach won:
 - A drainer only ever touches **sealed** (closed) segments, never the open one,
   so the "don't read a file being appended to" question disappears by construction.
 
-What shipped (all opt-in via `Options`):
+What shipped (opt-in via `Options.WALLevel`: `WALOff` / `WALPeriodic` /
+`WALPerWrite`):
 
-- **Segmented WAL** (`WALRotateInterval`, default 5s when draining): `WALPath`
-  becomes a directory of `seg-<n>.wal` files plus one active segment. A ticker
-  seals the active segment and opens the next, between records, under the WAL
-  lock — so a rotation never splits a record or a transaction. Single-file mode
-  (the default) is unchanged. See [wal_segment.go](../wal_segment.go).
-- **SQLite mirror** (`SQLitePath`, `DrainInterval` default 60s,
-  `SegmentDrainMinAge` default 5s): a background loop replays each sealed segment
-  **faithfully** (one SQLite transaction per segment; INSERT/UPDATE/DELETE in WAL
-  order — *not* coalesced), recording the segment number in the same transaction
-  (`_hz_meta.last_drained_segment`), then **deletes the segment**. So the WAL
-  stays bounded at ~the undrained tail. Driver: `modernc.org/sqlite` (pure Go).
-  See [drain.go](../drain.go).
+- **Segmented WAL** (`WALRotateInterval`, default 5s whenever the WAL is on):
+  `WALPath` becomes a directory of `seg-<n>.wal` files plus one active segment.
+  A ticker seals the active segment and opens the next, between records, under
+  the WAL lock — so a rotation never splits a record or a transaction. Rotation
+  is always on when the WAL is enabled, so the log never grows as one unbounded
+  file. See [wal_segment.go](../wal_segment.go).
+- **SQLite mirror** (`SQLitePath`; drains once per rotation): a background loop
+  replays each sealed segment **faithfully** (one SQLite transaction per segment;
+  INSERT/UPDATE/DELETE in WAL order — *not* coalesced), recording the segment
+  number in the same transaction (`_hz_meta.last_drained_segment`), then
+  **deletes the segment**. So the WAL stays bounded at ~the undrained tail. The
+  drain only ever touches sealed segments (those below the active one), so there
+  is no open file to race and no age gate is needed. Driver:
+  `modernc.org/sqlite` (pure Go). See [drain.go](../drain.go).
 - **Recovery** = load current state from SQLite (reconciling the catalog with
   runtime-created tables via `_hz_tables`), then replay only segments past the
   drained cursor on top. Boot and crash recovery are the same path. See
@@ -54,8 +57,9 @@ native-C rate measured earlier is the modernc-vs-cgo trade — at the 60s cadenc
 there is ample headroom either way.
 
 It builds on two pieces that already exist and are tested: the typed-mutation
-**WAL** ([wal.go](../wal.go), fsync modes `WALSync` / `WALSyncPerWrite` in
-[db.go](../db.go)) and **WAL-replay recovery** (`Open` → `replayWAL` in
+**WAL** ([wal.go](../wal.go), fsync selected by `WALLevel` — `WALPeriodic`
+fsyncs on the ticker, `WALPerWrite` fsyncs every write) and **WAL-replay
+recovery** (`Open` → `replayWAL` in
 [db.go](../db.go), covered by `recovery_test.go`). It reuses the async-merger's
 **dirty-set tracking** (`markDirtyLocked`, `dirty []UUID`, `dirtyCount` in
 [store.go](../store.go); the merge loop in [secindex.go](../secindex.go)).

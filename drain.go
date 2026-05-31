@@ -39,7 +39,6 @@ type sqliteMirror struct {
 	sdb         *sql.DB
 	tables      map[uint16]*drainTable // tableID -> mirror table (single-threaded: drain only)
 	lastDrained uint64                 // highest segment fully committed to SQLite
-	minAge      time.Duration          // skip segments sealed more recently than this
 }
 
 // execer is satisfied by both *sql.DB and *sql.Tx, so register/apply work
@@ -52,7 +51,7 @@ type execer interface {
 // tables, loads the drain cursor and the known tables, then seeds any bootstrap
 // tables from cat that the mirror does not yet have (the Open() schema is not
 // journaled as CREATE TABLE records, so it must be seeded here).
-func newSQLiteMirror(path string, cat *catalog, minAge time.Duration) (*sqliteMirror, error) {
+func newSQLiteMirror(path string, cat *catalog) (*sqliteMirror, error) {
 	sdb, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("mirror: open %q: %w", path, err)
@@ -70,7 +69,7 @@ func newSQLiteMirror(path string, cat *catalog, minAge time.Duration) (*sqliteMi
 			return nil, fmt.Errorf("mirror: %q: %w", pragma, err)
 		}
 	}
-	m := &sqliteMirror{sdb: sdb, tables: map[uint16]*drainTable{}, minAge: minAge}
+	m := &sqliteMirror{sdb: sdb, tables: map[uint16]*drainTable{}}
 	if err := m.ensureMeta(); err != nil {
 		sdb.Close()
 		return nil, err
@@ -260,10 +259,10 @@ func valueToArg(v Value) any {
 // --- drain ------------------------------------------------------------------
 
 // drainOnce drains every sealed segment past the cursor into SQLite, one segment
-// per transaction. When respectAge is true it stops at the first segment sealed
-// more recently than minAge (settled-history only); the final drain on Close
-// passes false to flush everything. A no-op when the mirror or WAL is absent.
-func (db *DB) drainOnce(respectAge bool) error {
+// per transaction. sealedSegments returns only segments below the active one, so
+// every candidate is already flushed, fsynced, and closed — there is no open
+// file to race and no age gate is needed. A no-op when the mirror or WAL is absent.
+func (db *DB) drainOnce() error {
 	if db.sq == nil || db.wal == nil {
 		return nil
 	}
@@ -275,17 +274,7 @@ func (db *DB) drainOnce(respectAge bool) error {
 		if n <= db.sq.lastDrained {
 			continue
 		}
-		path := db.wal.segPath(n)
-		if respectAge && db.sq.minAge > 0 {
-			fi, err := os.Stat(path)
-			if err != nil {
-				return err
-			}
-			if time.Since(fi.ModTime()) < db.sq.minAge {
-				break // too young; this and all later segments wait for the next pass
-			}
-		}
-		if err := db.drainSegment(n, path); err != nil {
+		if err := db.drainSegment(n, db.wal.segPath(n)); err != nil {
 			return err
 		}
 	}
@@ -476,12 +465,12 @@ func (db *DB) startDrainLoop(interval time.Duration) {
 			select {
 			case <-db.drainStop:
 				// Final drain: seal the active segment so its records reach the
-				// mirror, then drain everything regardless of age.
+				// mirror, then drain every sealed segment.
 				db.wal.rotate()
-				_ = db.drainOnce(false)
+				_ = db.drainOnce()
 				return
 			case <-t.C:
-				_ = db.drainOnce(true)
+				_ = db.drainOnce()
 			}
 		}
 	}()

@@ -114,7 +114,7 @@ func TestQueryValuesParity(t *testing.T) {
 // Open0 opens a seeded bench DB outside a *testing.B.
 func Open0(t *testing.T, n int) *DB {
 	t.Helper()
-	db, err := Open(Options{Schema: benchSchema(), SizeHint: n})
+	db, err := Open(Options{Schema: benchSchema(), sizeHint: n})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func Open0(t *testing.T, n int) *DB {
 }
 
 func BenchmarkInsert_PHPJSONArgs(b *testing.B) {
-	db, err := Open(Options{Schema: benchSchema(), SizeHint: b.N})
+	db, err := Open(Options{Schema: benchSchema(), sizeHint: b.N})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func BenchmarkInsert_PHPJSONArgs(b *testing.B) {
 }
 
 func BenchmarkInsert_AnyArgs(b *testing.B) {
-	db, err := Open(Options{Schema: benchSchema(), SizeHint: b.N})
+	db, err := Open(Options{Schema: benchSchema(), sizeHint: b.N})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func BenchmarkInsert_AnyArgs(b *testing.B) {
 }
 
 func BenchmarkInsert_TypedValues(b *testing.B) {
-	db, err := Open(Options{Schema: benchSchema(), SizeHint: b.N})
+	db, err := Open(Options{Schema: benchSchema(), sizeHint: b.N})
 	if err != nil {
 		b.Fatal(err)
 	}

@@ -76,29 +76,29 @@ type DB struct {
 // opened and any existing records are replayed into memory before
 // Open returns. Open is blocking until replay completes.
 func Open(opts Options) (*DB, error) {
-	if opts.SQLitePath != "" && opts.WALPath == "" {
-		return nil, fmt.Errorf("hazedb: SQLitePath requires WALPath (the mirror is fed from sealed WAL segments)")
+	if err := opts.validate(); err != nil {
+		return nil, err
 	}
 	opts.applyDefaults()
 	// An empty schema is allowed — tables can be created at runtime.
-	cat, err := newCatalog(opts.Schema, opts.SizeHint)
+	cat, err := newCatalog(opts.Schema, opts.sizeHint)
 	if err != nil {
 		return nil, err
 	}
 	db := &DB{
 		schema:   opts.Schema,
-		sizeHint: opts.SizeHint,
+		sizeHint: opts.sizeHint,
 		scratch:  newScratchPool(),
 	}
 	db.cat.Store(cat)
-	if opts.WALPath != "" {
-		segmented := opts.WALRotateInterval > 0 || opts.SQLitePath != ""
+	if opts.walEnabled() {
+		segmented := opts.WALRotateInterval > 0
 		var w *wal
 		var err error
 		if segmented {
-			w, err = openWALSegmented(opts.WALPath, opts.WALSync, opts.WALSyncPerWrite)
+			w, err = openWALSegmented(opts.WALPath, opts.walSync(), opts.walSyncPerWrite())
 		} else {
-			w, err = openWAL(opts.WALPath, opts.WALSync, opts.WALSyncPerWrite)
+			w, err = openWAL(opts.WALPath, opts.walSync(), opts.walSyncPerWrite())
 		}
 		if err != nil {
 			return nil, err
@@ -110,7 +110,7 @@ func Open(opts Options) (*DB, error) {
 			// SQLite-backed recovery: the mirror is the system of record on disk.
 			// Open it first, load it into memory, then replay only the undrained
 			// WAL tail (segments past the drained cursor) on top.
-			m, merr := newSQLiteMirror(opts.SQLitePath, db.cat.Load(), opts.SegmentDrainMinAge)
+			m, merr := newSQLiteMirror(opts.SQLitePath, db.cat.Load())
 			if merr != nil {
 				w.close()
 				return nil, merr
@@ -154,19 +154,19 @@ func Open(opts Options) (*DB, error) {
 				}
 			}
 		}
-		w.startTicker(opts.WALFlushInterval)
+		w.startTicker(opts.walFlushInterval)
 		w.startRotateTicker(opts.WALRotateInterval)
 		db.wal = w
 		// Replay marked rows dirty but never built the indexes; rebuild them from
 		// the live rows now, so reads are index-fast before serving.
 		db.rebuildAllIndexes()
 
-		if opts.SQLitePath != "" && opts.DrainInterval > 0 {
-			db.startDrainLoop(opts.DrainInterval)
+		if opts.SQLitePath != "" && opts.drainInterval > 0 {
+			db.startDrainLoop(opts.drainInterval)
 		}
 	}
-	if opts.IndexMergeInterval > 0 {
-		db.startMergeLoop(opts.IndexMergeInterval)
+	if opts.indexMergeInterval > 0 {
+		db.startMergeLoop(opts.indexMergeInterval)
 	}
 	return db, nil
 }

@@ -26,7 +26,7 @@ func BenchmarkSelectByPK_Parallel(b *testing.B) {
 }
 
 func BenchmarkInsert_Parallel_Mem(b *testing.B) {
-	db, _ := Open(Options{Schema: benchSchema(), SizeHint: 2 * 1024 * 1024})
+	db, _ := Open(Options{Schema: benchSchema(), sizeHint: 2 * 1024 * 1024})
 	defer db.Close()
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -43,7 +43,7 @@ func BenchmarkInsert_Parallel_Mem(b *testing.B) {
 
 func BenchmarkInsert_Parallel_WAL(b *testing.B) {
 	dir := b.TempDir()
-	db, _ := Open(Options{Schema: benchSchema(), SizeHint: 2 * 1024 * 1024, WALPath: dir + "/bench.wal"})
+	db, _ := Open(Options{Schema: benchSchema(), sizeHint: 2 * 1024 * 1024, WALLevel: WALPeriodic, WALPath: dir + "/bench.wal"})
 	defer db.Close()
 	b.ResetTimer()
 	b.ReportAllocs()

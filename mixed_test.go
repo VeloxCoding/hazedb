@@ -22,7 +22,7 @@ func TestMixedWorkloadLatency(t *testing.T) {
 	if testing.Short() {
 		t.Skip("mixed workload test takes ~3s")
 	}
-	db, _ := Open(Options{Schema: benchSchema(), SizeHint: 100_000})
+	db, _ := Open(Options{Schema: benchSchema(), sizeHint: 100_000})
 	defer db.Close()
 
 	// Pre-seed
@@ -126,7 +126,7 @@ func TestMixedWorkloadLatency_WAL(t *testing.T) {
 		t.Skip("mixed workload test takes ~3s")
 	}
 	dir := t.TempDir()
-	db, _ := Open(Options{Schema: benchSchema(), SizeHint: 100_000, WALPath: dir + "/m.wal"})
+	db, _ := Open(Options{Schema: benchSchema(), sizeHint: 100_000, WALLevel: WALPeriodic, WALPath: dir + "/m.wal"})
 	defer db.Close()
 
 	const seedN = 50_000

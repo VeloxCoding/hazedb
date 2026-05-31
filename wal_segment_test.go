@@ -11,7 +11,7 @@ import (
 // for determinism. Tests that exercise the ticker pass a short interval instead.
 func openSegmented(t *testing.T, dir string, rotate time.Duration) *DB {
 	t.Helper()
-	db, err := Open(Options{Schema: testSchema(), WALPath: dir, WALRotateInterval: rotate})
+	db, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: dir, WALRotateInterval: rotate})
 	if err != nil {
 		t.Fatalf("open segmented: %v", err)
 	}

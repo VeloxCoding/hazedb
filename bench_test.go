@@ -24,7 +24,7 @@ func benchSchema() Schema {
 
 func newBenchDB(b *testing.B, n int) *DB {
 	b.Helper()
-	db, err := Open(Options{Schema: benchSchema(), SizeHint: n})
+	db, err := Open(Options{Schema: benchSchema(), sizeHint: n})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func newBenchDB(b *testing.B, n int) *DB {
 }
 
 func BenchmarkInsert_Mem(b *testing.B) {
-	db, err := Open(Options{Schema: benchSchema(), SizeHint: b.N})
+	db, err := Open(Options{Schema: benchSchema(), sizeHint: b.N})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func BenchmarkInsert_Mem(b *testing.B) {
 
 func BenchmarkInsert_WAL(b *testing.B) {
 	dir := b.TempDir()
-	db, err := Open(Options{Schema: benchSchema(), SizeHint: b.N, WALPath: filepath.Join(dir, "b.wal")})
+	db, err := Open(Options{Schema: benchSchema(), sizeHint: b.N, WALLevel: WALPeriodic, WALPath: filepath.Join(dir, "b.wal")})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -71,14 +71,15 @@ func BenchmarkInsert_WAL(b *testing.B) {
 	}
 }
 
-// Durability-cost ladder vs BenchmarkInsert_WAL (flush-only). WALSync fsyncs
-// on the ticker; WALSyncPerWrite fsyncs every record. Note: b.TempDir() in
+// Durability-cost ladder vs BenchmarkInsert_WAL (WALPeriodic, default ticker).
+// This bench fsyncs on a fast ticker; the per-write bench fsyncs every record.
+// Note: b.TempDir() in
 // the container sits on an overlay FS, so absolute fsync cost here is not a
 // real-disk number — read these as relative mode overhead, not latency SLAs.
 func BenchmarkInsert_WALSync(b *testing.B) {
 	dir := b.TempDir()
-	db, err := Open(Options{Schema: benchSchema(), SizeHint: b.N,
-		WALPath: filepath.Join(dir, "b.wal"), WALSync: true, WALFlushInterval: 5 * time.Millisecond})
+	db, err := Open(Options{Schema: benchSchema(), sizeHint: b.N,
+		WALPath: filepath.Join(dir, "b.wal"), WALLevel: WALPeriodic, walFlushInterval: 5 * time.Millisecond})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -94,8 +95,8 @@ func BenchmarkInsert_WALSync(b *testing.B) {
 
 func BenchmarkInsert_WALSyncPerWrite(b *testing.B) {
 	dir := b.TempDir()
-	db, err := Open(Options{Schema: benchSchema(), SizeHint: b.N,
-		WALPath: filepath.Join(dir, "b.wal"), WALSyncPerWrite: true})
+	db, err := Open(Options{Schema: benchSchema(), sizeHint: b.N,
+		WALPath: filepath.Join(dir, "b.wal"), WALLevel: WALPerWrite})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -164,7 +165,7 @@ func BenchmarkUpdate_Mem(b *testing.B) {
 func BenchmarkDelete_Mem(b *testing.B) {
 	// Pre-insert N rows then delete b.N of them. To avoid running out
 	// of rows we re-insert in the loop too.
-	db, _ := Open(Options{Schema: benchSchema(), SizeHint: b.N})
+	db, _ := Open(Options{Schema: benchSchema(), sizeHint: b.N})
 	defer db.Close()
 	for i := 0; i < b.N; i++ {
 		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "name", i%100)
@@ -200,7 +201,7 @@ func BenchmarkParseOnly(b *testing.B) {
 // to gauge how much of the per-call cost is parser+plan vs storage.
 func BenchmarkInsertViaStmtNoSQL(b *testing.B) {
 	// Bypass SQL: build a plan once, reuse it across iterations.
-	db, _ := Open(Options{Schema: benchSchema(), SizeHint: b.N})
+	db, _ := Open(Options{Schema: benchSchema(), sizeHint: b.N})
 	defer db.Close()
 	pl, err := db.prepare("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", db.cat.Load())
 	if err != nil {

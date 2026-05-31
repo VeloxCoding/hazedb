@@ -169,7 +169,7 @@ func TestIndexMergeReconciles(t *testing.T) {
 // the index query result equals a brute-force full scan for every value (no
 // false negative).
 func TestIndexConcurrentInvariant(t *testing.T) {
-	db, err := Open(Options{Schema: Schema{}, IndexMergeInterval: 2 * time.Millisecond})
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: 2 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +310,7 @@ func TestIndexMultiplePerTable(t *testing.T) {
 func TestIndexRebuildAfterRestart(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "idxrec.wal")
-	db, err := Open(Options{Schema: Schema{}, WALPath: path, IndexMergeInterval: -1})
+	db, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path, indexMergeInterval: -1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,7 +325,7 @@ func TestIndexRebuildAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: Schema{}, WALPath: path, IndexMergeInterval: -1})
+	db2, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path, indexMergeInterval: -1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,7 +357,7 @@ func TestIndexRebuildAfterRestart(t *testing.T) {
 func TestOrderedIndexDeclared(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ord.wal")
-	db, err := Open(Options{Schema: Schema{}, WALPath: path, IndexMergeInterval: -1})
+	db, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path, indexMergeInterval: -1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -375,7 +375,7 @@ func TestOrderedIndexDeclared(t *testing.T) {
 	}
 	db.Close()
 
-	db2, err := Open(Options{Schema: Schema{}, WALPath: path, IndexMergeInterval: -1})
+	db2, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path, indexMergeInterval: -1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -486,7 +486,7 @@ func TestOrderedIndexOrderBy(t *testing.T) {
 // is monotonic (no out-of-order row). Quiescent: the ordered walk equals a
 // brute-force scan-then-sort.
 func TestOrderedIndexConcurrentInvariant(t *testing.T) {
-	db, err := Open(Options{Schema: Schema{}, IndexMergeInterval: 2 * time.Millisecond})
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: 2 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}

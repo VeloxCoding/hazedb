@@ -14,10 +14,9 @@ func TestWALDurabilityModesRoundTrip(t *testing.T) {
 		name string
 		opt  Options
 	}{
-		{"flush-only", Options{}},
-		{"ticker-sync", Options{WALSync: true, WALFlushInterval: 10 * time.Millisecond}},
-		{"sync-per-write", Options{WALSyncPerWrite: true}},
-		{"manual-only", Options{WALFlushInterval: -1}},
+		{"periodic", Options{WALLevel: WALPeriodic, walFlushInterval: 10 * time.Millisecond}},
+		{"per-write", Options{WALLevel: WALPerWrite}},
+		{"manual-flush", Options{WALLevel: WALPeriodic, walFlushInterval: -1}}, // ticker off; Close flushes
 	}
 	for _, m := range modes {
 		t.Run(m.name, func(t *testing.T) {
@@ -39,7 +38,7 @@ func TestWALDurabilityModesRoundTrip(t *testing.T) {
 				t.Fatalf("close: %v", err)
 			}
 
-			db2, err := Open(Options{Schema: testSchema(), WALPath: path})
+			db2, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
 			if err != nil {
 				t.Fatalf("reopen: %v", err)
 			}
@@ -58,7 +57,7 @@ func TestWALDurabilityModesRoundTrip(t *testing.T) {
 func TestWALErrorStateBlocksAndDoesNotApply(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "e.wal")
-	db, err := Open(Options{Schema: testSchema(), WALPath: path})
+	db, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}

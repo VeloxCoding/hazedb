@@ -1,114 +1,123 @@
 package hazedb
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
-// Defaults for the tunable Options fields, in one place. applyDefaults fills any
-// field left at its zero value; a NEGATIVE value is preserved as "explicitly
-// disabled" (e.g. DrainInterval < 0 = no drain loop), so it is never overwritten.
-//
-// These are the only knobs an operator sets. Genuine implementation constants —
-// the WAL buffer size, the SQLite PRAGMAs and one-connection limit, segment file
-// naming, shard counts, CRC/magic — are NOT settings: they live next to the code
-// that uses them and are deliberately not exposed here.
+// WALLevel selects on-disk durability — the single switch for the write-ahead
+// log. WALPath turns nothing on by itself; the level does.
+const (
+	WALOff      = iota // 0: memory only; nothing survives a crash.
+	WALPeriodic        // 1: writes fsynced by a background ticker (~1s); the caller never waits.
+	WALPerWrite        // 2: every write fsynced before the caller gets a reply — slowest, safest.
+)
+
+// Defaults for the tunable fields, in one place. applyDefaults fills any field
+// left at its zero value; a NEGATIVE duration is preserved as "explicitly
+// disabled" and is never overwritten.
 const (
 	defaultSizeHint           = 1024
 	defaultWALFlushInterval   = time.Second
 	defaultWALRotateInterval  = 5 * time.Second
-	defaultDrainInterval      = time.Minute
-	defaultSegmentDrainMinAge = 5 * time.Second
 	defaultIndexMergeInterval = 50 * time.Millisecond
 )
 
-// Options control Open behaviour. Fields are grouped by who is expected to set
-// them: the first two groups are operator-facing (a deployment legitimately
-// tunes them); the last group is hazedb's own tuning, where the default is right
-// for almost everyone and is exposed mainly for tests and unusual workloads.
+// Options configure Open. The EXPORTED fields are the entire operator surface;
+// the unexported fields are internal tuning, settable only from package tests
+// (the defaults are right for every deployment). Genuine implementation
+// constants — buffer sizes, SQLite PRAGMAs, segment naming, shard counts — are
+// not settings and live next to the code that uses them.
 type Options struct {
-	// --- Required ---
-
-	// Schema declares the tables. May be empty — tables can be created at
-	// runtime with CREATE TABLE.
+	// Schema declares the tables present at startup. May be empty — tables can
+	// also be created at runtime with CREATE TABLE.
 	Schema Schema
 
-	// --- Operator settings: where the data lives, and how durable/fast ---
+	// WALLevel is the durability switch: WALOff (memory only), WALPeriodic
+	// (background fsync), or WALPerWrite (fsync per write). Above WALOff, WALPath
+	// is required; setting WALPath or SQLitePath with WALOff is rejected.
+	WALLevel int
 
-	// WALPath is the on-disk write-ahead log. Empty = memory-only (no
-	// durability). In segmented mode (see SQLitePath / WALRotateInterval) this
-	// is a DIRECTORY of segment files; otherwise a single file. Created if absent.
+	// WALPath is the directory holding the write-ahead log segments, created if
+	// absent. Required when WALLevel > 0.
 	WALPath string
 
-	// SizeHint is a per-table row-count estimate for shard arena pre-allocation.
-	// Zero or negative = a small default.
-	SizeHint int
-
-	// WALFlushInterval is how often the background goroutine flushes the WAL
-	// buffer to the OS (and fsyncs when WALSync is set). Zero = 1s; a negative
-	// value disables the ticker (manual FlushWAL() only). Ignored without WALPath.
-	WALFlushInterval time.Duration
-
-	// WALSync makes the flush ticker fsync when anything is dirty, bounding
-	// power-loss to <= WALFlushInterval. Default false (flush only: survives a
-	// process crash, not power loss).
-	WALSync bool
-
-	// WALSyncPerWrite flushes and fsyncs after every WAL record, under the WAL
-	// lock — strongest durability, highest per-write cost. Overrides the ticker.
-	WALSyncPerWrite bool
-
-	// SQLitePath enables the on-disk SQLite mirror at this path: a background loop
-	// drains sealed WAL segments into it (current, compacted, queryable state),
-	// and it becomes the recovery source. Empty = no mirror. Requires WALPath and
-	// forces segmented mode. See docs/durability.md.
-	SQLitePath string
-
-	// DrainInterval is how often sealed segments are drained into SQLite — the
-	// trade between recovery-tail size / IO and freshness of the mirror. Zero =
-	// 1 minute; negative disables the loop (manual drain, tests). Needs SQLitePath.
-	DrainInterval time.Duration
-
-	// --- Advanced: hazedb's own tuning. The default is right for almost
-	// everyone; override mainly for tests or unusual workloads. ---
-
-	// WALRotateInterval is how often the active WAL segment is sealed and a new
-	// one opened. Zero keeps the single-file WAL; a positive value turns on
-	// segmented mode on its own. Forced to 5s when SQLitePath is set (the drain
-	// consumes sealed segments).
+	// WALRotateInterval is how often the active segment is sealed and the next
+	// opened, so a drain (or any external consumer) reads settled segments and
+	// the log never grows as one unbounded file. Zero = 5s.
 	WALRotateInterval time.Duration
 
-	// SegmentDrainMinAge skips segments sealed more recently than this, so the
-	// drain only touches settled history. Zero = 5s; negative disables the gate.
-	// Ignored without SQLitePath.
-	SegmentDrainMinAge time.Duration
+	// SQLitePath enables the on-disk SQLite mirror: the drain feeds sealed
+	// segments into it (compacted current state) and it becomes the recovery
+	// source. Empty = no mirror (the WAL itself replays into memory on boot).
+	// Requires WALLevel > 0.
+	SQLitePath string
 
-	// IndexMergeInterval is how often the background goroutine reconciles
-	// secondary indexes with the dirty rows. Zero = 50ms; negative disables it
-	// (manual merge — used by tests that assert pre-merge state). Cheap when no
-	// table has an index.
-	IndexMergeInterval time.Duration
+	// --- internal tuning (package tests only; not operator-facing) ---
+
+	// sizeHint pre-sizes shard arenas (a per-table row-count estimate).
+	sizeHint int
+	// walFlushInterval is the WALPeriodic flush/fsync ticker period. Zero = 1s;
+	// negative disables the ticker (manual FlushWAL only).
+	walFlushInterval time.Duration
+	// drainInterval is how often sealed segments drain into SQLite. Zero =
+	// WALRotateInterval; negative disables the loop (manual drain).
+	drainInterval time.Duration
+	// indexMergeInterval is how often secondary indexes reconcile dirty rows.
+	// Zero = 50ms; negative disables it (manual merge, for pre-merge assertions).
+	indexMergeInterval time.Duration
 }
 
-// applyDefaults fills unset (zero) fields from the default constants. Negative
-// values are left intact (they mean "disabled"). The SQLite-mirror defaults are
-// only applied when a mirror is configured.
+// validate rejects contradictory configs before any resource is opened. The
+// level is the switch: a path without a level (or a level without a path) is a
+// mistake, not a silent no-op.
+func (o *Options) validate() error {
+	switch o.WALLevel {
+	case WALOff:
+		if o.WALPath != "" {
+			return fmt.Errorf("hazedb: WALPath is set but WALLevel is WALOff — set WALLevel to WALPeriodic or WALPerWrite, or clear WALPath")
+		}
+		if o.SQLitePath != "" {
+			return fmt.Errorf("hazedb: SQLitePath is set but WALLevel is WALOff — the mirror is fed from the WAL")
+		}
+	case WALPeriodic, WALPerWrite:
+		if o.WALPath == "" {
+			return fmt.Errorf("hazedb: WALLevel > 0 requires WALPath")
+		}
+	default:
+		return fmt.Errorf("hazedb: invalid WALLevel %d (want WALOff, WALPeriodic, or WALPerWrite)", o.WALLevel)
+	}
+	return nil
+}
+
+// walEnabled reports whether on-disk persistence is on.
+func (o *Options) walEnabled() bool { return o.WALLevel != WALOff }
+
+// walSync / walSyncPerWrite translate the level into the two fsync flags the wal
+// layer takes. WALPeriodic fsyncs on the ticker; WALPerWrite fsyncs every write.
+func (o *Options) walSync() bool         { return o.WALLevel == WALPeriodic }
+func (o *Options) walSyncPerWrite() bool { return o.WALLevel == WALPerWrite }
+
+// applyDefaults fills unset (zero) fields. Negative values are left intact (they
+// mean "disabled"). WAL-dependent defaults apply only when the WAL is enabled.
 func (o *Options) applyDefaults() {
-	if o.SizeHint <= 0 {
-		o.SizeHint = defaultSizeHint
+	if o.sizeHint <= 0 {
+		o.sizeHint = defaultSizeHint
 	}
-	if o.WALFlushInterval == 0 {
-		o.WALFlushInterval = defaultWALFlushInterval
+	if o.indexMergeInterval == 0 {
+		o.indexMergeInterval = defaultIndexMergeInterval
 	}
-	if o.IndexMergeInterval == 0 {
-		o.IndexMergeInterval = defaultIndexMergeInterval
+	if !o.walEnabled() {
+		return
 	}
-	if o.SQLitePath != "" {
-		if o.WALRotateInterval <= 0 {
-			o.WALRotateInterval = defaultWALRotateInterval
-		}
-		if o.DrainInterval == 0 {
-			o.DrainInterval = defaultDrainInterval
-		}
-		if o.SegmentDrainMinAge == 0 {
-			o.SegmentDrainMinAge = defaultSegmentDrainMinAge
-		}
+	if o.walFlushInterval == 0 {
+		o.walFlushInterval = defaultWALFlushInterval
+	}
+	if o.WALRotateInterval == 0 {
+		o.WALRotateInterval = defaultWALRotateInterval
+	}
+	if o.SQLitePath != "" && o.drainInterval == 0 {
+		// Drain after every rotation: the sealed segment is the unit of work.
+		o.drainInterval = o.WALRotateInterval
 	}
 }

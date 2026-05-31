@@ -13,8 +13,8 @@ func TestSQLiteRecoveryAfterCrash(t *testing.T) {
 	dir := t.TempDir()
 	sqPath := filepath.Join(t.TempDir(), "m.db")
 	opts := Options{
-		Schema: testSchema(), WALPath: dir, SQLitePath: sqPath,
-		WALRotateInterval: time.Hour, DrainInterval: -1, SegmentDrainMinAge: -1,
+		Schema: testSchema(), WALLevel: WALPeriodic, WALPath: dir, SQLitePath: sqPath,
+		WALRotateInterval: time.Hour, drainInterval: -1,
 	}
 	db, err := Open(opts)
 	if err != nil {
@@ -32,7 +32,7 @@ func TestSQLiteRecoveryAfterCrash(t *testing.T) {
 	if err := db.wal.rotate(); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.drainOnce(false); err != nil {
+	if err := db.drainOnce(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -79,8 +79,8 @@ func TestDrainReclaimsSegments(t *testing.T) {
 	dir := t.TempDir()
 	sqPath := filepath.Join(t.TempDir(), "m.db")
 	db, err := Open(Options{
-		Schema: testSchema(), WALPath: dir, SQLitePath: sqPath,
-		WALRotateInterval: time.Hour, DrainInterval: -1, SegmentDrainMinAge: -1,
+		Schema: testSchema(), WALLevel: WALPeriodic, WALPath: dir, SQLitePath: sqPath,
+		WALRotateInterval: time.Hour, drainInterval: -1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -93,7 +93,7 @@ func TestDrainReclaimsSegments(t *testing.T) {
 		if err := db.wal.rotate(); err != nil {
 			t.Fatal(err)
 		}
-		if err := db.drainOnce(false); err != nil {
+		if err := db.drainOnce(); err != nil {
 			t.Fatal(err)
 		}
 	}

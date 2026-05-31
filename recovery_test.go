@@ -33,7 +33,7 @@ func TestRejectedDuplicateInsertDoesNotCorruptWAL(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "dup.wal")
 
-	db, err := Open(Options{Schema: testSchema(), WALPath: path})
+	db, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestRejectedDuplicateInsertDoesNotCorruptWAL(t *testing.T) {
 
 	// Reopen: replay must succeed (no journaled duplicate) and show exactly
 	// the two accepted rows.
-	db2, err := Open(Options{Schema: testSchema(), WALPath: path})
+	db2, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatalf("reopen after rejected duplicate must succeed, got: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestWALCorruptTailLengthIsBounded(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "huge.wal")
 
-	db, err := Open(Options{Schema: testSchema(), WALPath: path})
+	db, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestWALCorruptTailLengthIsBounded(t *testing.T) {
 
 	// Append a record header claiming a 4 GiB body, then only a few bytes.
 	// A naive make([]byte, totalLen) would try to allocate 4 GiB.
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(walSegmentFile(t, path), os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestWALCorruptTailLengthIsBounded(t *testing.T) {
 	f.Write([]byte{0xF0, 0xFF, 0xFF, 0xFF, 0x01, 0x02, 0x03})
 	f.Close()
 
-	db2, err := Open(Options{Schema: testSchema(), WALPath: path})
+	db2, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatalf("corrupt oversized tail length must be tolerated, got %v", err)
 	}
@@ -114,7 +114,7 @@ func TestWALCorruptTailLengthIsBounded(t *testing.T) {
 func TestMultiShardUpdateDeleteWALRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ms.wal")
-	db, err := Open(Options{Schema: testSchema(), WALPath: path})
+	db, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestMultiShardUpdateDeleteWALRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: testSchema(), WALPath: path})
+	db2, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestMultiShardUpdateDeleteWALRoundTrip(t *testing.T) {
 func TestConcurrentMultiShardWritesReplayConsistent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "msc.wal")
-	db, err := Open(Options{Schema: testSchema(), WALPath: path})
+	db, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestConcurrentMultiShardWritesReplayConsistent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: testSchema(), WALPath: path})
+	db2, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -118,11 +118,10 @@ func TestDrainMirrorMatchesEngine(t *testing.T) {
 	sqPath := filepath.Join(t.TempDir(), "mirror.db")
 	db, err := Open(Options{
 		Schema:             testSchema(),
-		WALPath:            dir,
+		WALLevel: WALPeriodic, WALPath:            dir,
 		SQLitePath:         sqPath,
 		WALRotateInterval:  time.Hour, // rotate manually
-		DrainInterval:      -1,        // drain manually
-		SegmentDrainMinAge: -1,        // no age gate in the test
+		drainInterval:      -1,        // drain manually
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -152,7 +151,7 @@ func TestDrainMirrorMatchesEngine(t *testing.T) {
 	if err := db.wal.rotate(); err != nil { // seal all writes
 		t.Fatal(err)
 	}
-	if err := db.drainOnce(false); err != nil {
+	if err := db.drainOnce(); err != nil {
 		t.Fatalf("drain: %v", err)
 	}
 

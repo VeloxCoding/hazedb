@@ -116,7 +116,7 @@ func TestPartitionedMultiShardDelete(t *testing.T) {
 func TestPartitionedWALRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "p.wal")
-	db, err := Open(Options{Schema: msgsSchema(), WALPath: path})
+	db, err := Open(Options{Schema: msgsSchema(), WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestPartitionedWALRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: msgsSchema(), WALPath: path})
+	db2, err := Open(Options{Schema: msgsSchema(), WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func TestPartitionScanQuery(t *testing.T) {
 // Indexed partition scan: one thread (~100 rows) out of a 10k-row table.
 // Contrast with BenchmarkSelectRange_Mem (~790us full scan of 10k).
 func BenchmarkPartitionScan(b *testing.B) {
-	db, _ := Open(Options{Schema: msgsSchema(), SizeHint: 10000})
+	db, _ := Open(Options{Schema: msgsSchema(), sizeHint: 10000})
 	defer db.Close()
 	threads := make([]UUID, 100)
 	for i := range threads {

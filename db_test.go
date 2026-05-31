@@ -57,12 +57,24 @@ func openDBWithWAL(t *testing.T) (*DB, string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.wal")
-	db, err := Open(Options{Schema: testSchema(), WALPath: path})
+	db, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
 	return db, path
+}
+
+// walSegmentFile returns the active (highest-numbered) segment file inside a
+// segmented WAL directory. Tests that corrupt or truncate raw WAL bytes target
+// this rather than WALPath, which is now a directory of segments.
+func walSegmentFile(t *testing.T, dir string) string {
+	t.Helper()
+	m, err := filepath.Glob(filepath.Join(dir, "seg-*.wal"))
+	if err != nil || len(m) == 0 {
+		t.Fatalf("no WAL segment in %s: %v", dir, err)
+	}
+	return m[len(m)-1]
 }
 
 func TestInsertAndSelect(t *testing.T) {
@@ -391,7 +403,7 @@ func TestWALRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: testSchema(), WALPath: path})
+	db2, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -409,14 +421,14 @@ func TestWALPartialTail(t *testing.T) {
 
 	// Append garbage that looks like the start of a record but is
 	// truncated. Replay must tolerate the dangling tail.
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(walSegmentFile(t, path), os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		t.Fatal(err)
 	}
 	f.Write([]byte{0x10, 0x00, 0x00, 0x00, 0x01}) // says len=16, but body is 1 byte
 	f.Close()
 
-	db2, err := Open(Options{Schema: testSchema(), WALPath: path})
+	db2, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatalf("partial tail should be tolerated, got %v", err)
 	}

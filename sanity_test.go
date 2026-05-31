@@ -23,7 +23,7 @@ func TestBigSanity(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sanity.wal")
 
-	db, err := Open(Options{Schema: Schema{}, WALPath: path})
+	db, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -344,7 +344,7 @@ func TestBigSanity(t *testing.T) {
 		if err := db.Close(); err != nil {
 			t.Fatalf("close: %v", err)
 		}
-		db2, err := Open(Options{Schema: Schema{}, WALPath: path})
+		db2, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
 		if err != nil {
 			t.Fatalf("reopen: %v", err)
 		}

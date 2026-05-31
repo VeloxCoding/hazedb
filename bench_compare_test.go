@@ -226,7 +226,7 @@ func setupBolt(b *testing.B) (*bolt.DB, func()) {
 // -------- INSERT --------
 
 func BenchmarkInsert_FASTSQL_Mem(b *testing.B) {
-	db, _ := Open(Options{Schema: benchSchema(), SizeHint: b.N})
+	db, _ := Open(Options{Schema: benchSchema(), sizeHint: b.N})
 	defer db.Close()
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -346,7 +346,7 @@ func BenchmarkUpdateByPK_Bolt(b *testing.B) {
 // reinsert overhead is included in every iter.)
 
 func BenchmarkDeleteByPK_FASTSQL_Mem(b *testing.B) {
-	db, _ := Open(Options{Schema: benchSchema(), SizeHint: b.N})
+	db, _ := Open(Options{Schema: benchSchema(), sizeHint: b.N})
 	defer db.Close()
 	for i := 0; i < b.N; i++ {
 		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "name", i%100)

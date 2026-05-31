@@ -36,16 +36,18 @@ import (
 
 // Handler is the Caddy HTTP handler that embeds hazedb.
 type Handler struct {
-	// WALPath is the on-disk write-ahead log. Empty = memory-only (no durability).
+	// WALLevel is the durability switch: 0 = memory only, 1 = background fsync
+	// (~1s window), 2 = fsync every write (slowest, safest). Above 0, WALPath
+	// is required.
+	WALLevel int `json:"wal_level,omitempty"`
+	// WALPath is the directory holding the write-ahead log segments. Required
+	// when wal_level > 0.
 	WALPath string `json:"wal_path,omitempty"`
-	// SizeHint is a per-table row-count estimate for arena pre-allocation. 0 = default.
-	SizeHint int `json:"size_hint,omitempty"`
-	// WALSync fsyncs on the flush ticker when dirty (bounds power-loss to the interval).
-	WALSync bool `json:"wal_sync,omitempty"`
-	// WALSyncPerWrite fsyncs after every record (strongest durability, slowest).
-	WALSyncPerWrite bool `json:"wal_sync_per_write,omitempty"`
-	// WALFlushMillis is the background flush-ticker interval in ms. 0 = 1s default.
-	WALFlushMillis int `json:"wal_flush_ms,omitempty"`
+	// WALRotateMillis is how often the active segment is sealed, in ms. 0 = 5s.
+	WALRotateMillis int `json:"wal_rotate_ms,omitempty"`
+	// SQLitePath enables the on-disk SQLite mirror at this path (system of record
+	// + recovery source). Empty = no mirror. Requires wal_level > 0.
+	SQLitePath string `json:"sqlite_path,omitempty"`
 	// InitSQL is an absolute path to a .sql file run once at Provision, before
 	// Caddy serves — typically CREATE TABLE + seed rows. Statements are split on
 	// ';'; do not put a semicolon inside a string literal in this file.
@@ -71,18 +73,17 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // Provision opens the *DB, runs init_sql, wires the routes, and registers the
 // instance. Called once per module instance at Caddy start / config reload.
 func (h *Handler) Provision(ctx caddy.Context) error {
-	if h.SizeHint < 0 || h.WALFlushMillis < 0 {
-		return fmt.Errorf("hazedb: size_hint and wal_flush_ms must be >= 0")
+	if h.WALRotateMillis < 0 {
+		return fmt.Errorf("hazedb: wal_rotate_ms must be >= 0")
 	}
 	opts := hazedb.Options{
-		Schema:          hazedb.Schema{}, // tables created at runtime (init_sql / POST /exec)
-		WALPath:         h.WALPath,
-		SizeHint:        h.SizeHint,
-		WALSync:         h.WALSync,
-		WALSyncPerWrite: h.WALSyncPerWrite,
+		Schema:     hazedb.Schema{}, // tables created at runtime (init_sql / POST /exec)
+		WALLevel:   h.WALLevel,
+		WALPath:    h.WALPath,
+		SQLitePath: h.SQLitePath,
 	}
-	if h.WALFlushMillis > 0 {
-		opts.WALFlushInterval = time.Duration(h.WALFlushMillis) * time.Millisecond
+	if h.WALRotateMillis > 0 {
+		opts.WALRotateInterval = time.Duration(h.WALRotateMillis) * time.Millisecond
 	}
 	db, err := hazedb.Open(opts)
 	if err != nil {
@@ -218,10 +219,10 @@ func writeJSON(w http.ResponseWriter, status int, body []byte) {
 // UnmarshalCaddyfile parses the `hazedb` handler directive. Example:
 //
 //	hazedb {
-//	    wal_path        /var/lib/hazedb/data.wal
-//	    size_hint       100000
-//	    wal_sync
-//	    wal_flush_ms    1000
+//	    wal_level       1
+//	    wal_path        /var/lib/hazedb/wal
+//	    wal_rotation    5s
+//	    sqlite_path     /var/lib/hazedb/hazedb.db
 //	    init_sql        /etc/hazedb/schema.sql
 //	    registry_name   default
 //	}
@@ -232,24 +233,6 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		}
 		for d.NextBlock(0) {
 			key := d.Val()
-			switch key {
-			case "wal_sync", "wal_sync_per_write":
-				// Optional bool arg; bare key = true.
-				val := true
-				if d.NextArg() {
-					b, err := strconv.ParseBool(d.Val())
-					if err != nil {
-						return d.Errf("%s: %v", key, err)
-					}
-					val = b
-				}
-				if key == "wal_sync" {
-					h.WALSync = val
-				} else {
-					h.WALSyncPerWrite = val
-				}
-				continue
-			}
 			if !d.NextArg() {
 				return d.ArgErr()
 			}
@@ -257,22 +240,24 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			switch key {
 			case "wal_path":
 				h.WALPath = value
+			case "sqlite_path":
+				h.SQLitePath = value
 			case "init_sql":
 				h.InitSQL = value
 			case "registry_name":
 				h.RegistryName = value
-			case "size_hint":
+			case "wal_level":
 				n, err := strconv.Atoi(value)
 				if err != nil {
 					return d.Errf("%s: %v", key, err)
 				}
-				h.SizeHint = n
-			case "wal_flush_ms":
-				n, err := strconv.Atoi(value)
+				h.WALLevel = n
+			case "wal_rotation":
+				dur, err := time.ParseDuration(value)
 				if err != nil {
 					return d.Errf("%s: %v", key, err)
 				}
-				h.WALFlushMillis = n
+				h.WALRotateMillis = int(dur / time.Millisecond)
 			default:
 				return d.Errf("unrecognized option: %s", key)
 			}

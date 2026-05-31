@@ -279,7 +279,7 @@ func BenchmarkWALEnc_Delete_SQLStr(b *testing.B) {
 const spikeCorpus = 20000
 
 func newMsgDB(tb testing.TB) *DB {
-	db, err := Open(Options{Schema: msgSchema(), SizeHint: spikeCorpus})
+	db, err := Open(Options{Schema: msgSchema(), sizeHint: spikeCorpus})
 	if err != nil {
 		tb.Fatal(err)
 	}

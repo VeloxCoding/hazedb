@@ -16,7 +16,7 @@ func benchIndexSeed(b *testing.B, withIndex bool, n int) (*DB, []string) {
 	if withIndex {
 		idx = ", INDEX (email)"
 	}
-	db, err := Open(Options{Schema: Schema{}, IndexMergeInterval: -1, SizeHint: n})
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: n})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func benchIndexInsert(b *testing.B, withIndex bool) {
 	if withIndex {
 		idx = ", INDEX (email)"
 	}
-	db, err := Open(Options{Schema: Schema{}, IndexMergeInterval: -1, SizeHint: b.N})
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: b.N})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -85,7 +85,7 @@ func benchIndexMerge(b *testing.B, n int) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		db, err := Open(Options{Schema: Schema{}, IndexMergeInterval: -1, SizeHint: n})
+		db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: n})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -107,7 +107,7 @@ func BenchmarkIndexMerge_50k(b *testing.B) { benchIndexMerge(b, 50000) }
 // DESC LIMIT 20. Varying the author's post count shows whether the cost scales
 // with the matched set (gather-all-then-sort) or just the LIMIT.
 func benchIndexOrderBy(b *testing.B, perAuthor int) {
-	db, err := Open(Options{Schema: Schema{}, IndexMergeInterval: -1, SizeHint: perAuthor * 2})
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: perAuthor * 2})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -136,7 +136,7 @@ func BenchmarkIndexOrderBy_5000(b *testing.B) { benchIndexOrderBy(b, 5000) }
 // scan + sort. Compare to a hash index, which would scan all + top-N heap.
 func BenchmarkOrderedWalk_50k(b *testing.B) {
 	const n = 50000
-	db, err := Open(Options{Schema: Schema{}, IndexMergeInterval: -1, SizeHint: n})
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: n})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -161,7 +161,7 @@ func BenchmarkOrderedWalk_50k(b *testing.B) {
 // single-index plan would walk.
 func BenchmarkIndexIntersect_50k(b *testing.B) {
 	const n = 50000
-	db, err := Open(Options{Schema: Schema{}, IndexMergeInterval: -1, SizeHint: n})
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: n})
 	if err != nil {
 		b.Fatal(err)
 	}

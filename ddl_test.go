@@ -13,7 +13,7 @@ func openEmpty(t *testing.T) *DB {
 	// IndexMergeInterval -1 disables the background merger so index unit tests
 	// can assert pre-merge state deterministically (they call db.mergeIndexes()
 	// explicitly). The background loop is exercised by the S5 stress test.
-	db, err := Open(Options{Schema: Schema{}, IndexMergeInterval: -1}) // create tables at runtime
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1}) // create tables at runtime
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +47,7 @@ func TestRuntimeCreateTable(t *testing.T) {
 func TestRuntimeCreateSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ddl.wal")
-	db, err := Open(Options{Schema: Schema{}, WALPath: path})
+	db, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestRuntimeCreateSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: Schema{}, WALPath: path})
+	db2, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestRuntimeCreateSurvivesRestart(t *testing.T) {
 func TestRuntimeDropTable(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "drop.wal")
-	db, err := Open(Options{Schema: Schema{}, WALPath: path})
+	db, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestRuntimeDropTable(t *testing.T) {
 	}
 	db.Close()
 
-	db2, err := Open(Options{Schema: Schema{}, WALPath: path})
+	db2, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,7 @@ func TestRuntimeCreateConcurrent(t *testing.T) {
 func TestRuntimeRecreateTable(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "recreate.wal")
-	db, err := Open(Options{Schema: Schema{}, WALPath: path})
+	db, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +206,7 @@ func TestRuntimeRecreateTable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: Schema{}, WALPath: path})
+	db2, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +243,7 @@ func TestStalePlanAfterDrop(t *testing.T) {
 func TestRuntimePartitionedSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "part.wal")
-	db, err := Open(Options{Schema: Schema{}, WALPath: path})
+	db, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +256,7 @@ func TestRuntimePartitionedSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: Schema{}, WALPath: path})
+	db2, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,7 +338,7 @@ func TestIndexValidationErrors(t *testing.T) {
 func TestIndexSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "idx.wal")
-	db, err := Open(Options{Schema: Schema{}, WALPath: path})
+	db, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +346,7 @@ func TestIndexSurvivesRestart(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db2, err := Open(Options{Schema: Schema{}, WALPath: path})
+	db2, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,7 +360,7 @@ func TestIndexSurvivesRestart(t *testing.T) {
 // --- benchmarks: a runtime-created table must be as fast as a predeclared one ---
 
 func BenchmarkRuntimeCreatedInsert(b *testing.B) {
-	db, _ := Open(Options{Schema: Schema{}, SizeHint: b.N})
+	db, _ := Open(Options{Schema: Schema{}, sizeHint: b.N})
 	defer db.Close()
 	db.Exec("CREATE TABLE u (id uuid primary key, name text, age int)")
 	b.ResetTimer()
@@ -372,7 +372,7 @@ func BenchmarkRuntimeCreatedInsert(b *testing.B) {
 
 func BenchmarkRuntimeCreatedSelect(b *testing.B) {
 	const N = 10000
-	db, _ := Open(Options{Schema: Schema{}, SizeHint: N})
+	db, _ := Open(Options{Schema: Schema{}, sizeHint: N})
 	defer db.Close()
 	db.Exec("CREATE TABLE u (id uuid primary key, name text, age int)")
 	for i := 0; i < N; i++ {

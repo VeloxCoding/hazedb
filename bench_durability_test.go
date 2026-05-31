@@ -11,8 +11,8 @@ import (
 // the per-write cost of segmented mode.
 func BenchmarkInsert_WALSegmented(b *testing.B) {
 	dir := b.TempDir()
-	db, err := Open(Options{Schema: benchSchema(), SizeHint: b.N,
-		WALPath: dir, WALRotateInterval: 5 * time.Second})
+	db, err := Open(Options{Schema: benchSchema(), sizeHint: b.N,
+		WALLevel: WALPeriodic, WALPath: dir, WALRotateInterval: 5 * time.Second})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -32,9 +32,9 @@ func BenchmarkInsert_WALSegmented(b *testing.B) {
 func BenchmarkInsert_WALDrain(b *testing.B) {
 	dir := b.TempDir()
 	sqPath := filepath.Join(b.TempDir(), "m.db")
-	db, err := Open(Options{Schema: benchSchema(), SizeHint: b.N,
-		WALPath: dir, SQLitePath: sqPath,
-		WALRotateInterval: 100 * time.Millisecond, DrainInterval: 200 * time.Millisecond, SegmentDrainMinAge: -1})
+	db, err := Open(Options{Schema: benchSchema(), sizeHint: b.N,
+		WALLevel: WALPeriodic, WALPath: dir, SQLitePath: sqPath,
+		WALRotateInterval: 100 * time.Millisecond, drainInterval: 200 * time.Millisecond})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -54,9 +54,9 @@ func BenchmarkDrainThroughput(b *testing.B) {
 	const K = 20000
 	dir := b.TempDir()
 	sqPath := filepath.Join(b.TempDir(), "m.db")
-	db, err := Open(Options{Schema: benchSchema(), SizeHint: K,
-		WALPath: dir, SQLitePath: sqPath,
-		WALRotateInterval: time.Hour, DrainInterval: -1, SegmentDrainMinAge: -1})
+	db, err := Open(Options{Schema: benchSchema(), sizeHint: K,
+		WALLevel: WALPeriodic, WALPath: dir, SQLitePath: sqPath,
+		WALRotateInterval: time.Hour, drainInterval: -1})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func BenchmarkDrainThroughput(b *testing.B) {
 			b.Fatal(err)
 		}
 		b.StartTimer()
-		if err := db.drainOnce(false); err != nil {
+		if err := db.drainOnce(); err != nil {
 			b.Fatal(err)
 		}
 		total += K
