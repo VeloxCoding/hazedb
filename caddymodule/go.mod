@@ -17,7 +17,7 @@ module github.com/VeloxCoding/hazedb/caddymodule
 go 1.25.0
 
 require (
-	github.com/VeloxCoding/hazedb v0.1.13
+	github.com/VeloxCoding/hazedb v0.1.14
 	github.com/caddyserver/caddy/v2 v2.11.2
 )
 
