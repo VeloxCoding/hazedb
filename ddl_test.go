@@ -318,8 +318,8 @@ func TestCreateTableWithIndex(t *testing.T) {
 
 func TestIndexValidationErrors(t *testing.T) {
 	cases := map[string]string{
-		"unknown column": "CREATE TABLE t (id uuid primary key, n int, INDEX (missing))",
-		"on PK column":    "CREATE TABLE t (id uuid primary key, n int, INDEX (id))",
+		"unknown column":   "CREATE TABLE t (id uuid primary key, n int, INDEX (missing))",
+		"on PK column":     "CREATE TABLE t (id uuid primary key, n int, INDEX (id))",
 		"duplicate column": "CREATE TABLE t (id uuid primary key, n int, INDEX (n), INDEX (n))",
 		"composite":        "CREATE TABLE t (id uuid primary key, a int, b int, INDEX (a, b))",
 	}

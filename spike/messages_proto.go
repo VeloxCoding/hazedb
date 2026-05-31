@@ -46,10 +46,10 @@ type threadIndex struct {
 }
 
 type msgShard struct {
-	mu       sync.RWMutex
-	rows     []Message
-	pk       map[UUIDv7]uint32
-	threads  map[[16]byte]*threadIndex
+	mu      sync.RWMutex
+	rows    []Message
+	pk      map[UUIDv7]uint32
+	threads map[[16]byte]*threadIndex
 }
 
 type MessagesDB struct {

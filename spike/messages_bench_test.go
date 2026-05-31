@@ -24,9 +24,9 @@ import (
 // ====================================================================
 
 const (
-	tsThreads  = 1_000
+	tsThreads   = 1_000
 	tsPerThread = 100
-	tsTotal    = tsThreads * tsPerThread
+	tsTotal     = tsThreads * tsPerThread
 )
 
 func preGenMessages() ([]spike.Message, [][16]byte) {

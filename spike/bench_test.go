@@ -7,8 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"go.etcd.io/bbolt"
 	_ "github.com/mattn/go-sqlite3"
+	"go.etcd.io/bbolt"
 
 	"github.com/VeloxCoding/hazedb/spike"
 )

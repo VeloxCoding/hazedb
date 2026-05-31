@@ -29,7 +29,7 @@ const (
 //
 //   - KindInt / KindBool : the value lives in w0
 //   - KindUUID           : the 16 bytes live inline in (w0, w1), big-endian so
-//                          comparing the words equals byte-lexicographic order
+//     comparing the words equals byte-lexicographic order
 //   - KindString/KindBytes: ptr is the backing-data pointer, w0 the length
 //   - KindNull           : all zero
 //

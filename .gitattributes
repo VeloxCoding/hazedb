@@ -1,0 +1,6 @@
+# hazedb builds and deploys on Linux/Docker. Keep every text file LF in the repo
+# AND in the working tree on every platform: a CRLF *.go file committed from
+# Windows would make `gofmt -l` flag it on a Linux clone (gofmt emits LF), and
+# the *.sh scripts must be LF to run inside the containers. `text=auto` still
+# leaves files Git detects as binary untouched.
+* text=auto eol=lf

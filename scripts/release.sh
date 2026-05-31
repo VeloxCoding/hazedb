@@ -39,6 +39,13 @@ cd "$root"
 git rev-parse -q --verify "refs/tags/$v" >/dev/null && { echo "tag $v already exists" >&2; exit 1; }
 git rev-parse -q --verify "refs/tags/caddymodule/$v" >/dev/null && { echo "tag caddymodule/$v already exists" >&2; exit 1; }
 
+# Formatting gate — a released tag must be gofmt-clean, so a fresh clone passes
+# `gofmt -l .` with no output. (.gitattributes pins LF, so this is reliable even
+# when the release is cut from a Windows checkout.)
+command -v gofmt >/dev/null || { echo "gofmt not found (need the Go toolchain)" >&2; exit 1; }
+fmt="$(gofmt -l .)"
+[[ -z "$fmt" ]] || { echo "gofmt not clean — run 'gofmt -w .' and commit:" >&2; printf '  %s\n' $fmt >&2; exit 1; }
+
 # 1. Commit the caddymodule core-require bump. This commit is where BOTH tags
 #    ultimately land; go.sum is refreshed onto it in step 3.
 ( cd caddymodule && go mod edit -require="github.com/VeloxCoding/hazedb@$v" )

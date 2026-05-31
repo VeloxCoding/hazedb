@@ -260,9 +260,9 @@ func TestFidelity_RandomMix(t *testing.T) {
 	w.verify(t, "random-mix")
 }
 
-// 3. Update churn: the same rows are updated many times. SQLite is INSERT OR
-//    REPLACE per record, so it must collapse to each row's FINAL value — never
-//    a stale intermediate.
+//  3. Update churn: the same rows are updated many times. SQLite is INSERT OR
+//     REPLACE per record, so it must collapse to each row's FINAL value — never
+//     a stale intermediate.
 func TestFidelity_UpdateChurn(t *testing.T) {
 	dir := t.TempDir()
 	sqPath := filepath.Join(t.TempDir(), "m.db")
@@ -278,8 +278,8 @@ func TestFidelity_UpdateChurn(t *testing.T) {
 	w.verify(t, "update-churn")
 }
 
-// 4. All types + NULLs: a small, dense pass that guarantees every type and a
-//    NULL in every nullable column reaches the mirror at least once.
+//  4. All types + NULLs: a small, dense pass that guarantees every type and a
+//     NULL in every nullable column reaches the mirror at least once.
 func TestFidelity_AllTypesAndNulls(t *testing.T) {
 	dir := t.TempDir()
 	sqPath := filepath.Join(t.TempDir(), "m.db")
@@ -295,8 +295,8 @@ func TestFidelity_AllTypesAndNulls(t *testing.T) {
 	w.verify(t, "all-types")
 }
 
-// 5. Transactions: multi-mutation commits must drain with the same fidelity as
-//    autocommit writes (the WAL records a TXN envelope; the drain replays it).
+//  5. Transactions: multi-mutation commits must drain with the same fidelity as
+//     autocommit writes (the WAL records a TXN envelope; the drain replays it).
 func TestFidelity_Transactions(t *testing.T) {
 	dir := t.TempDir()
 	sqPath := filepath.Join(t.TempDir(), "m.db")
@@ -353,9 +353,9 @@ func TestFidelity_Transactions(t *testing.T) {
 	w.verify(t, "transactions")
 }
 
-// 6. Incremental drain: rotate + drain between many batches, so the mirror is
-//    assembled across dozens of sealed segments (each deleted after commit).
-//    The final state must still be exact.
+//  6. Incremental drain: rotate + drain between many batches, so the mirror is
+//     assembled across dozens of sealed segments (each deleted after commit).
+//     The final state must still be exact.
 func TestFidelity_IncrementalDrain(t *testing.T) {
 	dir := t.TempDir()
 	sqPath := filepath.Join(t.TempDir(), "m.db")
@@ -374,9 +374,9 @@ func TestFidelity_IncrementalDrain(t *testing.T) {
 	w.verify(t, "incremental-drain")
 }
 
-// 7. Recovery round-trip: drain, close, reopen (load from SQLite + replay the
-//    undrained tail), and confirm the recovered engine equals the reference.
-//    Then keep writing on the recovered DB and verify again.
+//  7. Recovery round-trip: drain, close, reopen (load from SQLite + replay the
+//     undrained tail), and confirm the recovered engine equals the reference.
+//     Then keep writing on the recovered DB and verify again.
 func TestFidelity_RecoveryRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	sqPath := filepath.Join(t.TempDir(), "m.db")

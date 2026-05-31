@@ -4,7 +4,7 @@
 //
 // The spike implements ONE hardcoded table:
 //
-//     users(id TEXT PK, email TEXT, name TEXT)
+//	users(id TEXT PK, email TEXT, name TEXT)
 //
 // The implementations are as simple as possible, but the types are the same
 // types the full v1 design will use: RowID, RowRef, RowHead, Mutation,
@@ -40,9 +40,9 @@ type RowRef struct {
 }
 
 const (
-	tableUsers     TableID     = 1
-	partitionZero  PartitionID = 0
-	currentLayout  uint16      = 1
+	tableUsers    TableID     = 1
+	partitionZero PartitionID = 0
+	currentLayout uint16      = 1
 )
 
 // ---------- Row model (matches v1 design) ----------
