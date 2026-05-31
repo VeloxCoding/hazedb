@@ -58,22 +58,30 @@ func RowsToJSONObjects(cols []string, rows []Row) ([]byte, error) {
 		if i > 0 {
 			b = append(b, ',')
 		}
-		b = append(b, '{')
-		for j, cell := range rows[i] {
-			if j > 0 {
-				b = append(b, ',')
-			}
-			if j < ncols {
-				b = appendJSONString(b, cols[j])
-			} else {
-				b = appendJSONString(b, "")
-			}
-			b = append(b, ':')
-			b = appendValueJSON(b, cell)
-		}
-		b = append(b, '}')
+		b = appendRowJSONObject(b, cols, rows[i])
 	}
 	return append(b, ']'), nil
+}
+
+// appendRowJSONObject appends one row as a {"col":val,...} object. Shared by
+// RowsToJSONObjects and the streaming QueryJSON, so the object shape has one
+// definition. The row may alias live arena storage (QueryJSON encodes under the
+// shard lock); every cell is copied into b here, so nothing is retained.
+func appendRowJSONObject(b []byte, cols []string, row Row) []byte {
+	b = append(b, '{')
+	for j, cell := range row {
+		if j > 0 {
+			b = append(b, ',')
+		}
+		if j < len(cols) {
+			b = appendJSONString(b, cols[j])
+		} else {
+			b = appendJSONString(b, "")
+		}
+		b = append(b, ':')
+		b = appendValueJSON(b, cell)
+	}
+	return append(b, '}')
 }
 
 const jsonHexDigits = "0123456789abcdef"

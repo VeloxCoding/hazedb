@@ -614,13 +614,14 @@ func (t *table) offerLiveRow(pk UUID, pred func(Row) bool, top *topN) {
 // evaluates the full WHERE on each live row. With an ORDER BY it gathers all
 // matches and sorts before LIMIT (the filtered-list pattern); otherwise it
 // projects and stops at LIMIT.
-func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
-	st := pl.st.(*selectStmt)
+// idxCandidates resolves the candidate-PK enumerator for an indexed SELECT and
+// returns emit(fn), which calls fn(pk) for each unique candidate (fn returns
+// true to stop). ok=false means the result is provably empty (a NULL key, a
+// missing index, or no index hit AND no dirty overlay) — the caller returns no
+// rows. Shared by execSelectIdx (materialized) and selectEach (streaming) so the
+// hybrid index∪dirty correctness has a single definition.
+func (db *DB) idxCandidates(pl *plan, ctx *evalCtx) (emit func(func(pk UUID) bool), ok bool, err error) {
 	tbl := pl.rt
-	colNames := pl.colNames
-	if st.limit == 0 {
-		return colNames, nil, nil
-	}
 	// Index side: one bucket per indexed equality conjunct, intersected. With
 	// two indexes (WHERE name = ? AND city = ?) this shrinks the candidate set
 	// to rows matching BOTH before any row is fetched — e.g. the 1000 Peters in
@@ -629,14 +630,14 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 	for i, ord := range pl.idxCols {
 		keyVal, err := evalExpr(pl.idxSrcs[i], ctx)
 		if err != nil {
-			return nil, nil, err
+			return nil, false, err
 		}
 		if keyVal.IsNull() {
-			return colNames, nil, nil
+			return nil, false, nil
 		}
 		si := tbl.indexFor(ord)
 		if si == nil {
-			return colNames, nil, nil
+			return nil, false, nil
 		}
 		bucket := si.lookup(keyOf(keyVal))
 		if i == 0 {
@@ -650,18 +651,17 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 	}
 	// Hybrid candidate set: the (intersected) index hits UNION the dirty PKs
 	// (mutated since the last merge, membership uncertain). Every candidate's
-	// live row is evaluated against the FULL WHERE, so neither a stale entry, an
-	// unrelated dirty PK, nor an extra conjunct can yield a wrong row. starAll
-	// keeps the whole row; otherwise project the wanted columns.
+	// live row is evaluated against the FULL WHERE by the caller, so neither a
+	// stale entry, an unrelated dirty PK, nor an extra conjunct yields a wrong row.
 	dirty := tbl.dirtyPKs()
 	if len(pks) == 0 && len(dirty) == 0 {
-		return colNames, nil, nil
+		return nil, false, nil
 	}
 	// emit visits each candidate PK once, calling fn (stop on true). The index
 	// buckets are already unique, so a dedup set is only built when the dirty
 	// overlay is non-empty (a PK may then be in both) — the steady-state read
 	// (merged, dirty empty) walks the bucket with no per-candidate map.
-	emit := func(fn func(pk UUID) bool) {
+	emit = func(fn func(pk UUID) bool) {
 		if len(dirty) == 0 {
 			for _, pk := range pks {
 				if fn(pk) {
@@ -688,6 +688,23 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 				return
 			}
 		}
+	}
+	return emit, true, nil
+}
+
+func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
+	st := pl.st.(*selectStmt)
+	tbl := pl.rt
+	colNames := pl.colNames
+	if st.limit == 0 {
+		return colNames, nil, nil
+	}
+	emit, ok, err := db.idxCandidates(pl, ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !ok {
+		return colNames, nil, nil
 	}
 
 	// ORDER BY: gather every matching live row, sort by the order column, then
@@ -725,7 +742,7 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 	}
 
 	// No ORDER BY: project and stop as soon as LIMIT is reached.
-	out := make([]Row, 0, len(pks))
+	out := make([]Row, 0, 16)
 	emit(func(pk UUID) bool {
 		r, ok := tbl.getByPK(pk)
 		if !ok {
