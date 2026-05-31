@@ -112,6 +112,11 @@ func (v Value) UUID() UUID {
 	return u
 }
 
+// uuidWords returns the two big-endian words backing a KindUUID value (hi = the
+// first 8 bytes, lo = the last 8). The secondary index keys on these directly —
+// no [16]byte round-trip, no allocation. Caller must know Kind == KindUUID.
+func (v Value) uuidWords() (hi, lo uint64) { return v.w0, v.w1 }
+
 func (v Value) IsNull() bool { return v.Kind == KindNull }
 
 // AsString returns the value formatted as text. Used for PK keys in

@@ -1,6 +1,7 @@
 package hazedb
 
 import (
+	"encoding/binary"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -723,5 +724,106 @@ func TestIndexNonUniqueChurn(t *testing.T) {
 	tbl := db.cat.Load().byName["users"].table
 	if n := len(tbl.dirtyPKs()); n != 0 {
 		t.Fatalf("dirty not drained: %d", n)
+	}
+}
+
+// A hash INDEX on a non-PK uuid column: equality resolves through the index.
+// PK indexing never exercises a uuid secIndex (the PK has its own directory), so
+// this is the only coverage of the two-word uuid indexKey on the equality path —
+// keyOf packs the uuid words, the live re-check confirms the match.
+func TestIndexUUIDColumn(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE events (id uuid primary key, actor uuid, note text, INDEX (actor))")
+	actorA := UUID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10}
+	actorB := UUID{0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00}
+	for i := 0; i < 5; i++ {
+		db.Exec("INSERT INTO events (id, actor, note) VALUES (?, ?, ?)", NewUUIDv7(), actorA, "a"+strconv.Itoa(i))
+	}
+	db.Exec("INSERT INTO events (id, actor, note) VALUES (?, ?, ?)", NewUUIDv7(), actorB, "b0")
+
+	count := func(actor UUID) int {
+		_, rows, err := db.Query("SELECT note FROM events WHERE actor = ?", actor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(rows)
+	}
+	for _, phase := range []string{"overlay", "merged"} {
+		if phase == "merged" {
+			db.mergeIndexes()
+		}
+		if got := count(actorA); got != 5 {
+			t.Fatalf("[%s] actorA bucket: got %d, want 5", phase, got)
+		}
+		if got := count(actorB); got != 1 {
+			t.Fatalf("[%s] actorB bucket: got %d, want 1", phase, got)
+		}
+	}
+}
+
+// O5: an ORDERED INDEX on a uuid column must order by the 16 bytes big-endian.
+// The two-word indexKey compares the words UNSIGNED; a signed high-word compare
+// would sort any uuid whose first byte is >= 0x80 (high bit of w0 set) BEFORE
+// smaller ones. The keys below straddle the 0x7f→0x80 high-word boundary (and a
+// low-word-only tie-break), so a signed regression fails here — in both the
+// dirty-overlay and merged phases, which both route through less().
+func TestOrderedIndexUUIDBoundary(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE events (id uuid primary key, actor uuid, ORDERED INDEX (actor))")
+
+	mk := func(hi, lo uint64) UUID {
+		var u UUID
+		binary.BigEndian.PutUint64(u[0:8], hi)
+		binary.BigEndian.PutUint64(u[8:16], lo)
+		return u
+	}
+	want := []UUID{ // strictly ascending in big-endian byte order
+		mk(0x0000000000000000, 0x0000000000000001),
+		mk(0x0000000000000000, 0x00000000000000ff),
+		mk(0x7fffffffffffffff, 0xffffffffffffffff),
+		mk(0x8000000000000000, 0x0000000000000000), // signed compare would mis-sort this below the 0x00.. keys
+		mk(0xffffffffffffffff, 0xffffffffffffffff),
+	}
+	for _, i := range []int{3, 0, 4, 2, 1} { // insert shuffled
+		db.Exec("INSERT INTO events (id, actor) VALUES (?, ?)", NewUUIDv7(), want[i])
+	}
+
+	actors := func(sql string) []UUID {
+		_, rows, err := db.Query(sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := make([]UUID, len(rows))
+		for i, r := range rows {
+			out[i] = r[0].UUID()
+		}
+		return out
+	}
+	eqU := func(a, b []UUID) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for i := range a {
+			if a[i] != b[i] {
+				return false
+			}
+		}
+		return true
+	}
+	desc := make([]UUID, len(want))
+	for i := range want {
+		desc[i] = want[len(want)-1-i]
+	}
+
+	for _, phase := range []string{"overlay", "merged"} {
+		if phase == "merged" {
+			db.mergeIndexes()
+		}
+		if got := actors("SELECT actor FROM events ORDER BY actor ASC"); !eqU(got, want) {
+			t.Fatalf("[%s] ASC: got %v, want %v", phase, got, want)
+		}
+		if got := actors("SELECT actor FROM events ORDER BY actor DESC"); !eqU(got, desc) {
+			t.Fatalf("[%s] DESC: got %v, want %v", phase, got, desc)
+		}
 	}
 }

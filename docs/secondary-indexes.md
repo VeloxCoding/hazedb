@@ -67,8 +67,10 @@ a bucket list — a value may map to many PKs (there is no enforced-unique form)
 - ordered: a key-sorted slice (`[]ordEntry`) serving equality + ranges + ORDER BY,
   rebuilt on merge.
 - `indexKey` is a comparable, normalised encoding of the indexed `Value`
-  (`string`→string, `int`→int64, `uuid`→array, `bool`→bool). `Value` itself is
-  not map-key-able (it carries an `unsafe.Pointer`).
+  (`string`→string, `int`→int64, `uuid`→its two big-endian uint64 words,
+  `bool`→bool — mirroring `Value`'s packing, so a UUID key needs no `[16]byte`
+  round-trip or allocation). `Value` itself is not map-key-able (it carries an
+  `unsafe.Pointer`).
 - Guarded by one `RWMutex`, **written only by the merger**; readers `RLock`.
   (A later optimisation may swap to an immutable snapshot + atomic pointer for
   lock-free reads — only if reads are shown to contend on the lock.)

@@ -17,42 +17,57 @@ import (
 // indexKey is a comparable, value-typed encoding of an indexed cell, usable as
 // a Go map key (Value carries an unsafe.Pointer and is not itself comparable).
 // NULL is never indexed (it is not '='-queryable), so a NULL key is only ever a
-// sentinel, never stored. Go strings are immutable, so a KindString key may
-// alias the row's backing safely; KindBytes/KindUUID copy.
+// sentinel, never stored.
+//
+// Payload by kind (mirrors Value's word packing, so keyOf needs no conversion):
+//   - int  : w0 holds the value, compared SIGNED (int64(w0)).
+//   - bool : w0 is 0/1.
+//   - uuid : w0/w1 are the two big-endian words, compared UNSIGNED high-then-low
+//     (big-endian => word order == byte order == UUID order). No [16]byte
+//     round-trip and no allocation, unlike a string-encoded key.
+//   - string/bytes : s holds the content, compared bytewise. A KindString key
+//     aliases the row's immutable backing; KindBytes copies.
 type indexKey struct {
 	kind ValueKind
-	i    int64
+	w0   uint64
+	w1   uint64
 	s    string
 }
 
 func keyOf(v Value) indexKey {
 	switch v.Kind {
 	case KindInt:
-		return indexKey{kind: KindInt, i: v.Int()}
+		return indexKey{kind: KindInt, w0: uint64(v.Int())}
 	case KindBool:
-		var b int64
+		var b uint64
 		if v.Bool() {
 			b = 1
 		}
-		return indexKey{kind: KindBool, i: b}
+		return indexKey{kind: KindBool, w0: b}
 	case KindString:
 		return indexKey{kind: KindString, s: v.Str()}
 	case KindBytes:
 		return indexKey{kind: KindBytes, s: string(v.Bytes())}
 	case KindUUID:
-		u := v.UUID()
-		return indexKey{kind: KindUUID, s: string(u[:])}
+		hi, lo := v.uuidWords()
+		return indexKey{kind: KindUUID, w0: hi, w1: lo}
 	}
 	return indexKey{kind: KindNull}
 }
 
 // less orders two keys of the SAME kind (all keys in one index share a kind):
-// numeric for int/bool, lexicographic for string/bytes, and the UUID's 16
-// big-endian bytes (so byte order == UUID order).
+// signed for int (bool's 0/1 rides along), the two big-endian words high-then-low
+// and UNSIGNED for uuid (so word order == UUID byte order), lexicographic for
+// string/bytes.
 func (k indexKey) less(o indexKey) bool {
 	switch k.kind {
 	case KindInt, KindBool:
-		return k.i < o.i
+		return int64(k.w0) < int64(o.w0)
+	case KindUUID:
+		if k.w0 != o.w0 {
+			return k.w0 < o.w0
+		}
+		return k.w1 < o.w1
 	default:
 		return k.s < o.s
 	}
