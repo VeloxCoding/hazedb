@@ -362,17 +362,30 @@ func hazedb_fetchall(sql *C.zend_string, args *C.zval) unsafe.Pointer {
 	if !ok {
 		return nil
 	}
-	cols, rows, err := db.QueryValues(zendStringView(sql), vals...)
+	// Stream: build each PHP assoc array straight from the live row, skipping the
+	// Go []Row + per-row clone QueryValues would materialize only to re-encode.
+	// QueryEach runs the visitor under the row's shard lock and the row is valid
+	// only for that call; rowToAssoc copies every cell into the Zend heap before
+	// returning, so nothing is retained. The array is allocated on the first row
+	// (and for an empty result below), so an error — which QueryEach only returns
+	// before any row is visited — leaks nothing.
+	sc := scratchPool.Get().(*rowScratch)
+	var out *C.zend_array
+	err := db.QueryEach(zendStringView(sql), vals, func(cols []string, row hazedb.Row) bool {
+		if out == nil {
+			sc.fillKeys(cols)
+			out = C.hzd_arr_new(C.uint32_t(0))
+		}
+		C.hzd_push_arr(out, sc.rowToAssoc(row))
+		return true
+	})
+	scratchPool.Put(sc)
 	if err != nil {
 		return nil
 	}
-	sc := scratchPool.Get().(*rowScratch)
-	sc.fillKeys(cols)
-	out := C.hzd_arr_new(C.uint32_t(len(rows)))
-	for i := range rows {
-		C.hzd_push_arr(out, sc.rowToAssoc(rows[i]))
+	if out == nil {
+		out = C.hzd_arr_new(C.uint32_t(0)) // empty result -> empty array (not null)
 	}
-	scratchPool.Put(sc)
 	return unsafe.Pointer(out)
 }
 
@@ -389,11 +402,13 @@ func hazedb_fetchall_json(sql *C.zend_string, args *C.zval) unsafe.Pointer {
 	if !ok {
 		return nil
 	}
-	cols, rows, err := db.QueryValues(zendStringView(sql), vals...)
+	// Stream straight to JSON bytes: QueryJSON encodes the live rows into one
+	// buffer, skipping the []Row clone QueryValues + RowsToJSONObjects would
+	// build and immediately discard.
+	_, body, err := db.QueryJSON(zendStringView(sql), vals...)
 	if err != nil {
 		return nil
 	}
-	body, _ := hazedb.RowsToJSONObjects(cols, rows)
 	return phpStringFromBytes(body)
 }
 
