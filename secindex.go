@@ -321,6 +321,16 @@ func (t *table) mergeIndexes() {
 	}
 	t.mergeMu.Lock()
 	defer t.mergeMu.Unlock()
+	// The merge reads only the indexed columns, so project just those into a
+	// reused scratch buffer instead of cloning the whole row per dirty PK
+	// (getByPK copies every column, incl. any large BYTES payload). ords[k] is
+	// the column ordinal of t.indexes[k], so the projected row lines up 1:1 with
+	// the index list.
+	ords := make([]int, len(t.indexes))
+	for k, si := range t.indexes {
+		ords[k] = si.ordinal
+	}
+	var scratch []Value
 	type pending struct {
 		s *tableShard
 		n int
@@ -339,10 +349,15 @@ func (t *table) mergeIndexes() {
 			continue
 		}
 		for _, pk := range batch {
-			if r, ok := t.getByPK(pk); ok {
-				t.idxApply(pk, r)
-			} else {
-				t.idxApply(pk, nil)
+			pr, ok := t.getByPKProjectInto(pk, ords, scratch)
+			scratch = pr // reuse the buffer next iteration
+			for k, si := range t.indexes {
+				if !ok {
+					si.apply(pk, indexKey{}, false)
+					continue
+				}
+				v := pr[k]
+				si.apply(pk, keyOf(v), v.Kind != KindNull)
 			}
 		}
 		drops = append(drops, pending{s, n})

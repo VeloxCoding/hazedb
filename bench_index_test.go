@@ -103,6 +103,35 @@ func benchIndexMerge(b *testing.B, n int) {
 func BenchmarkIndexMerge_10k(b *testing.B) { benchIndexMerge(b, 10000) }
 func BenchmarkIndexMerge_50k(b *testing.B) { benchIndexMerge(b, 50000) }
 
+// Wide table, ONE indexed column: the merge only needs `name`, but getByPK
+// clones every column — including the 256-byte payload — per dirty row. This is
+// the case where fetching just the indexed columns pays off (vs IndexMerge_50k,
+// where the indexed columns are essentially the whole row).
+func benchIndexMergeWide(b *testing.B, n int) {
+	b.ReportAllocs()
+	payload := make([]byte, 256)
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: n})
+		if err != nil {
+			b.Fatal(err)
+		}
+		db.Exec("CREATE TABLE w (id uuid primary key, name text, a int, c text, payload bytes, INDEX (name))")
+		for j := 0; j < n; j++ {
+			if _, err := db.Exec("INSERT INTO w (id, name, a, c, payload) VALUES (?, ?, ?, ?, ?)",
+				NewUUIDv7(), "n"+strconv.Itoa(j%100), j, "c"+strconv.Itoa(j), payload); err != nil {
+				b.Fatal(err)
+			}
+		}
+		b.StartTimer()
+		db.mergeIndexes()
+		b.StopTimer()
+		db.Close()
+	}
+}
+
+func BenchmarkIndexMergeWide_50k(b *testing.B) { benchIndexMergeWide(b, 50000) }
+
 // Index-assisted ORDER BY on a filtered list: WHERE author = ? ORDER BY day
 // DESC LIMIT 20. Varying the author's post count shows whether the cost scales
 // with the matched set (gather-all-then-sort) or just the LIMIT.
