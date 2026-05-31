@@ -10,8 +10,9 @@ import (
 // Secondary indexes — optional value->PK lookup structures on a non-PK column,
 // declared in DDL (INDEX (col)). See docs/secondary-indexes.md for the full
 // design (async maintenance + hybrid reads). This file holds the in-memory
-// structure and the synchronous-maintenance baseline (S2); later steps move
-// maintenance off the write path.
+// structures and the async merger: the write path only marks a PK dirty
+// (markDirtyLocked, store.go), and the background merger reconciles the indexes
+// against the live rows off the write path.
 
 // indexKey is a comparable, value-typed encoding of an indexed cell, usable as
 // a Go map key (Value carries an unsafe.Pointer and is not itself comparable).
@@ -224,21 +225,6 @@ func (t *table) indexFor(ord int) *secIndex {
 		}
 	}
 	return nil
-}
-
-// idxApply updates every secondary index for one single-row change. newRow nil
-// means the row was deleted. Called off the shard lock; each index has its own
-// mu. The synchronous-maintenance baseline (S2) — moved off the write path in
-// S4.
-func (t *table) idxApply(pk UUID, newRow Row) {
-	for _, si := range t.indexes {
-		if newRow == nil {
-			si.apply(pk, indexKey{}, false)
-			continue
-		}
-		v := newRow[si.ordinal]
-		si.apply(pk, keyOf(v), v.Kind != KindNull)
-	}
 }
 
 // startMergeLoop launches the background merger: every interval it reconciles
