@@ -56,14 +56,16 @@ live row** as a correctness backstop. No WAL change; no seq needed.
 
 ## 3. Data structures
 
-**Schema.** `TableDef.Indexes []IndexDef{Name string, Column string, Unique bool}`;
-resolved in the catalog to a column ordinal (`resolvedIndex{ordinal int, unique bool}`).
+**Schema.** `TableDef.Indexes []IndexDef{Name string, Column string, Ordered bool}`;
+resolved in the catalog to a column ordinal (`resolvedIndex{name string, ordinal int, ordered bool}`).
 
-**The index** (one per declared index): value → PK(s).
+**The index** (one per declared index): value → PK(s). The forward map is always
+a bucket list — a value may map to many PKs (there is no enforced-unique form):
 
-- unique: `map[indexKey]UUID`
-- non-unique: `map[indexKey][]UUID` (bucket list — same shape as the existing
-  partition `tails`)
+- hash (default): forward `map[indexKey][]UUID` (bucket list — same shape as the
+  existing partition `tails`) plus a reverse `map[UUID]indexKey`.
+- ordered: a key-sorted slice (`[]ordEntry`) serving equality + ranges + ORDER BY,
+  rebuilt on merge.
 - `indexKey` is a comparable, normalised encoding of the indexed `Value`
   (`string`→string, `int`→int64, `uuid`→array, `bool`→bool). `Value` itself is
   not map-key-able (it carries an `unsafe.Pointer`).

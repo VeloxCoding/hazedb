@@ -28,7 +28,7 @@ every statement the parser accepts — but that set is a deliberate subset of SQ
 
 | area | accepted |
 |---|---|
-| DDL | `CREATE TABLE name (col TYPE …)` with `PRIMARY KEY` / `PARTITION KEY` constraints and `[UNIQUE] [ORDERED] INDEX [name] (col)` declarations; `DROP TABLE name` |
+| DDL | `CREATE TABLE name (col TYPE …)` with `PRIMARY KEY` / `PARTITION KEY` constraints and `[ORDERED] INDEX [name] (col)` declarations; `DROP TABLE name` |
 | Column types | `int`, `text`/`string`, `bool`, `bytes`/`blob`, `uuid` |
 | Writes | `INSERT INTO … VALUES (…)`, `UPDATE … SET … WHERE …`, `DELETE FROM … WHERE …` |
 | `SELECT` | `*` or an explicit column list, **one** table (`FROM t`), optional `WHERE`, `ORDER BY col [ASC\|DESC]`, `LIMIT n` |
@@ -48,7 +48,7 @@ a full scan:
 CREATE TABLE users (
     id uuid primary key, name text, age int null, email text,
     INDEX (email),
-    UNIQUE INDEX (name)   -- UNIQUE is a selectivity hint, not an enforced constraint
+    ORDERED INDEX (name)   -- ORDERED also serves ranges + ORDER BY; default is hash (equality only)
 )
 ```
 
@@ -90,8 +90,7 @@ testbed reproduces the SQLite comparison):
   one-time, in the background (every 50 ms) or once at boot after WAL replay.
 
 **Limits:** non-partitioned tables only (an `INDEX` on a partitioned table is
-rejected); single-column only (no composite); `UNIQUE` does not reject
-duplicates (uniqueness is the operator's promise, used only to read faster).
+rejected); single-column only (no composite).
 
 ### `ORDER BY` cost on very large buckets
 
