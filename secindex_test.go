@@ -13,7 +13,7 @@ import (
 // right rows (point hit, miss).
 func TestIndexPointReadAndPlan(t *testing.T) {
 	db := openEmpty(t)
-	db.Exec("CREATE TABLE users (id uuid primary key, name text, email text, UNIQUE INDEX (email))")
+	db.Exec("CREATE TABLE users (id uuid primary key, name text, email text, INDEX (email))")
 	for i := 0; i < 5; i++ {
 		db.Exec("INSERT INTO users (id, name, email) VALUES (?, ?, ?)", NewUUIDv7(), "u"+strconv.Itoa(i), "e"+strconv.Itoa(i))
 	}
@@ -36,7 +36,7 @@ func TestIndexPointReadAndPlan(t *testing.T) {
 // UPDATE (old value gone, new value findable) and a DELETE.
 func TestIndexMaintainedOnUpdateDelete(t *testing.T) {
 	db := openEmpty(t)
-	db.Exec("CREATE TABLE users (id uuid primary key, email text, UNIQUE INDEX (email))")
+	db.Exec("CREATE TABLE users (id uuid primary key, email text, INDEX (email))")
 	id := NewUUIDv7()
 	db.Exec("INSERT INTO users (id, email) VALUES (?, ?)", id, "a@x")
 	if _, err := db.Exec("UPDATE users SET email = ? WHERE id = ?", "b@x", id); err != nil {
@@ -106,7 +106,7 @@ func TestIndexHybridRecheckFiltersStale(t *testing.T) {
 // dirty list is drained.
 func TestIndexDirtyOverlayThenMerge(t *testing.T) {
 	db := openEmpty(t)
-	db.Exec("CREATE TABLE users (id uuid primary key, email text, UNIQUE INDEX (email))")
+	db.Exec("CREATE TABLE users (id uuid primary key, email text, INDEX (email))")
 	id := NewUUIDv7()
 	db.Exec("INSERT INTO users (id, email) VALUES (?, ?)", id, "a@x")
 	tbl := db.cat.Load().byName["users"].table
@@ -261,7 +261,7 @@ func TestIndexNonUniqueBucket(t *testing.T) {
 // indexed column moves only that index; a delete drops the row from both.
 func TestIndexMultiplePerTable(t *testing.T) {
 	db := openEmpty(t)
-	db.Exec("CREATE TABLE users (id uuid primary key, email text, city text, UNIQUE INDEX (email), INDEX (city))")
+	db.Exec("CREATE TABLE users (id uuid primary key, email text, city text, INDEX (email), INDEX (city))")
 	a, b := NewUUIDv7(), NewUUIDv7()
 	db.Exec("INSERT INTO users (id, email, city) VALUES (?, ?, ?)", a, "a@x", "AMS")
 	db.Exec("INSERT INTO users (id, email, city) VALUES (?, ?, ?)", b, "b@x", "AMS")

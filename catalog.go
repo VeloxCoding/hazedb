@@ -134,7 +134,7 @@ func (db *DB) dropTable(name string) error {
 // CREATE: tableID:2 | name(len:2+bytes) | numCols:2 | per col: name(len:2+bytes) | type:1 | flags:1
 //   flags bit 0 = PK, 1 = PartitionKey, 2 = Immutable, 3 = Nullable
 //   then (optional, omitted by pre-index records): numIndexes:2 |
-//        per index: name(len:2+bytes) | col(len:2+bytes) | flags:1 (bit 0 = Unique)
+//        per index: name(len:2+bytes) | col(len:2+bytes) | flags:1 (bit 1 = Ordered; bit 0 reserved)
 // DROP:   name(len:2+bytes)
 
 func encodeCreateTable(buf []byte, tableID uint16, td TableDef) []byte {
@@ -168,9 +168,6 @@ func encodeCreateTable(buf []byte, tableID uint16, td TableDef) []byte {
 		buf = appendU16LE(buf, uint16(len(ix.Column)))
 		buf = append(buf, ix.Column...)
 		var flags byte
-		if ix.Unique {
-			flags |= 1
-		}
 		if ix.Ordered {
 			flags |= 2
 		}
@@ -239,7 +236,7 @@ func decodeCreateTable(b []byte) (uint16, TableDef, error) {
 		}
 		flags := b[off]
 		off++
-		td.Indexes = append(td.Indexes, IndexDef{Name: name, Column: col, Unique: flags&1 != 0, Ordered: flags&2 != 0})
+		td.Indexes = append(td.Indexes, IndexDef{Name: name, Column: col, Ordered: flags&2 != 0})
 	}
 	return tableID, td, nil
 }

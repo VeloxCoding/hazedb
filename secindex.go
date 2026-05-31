@@ -67,12 +67,9 @@ func uuidLess(a, b UUID) bool { return bytes.Compare(a[:], b[:]) < 0 }
 
 // secIndex is one secondary index: a forward map value->PKs and a reverse map
 // PK->current key, so a change can drop the stale forward entry without the
-// caller supplying the old value. Guarded by mu. UNIQUE is a read hint (the
-// operator promises <=1 row per value, enabling early-exit) — NOT an enforced
-// constraint, since enforcement cannot be synchronous once maintenance is async.
+// caller supplying the old value. Guarded by mu.
 type secIndex struct {
 	ordinal int
-	unique  bool
 	ordered bool // sorted index (equality + ranges + ORDER BY); see O2
 	mu      sync.RWMutex
 	fwd     map[indexKey][]UUID // hash mode: value -> PKs
@@ -83,7 +80,6 @@ type secIndex struct {
 func newSecIndex(ri resolvedIndex) *secIndex {
 	return &secIndex{
 		ordinal: ri.ordinal,
-		unique:  ri.unique,
 		ordered: ri.ordered,
 		fwd:     make(map[indexKey][]UUID),
 		rev:     make(map[UUID]indexKey),

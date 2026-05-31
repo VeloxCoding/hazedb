@@ -58,7 +58,6 @@ type ColumnDef struct {
 type IndexDef struct {
 	Name   string // optional; auto-derived as "idx_<col>" when empty
 	Column string
-	Unique bool
 	// Ordered makes this a sorted index (serves equality + ranges + ORDER BY)
 	// instead of the default hash index (equality only). A column has one or the
 	// other, not both.
@@ -79,11 +78,10 @@ type Schema struct {
 }
 
 // resolvedIndex is the validated form of an IndexDef: the indexed column's
-// ordinal plus its uniqueness, resolved once at schema time.
+// ordinal and index kind, resolved once at schema time.
 type resolvedIndex struct {
 	name    string
 	ordinal int
-	unique  bool
 	ordered bool
 }
 
@@ -183,7 +181,7 @@ func resolveSchema(s Schema) (map[string]*resolvedTable, error) {
 				return nil, fmt.Errorf("schema: table %q duplicate index name %q", t.Name, name)
 			}
 			seenIdxName[name] = true
-			rt.indexes = append(rt.indexes, resolvedIndex{name: name, ordinal: ord, unique: ix.Unique, ordered: ix.Ordered})
+			rt.indexes = append(rt.indexes, resolvedIndex{name: name, ordinal: ord, ordered: ix.Ordered})
 		}
 		out[t.Name] = rt
 	}

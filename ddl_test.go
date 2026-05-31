@@ -295,17 +295,17 @@ func resolvedTableByName(t *testing.T, db *DB, name string) *resolvedTable {
 // existing full-scan read path.
 func TestCreateTableWithIndex(t *testing.T) {
 	db := openEmpty(t)
-	if _, err := db.Exec("CREATE TABLE users (id uuid primary key, name text, email text, INDEX (email), UNIQUE INDEX by_name (name))"); err != nil {
+	if _, err := db.Exec("CREATE TABLE users (id uuid primary key, name text, email text, INDEX (email), INDEX by_name (name))"); err != nil {
 		t.Fatal(err)
 	}
 	rt := resolvedTableByName(t, db, "users")
 	if len(rt.indexes) != 2 {
 		t.Fatalf("want 2 indexes, got %d", len(rt.indexes))
 	}
-	if rt.indexes[0] != (resolvedIndex{name: "idx_email", ordinal: 2, unique: false}) {
+	if rt.indexes[0] != (resolvedIndex{name: "idx_email", ordinal: 2}) {
 		t.Errorf("email index resolved wrong: %+v", rt.indexes[0])
 	}
-	if rt.indexes[1] != (resolvedIndex{name: "by_name", ordinal: 1, unique: true}) {
+	if rt.indexes[1] != (resolvedIndex{name: "by_name", ordinal: 1}) {
 		t.Errorf("name index resolved wrong: %+v", rt.indexes[1])
 	}
 	// Reads still work (full scan; index behaviour lands in S2+).
@@ -342,7 +342,7 @@ func TestIndexSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.Exec("CREATE TABLE users (id uuid primary key, email text, UNIQUE INDEX (email))")
+	db.Exec("CREATE TABLE users (id uuid primary key, email text, INDEX (email))")
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +352,7 @@ func TestIndexSurvivesRestart(t *testing.T) {
 	}
 	defer db2.Close()
 	rt := resolvedTableByName(t, db2, "users")
-	if len(rt.indexes) != 1 || rt.indexes[0] != (resolvedIndex{name: "idx_email", ordinal: 1, unique: true}) {
+	if len(rt.indexes) != 1 || rt.indexes[0] != (resolvedIndex{name: "idx_email", ordinal: 1}) {
 		t.Fatalf("index lost or changed after restart: %+v", rt.indexes)
 	}
 }
