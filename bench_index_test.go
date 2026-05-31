@@ -58,6 +58,35 @@ func BenchmarkIndexReadOne_10k(b *testing.B) {
 	}
 }
 
+// Indexed read whose bucket holds MANY rows (a non-unique index — the common
+// "all rows for this author/tag/owner" list view). Exercises the materialized
+// execSelectIdx result-slice growth: with rowsPerKey rows the slice must be
+// presized to the candidate count, not regrown from a fixed seed.
+func benchIndexReadMany(b *testing.B, rowsPerKey int) {
+	const keys = 100
+	n := keys * rowsPerKey
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: n})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec("CREATE TABLE t (id uuid primary key, owner text, INDEX (owner))")
+	for i := 0; i < n; i++ {
+		db.Exec("INSERT INTO t (id, owner) VALUES (?, ?)", NewUUIDv7(), "owner"+strconv.Itoa(i%keys))
+	}
+	db.mergeIndexes()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, rows, err := db.Query("SELECT id, owner FROM t WHERE owner = ?", "owner7"); err != nil || len(rows) != rowsPerKey {
+			b.Fatalf("rows=%d err=%v", len(rows), err)
+		}
+	}
+}
+
+func BenchmarkIndexReadMany_100(b *testing.B)  { benchIndexReadMany(b, 100) }
+func BenchmarkIndexReadMany_1000(b *testing.B) { benchIndexReadMany(b, 1000) }
+
 func benchIndexInsert(b *testing.B, withIndex bool) {
 	idx := ""
 	if withIndex {

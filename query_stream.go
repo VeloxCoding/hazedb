@@ -81,7 +81,7 @@ func (db *DB) selectEach(pl *plan, args []Value, visit func(row Row) bool) ([]st
 	// Indexed equality: visit each candidate's live row under its shard lock
 	// (locked per row, like offerLiveRow).
 	if pl.idxLookup {
-		emit, ok, err := db.idxCandidates(pl, &ctx)
+		emit, _, ok, err := db.idxCandidates(pl, &ctx)
 		if err != nil {
 			return nil, err
 		}

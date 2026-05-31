@@ -616,11 +616,13 @@ func (t *table) offerLiveRow(pk UUID, pred func(Row) bool, top *topN) {
 // projects and stops at LIMIT.
 // idxCandidates resolves the candidate-PK enumerator for an indexed SELECT and
 // returns emit(fn), which calls fn(pk) for each unique candidate (fn returns
-// true to stop). ok=false means the result is provably empty (a NULL key, a
+// true to stop). nhint is an upper bound on the candidate count (index hits +
+// dirty overlay, before dedup) — the materialized caller presizes its result
+// slice from it. ok=false means the result is provably empty (a NULL key, a
 // missing index, or no index hit AND no dirty overlay) — the caller returns no
 // rows. Shared by execSelectIdx (materialized) and selectEach (streaming) so the
 // hybrid index∪dirty correctness has a single definition.
-func (db *DB) idxCandidates(pl *plan, ctx *evalCtx) (emit func(func(pk UUID) bool), ok bool, err error) {
+func (db *DB) idxCandidates(pl *plan, ctx *evalCtx) (emit func(func(pk UUID) bool), nhint int, ok bool, err error) {
 	tbl := pl.rt
 	// Index side: one bucket per indexed equality conjunct, intersected. With
 	// two indexes (WHERE name = ? AND city = ?) this shrinks the candidate set
@@ -630,14 +632,14 @@ func (db *DB) idxCandidates(pl *plan, ctx *evalCtx) (emit func(func(pk UUID) boo
 	for i, ord := range pl.idxCols {
 		keyVal, err := evalExpr(pl.idxSrcs[i], ctx)
 		if err != nil {
-			return nil, false, err
+			return nil, 0, false, err
 		}
 		if keyVal.IsNull() {
-			return nil, false, nil
+			return nil, 0, false, nil
 		}
 		si := tbl.indexFor(ord)
 		if si == nil {
-			return nil, false, nil
+			return nil, 0, false, nil
 		}
 		bucket := si.lookup(keyOf(keyVal))
 		if i == 0 {
@@ -655,7 +657,7 @@ func (db *DB) idxCandidates(pl *plan, ctx *evalCtx) (emit func(func(pk UUID) boo
 	// stale entry, an unrelated dirty PK, nor an extra conjunct yields a wrong row.
 	dirty := tbl.dirtyPKs()
 	if len(pks) == 0 && len(dirty) == 0 {
-		return nil, false, nil
+		return nil, 0, false, nil
 	}
 	// emit visits each candidate PK once, calling fn (stop on true). The index
 	// buckets are already unique, so a dedup set is only built when the dirty
@@ -689,7 +691,7 @@ func (db *DB) idxCandidates(pl *plan, ctx *evalCtx) (emit func(func(pk UUID) boo
 			}
 		}
 	}
-	return emit, true, nil
+	return emit, len(pks) + len(dirty), true, nil
 }
 
 func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
@@ -699,7 +701,7 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 	if st.limit == 0 {
 		return colNames, nil, nil
 	}
-	emit, ok, err := db.idxCandidates(pl, ctx)
+	emit, nhint, ok, err := db.idxCandidates(pl, ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -741,8 +743,18 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 		return colNames, projectRows(matched, st.starAll, pl.projOrdinals), nil
 	}
 
-	// No ORDER BY: project and stop as soon as LIMIT is reached.
-	out := make([]Row, 0, 16)
+	// No ORDER BY: project and stop as soon as LIMIT is reached. Presize to the
+	// candidate count so a multi-row indexed read does not regrow the result
+	// slice — capped by LIMIT (we stop there) and an absolute ceiling so a huge
+	// candidate set with no LIMIT does not prealloc pathologically.
+	capHint := nhint
+	if st.limit >= 0 && st.limit < capHint {
+		capHint = st.limit
+	}
+	if capHint > 1024 {
+		capHint = 1024
+	}
+	out := make([]Row, 0, capHint)
 	emit(func(pk UUID) bool {
 		r, ok := tbl.getByPK(pk)
 		if !ok {
