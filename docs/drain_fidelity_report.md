@@ -122,13 +122,38 @@ cursor) is still replayed into memory and still drains normally.
 
 ---
 
+## Soak test (multi-minute, RAM-bounded, live background drain)
+
+[`drain_soak_test.go`](../drain_soak_test.go) runs a long, balanced workload
+against the **real background drain** (rotate + drain tickers running, as in
+production), holding the live set near a target so RAM stays flat
+(inserts/deletes balanced, plus a steady stream of updates), then quiesces
+(`stopDrainLoop` seals + drains the tail and joins) and asserts
+reference == engine == SQLite. Gated behind `HAZEDB_SOAK_SECONDS` so it never
+runs in the normal suite.
+
+Result of a 180s run (`HAZEDB_SOAK_SECONDS=180`):
+
+| metric | value |
+|---|---|
+| total operations | 16,682,000 |
+| inserts / updates / deletes | 4.60M / 7.51M / 4.57M |
+| live rows (steady-state) | ~28.5k–30.9k throughout (flat RAM) |
+| final live == mirror | **28,533 == 28,533**, three-way exact |
+
+An 8s variant under `-race` (≈398k ops) is also clean — the concurrent
+background drain has no data race. During the run the live and SQLite counts
+track within a few hundred rows (the ~1s drain lag plus non-atomic sampling);
+the authoritative check is the post-quiesce comparison, which is exact.
+
 ## How to run
 
 ```bash
 # in the golang:1.25 container, repo root mounted at /app
-go test -run TestFidelity -v ./...      # the fidelity suite
-go test -race -run TestFidelity ./...   # under the race detector
-go test ./...                           # full suite stays green
+go test -run TestFidelity -v ./...                        # the fidelity suite
+go test -race -run TestFidelity ./...                     # under the race detector
+go test ./...                                             # full suite stays green
+HAZEDB_SOAK_SECONDS=180 go test -run TestSoak -v -timeout 9m .   # multi-minute soak
 ```
 
 ---
