@@ -6,7 +6,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 // table is the runtime form of a resolvedTable with its storage attached.
@@ -73,92 +72,27 @@ type DB struct {
 	drainDone chan struct{}
 }
 
-// Options control Open behaviour.
-type Options struct {
-	// WALPath is the on-disk write-ahead log. Empty = memory-only
-	// (no durability). The file is created if it doesn't exist.
-	WALPath string
-
-	// Schema declares the tables. Required; at least one table.
-	Schema Schema
-
-	// SizeHint is a per-table row-count estimate for shard arena
-	// pre-allocation. Zero = use a small default.
-	SizeHint int
-
-	// WALFlushInterval is how often the background goroutine flushes the WAL
-	// buffer to the OS (and fsyncs when WALSync is set). Zero selects the
-	// safe default of 1s; a negative value disables the ticker entirely
-	// (manual FlushWAL() only). Ignored when WALPath is empty.
-	WALFlushInterval time.Duration
-
-	// WALSync makes the ticker fsync after flushing when anything is dirty,
-	// bounding power-loss to <= WALFlushInterval. Default false (flush only;
-	// survives process crash, not power loss).
-	WALSync bool
-
-	// WALSyncPerWrite flushes and fsyncs after every individual WAL record,
-	// under the WAL lock. Strongest durability (no acknowledged-loss window),
-	// highest per-write cost. Overrides the ticker's sync cadence.
-	WALSyncPerWrite bool
-
-	// WALRotateInterval enables segmented mode and sets how often the active
-	// WAL segment is sealed and a new one opened. Zero (default) keeps the
-	// single-file WAL. In segmented mode WALPath is a DIRECTORY of segment files
-	// (seg-<n>.wal); sealed segments can be drained without touching the open
-	// one. Forced on (default 5s) when SQLitePath is set. See docs/durability.md.
-	WALRotateInterval time.Duration
-
-	// SQLitePath enables the on-disk SQLite mirror at this path. A background
-	// loop drains sealed WAL segments into it (current state, compacted,
-	// queryable). Empty = no mirror. Requires WALPath; forces segmented mode.
-	SQLitePath string
-
-	// DrainInterval is how often sealed segments are drained into SQLite. Zero
-	// selects 1 minute; a negative value disables the loop (manual drain only,
-	// for tests). Ignored when SQLitePath is empty.
-	DrainInterval time.Duration
-
-	// SegmentDrainMinAge skips segments sealed more recently than this, so the
-	// drain only touches settled history (never the just-rotated segment). Zero
-	// selects 5s; negative disables the age gate. Ignored when SQLitePath empty.
-	SegmentDrainMinAge time.Duration
-
-	// IndexMergeInterval is how often the background goroutine reconciles
-	// secondary indexes with the dirty rows. Zero selects a default (50ms); a
-	// negative value disables the goroutine (manual merge only — used by tests
-	// that assert pre-merge state). Cheap when no table has an index.
-	IndexMergeInterval time.Duration
-}
-
 // Open prepares the database. If WALPath is non-empty, the file is
 // opened and any existing records are replayed into memory before
 // Open returns. Open is blocking until replay completes.
 func Open(opts Options) (*DB, error) {
-	sizeHint := opts.SizeHint
-	if sizeHint <= 0 {
-		sizeHint = 1024
-	}
 	if opts.SQLitePath != "" && opts.WALPath == "" {
 		return nil, fmt.Errorf("hazedb: SQLitePath requires WALPath (the mirror is fed from sealed WAL segments)")
 	}
+	opts.applyDefaults()
 	// An empty schema is allowed — tables can be created at runtime.
-	cat, err := newCatalog(opts.Schema, sizeHint)
+	cat, err := newCatalog(opts.Schema, opts.SizeHint)
 	if err != nil {
 		return nil, err
 	}
 	db := &DB{
 		schema:   opts.Schema,
-		sizeHint: sizeHint,
+		sizeHint: opts.SizeHint,
 		scratch:  newScratchPool(),
 	}
 	db.cat.Store(cat)
 	if opts.WALPath != "" {
-		rotateInterval := opts.WALRotateInterval
-		segmented := rotateInterval > 0 || opts.SQLitePath != ""
-		if segmented && rotateInterval <= 0 {
-			rotateInterval = 5 * time.Second // default rotation cadence when draining
-		}
+		segmented := opts.WALRotateInterval > 0 || opts.SQLitePath != ""
 		var w *wal
 		var err error
 		if segmented {
@@ -176,11 +110,7 @@ func Open(opts Options) (*DB, error) {
 			// SQLite-backed recovery: the mirror is the system of record on disk.
 			// Open it first, load it into memory, then replay only the undrained
 			// WAL tail (segments past the drained cursor) on top.
-			minAge := opts.SegmentDrainMinAge
-			if minAge == 0 {
-				minAge = 5 * time.Second
-			}
-			m, merr := newSQLiteMirror(opts.SQLitePath, db.cat.Load(), minAge)
+			m, merr := newSQLiteMirror(opts.SQLitePath, db.cat.Load(), opts.SegmentDrainMinAge)
 			if merr != nil {
 				w.close()
 				return nil, merr
@@ -224,33 +154,19 @@ func Open(opts Options) (*DB, error) {
 				}
 			}
 		}
-		flushInterval := opts.WALFlushInterval
-		if flushInterval == 0 {
-			flushInterval = time.Second // safe default
-		}
-		w.startTicker(flushInterval)
-		w.startRotateTicker(rotateInterval)
+		w.startTicker(opts.WALFlushInterval)
+		w.startRotateTicker(opts.WALRotateInterval)
 		db.wal = w
 		// Replay marked rows dirty but never built the indexes; rebuild them from
 		// the live rows now, so reads are index-fast before serving.
 		db.rebuildAllIndexes()
 
-		if opts.SQLitePath != "" {
-			drainInterval := opts.DrainInterval
-			if drainInterval == 0 {
-				drainInterval = time.Minute
-			}
-			if drainInterval > 0 {
-				db.startDrainLoop(drainInterval)
-			}
+		if opts.SQLitePath != "" && opts.DrainInterval > 0 {
+			db.startDrainLoop(opts.DrainInterval)
 		}
 	}
-	mergeInterval := opts.IndexMergeInterval
-	if mergeInterval == 0 {
-		mergeInterval = 50 * time.Millisecond
-	}
-	if mergeInterval > 0 {
-		db.startMergeLoop(mergeInterval)
+	if opts.IndexMergeInterval > 0 {
+		db.startMergeLoop(opts.IndexMergeInterval)
 	}
 	return db, nil
 }
