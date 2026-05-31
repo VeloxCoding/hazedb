@@ -353,7 +353,7 @@ func (db *DB) queryRowPlan(pl *plan, args []any) ([]string, Row, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if pl.idxLookup && pl.orderOrdinal < 0 {
+	if pl.idxLookup && pl.orderOrdinal < 0 && pl.st.(*selectStmt).offset == 0 {
 		return db.execSelectIdxOne(pl, vargs)
 	}
 	cols, rows, err := db.execSelect(pl, vargs)
@@ -401,7 +401,7 @@ func (db *DB) QueryRowValues(sql string, args ...Value) ([]string, Row, error) {
 		}
 		return db.execSelectPKOne(pl, keyVal)
 	}
-	if pl.idxLookup && pl.orderOrdinal < 0 {
+	if pl.idxLookup && pl.orderOrdinal < 0 && pl.st.(*selectStmt).offset == 0 {
 		return db.execSelectIdxOne(pl, args)
 	}
 	cols, rows, err := db.execSelect(pl, args)

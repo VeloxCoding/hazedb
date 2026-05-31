@@ -2,7 +2,7 @@
 
 **Status:** M1–M6 implemented (store, SQL, WAL durability, UUIDv7 PK, partitioning, runtime catalog + `CREATE`/`DROP TABLE`, single-table transactions); M7–M8 open. See *Implementation status* for what is running vs designed.  
 **Module:** `github.com/VeloxCoding/hazedb`  
-**Updated:** 2026-05-30 (rev. 24 — PHP cgo binding reshaped to a PDO-style native-array API: `hazedb_fetch`/`hazedb_fetchall`/`hazedb_exec`)
+**Updated:** 2026-05-31 (rev. 25 — `OFFSET m` added to `SELECT`, on every read path)
 
 ---
 
@@ -335,13 +335,15 @@ parseSQL(sql) → assignParamIndices → plan() → execSelect/execInsert/...
 Supported today:
 
 ```sql
-SELECT col_list FROM table [WHERE expr] [ORDER BY col [DESC]] [LIMIT n]
+SELECT col_list FROM table [WHERE expr] [ORDER BY col [DESC]] [LIMIT n] [OFFSET m]
 INSERT INTO table (cols) VALUES (vals)
 UPDATE table SET col = val [WHERE expr]
 DELETE FROM table [WHERE expr]
 ```
 
 WHERE supports: `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IS NULL`, `IS NOT NULL`, `?` params, literals (int/string/bool/null).
+
+`OFFSET m` skips the first `m` matched rows (in `ORDER BY` order; without `ORDER BY`, in the same undefined scan order `LIMIT` uses) and applies on every read path — PK/index/ordered-walk/scan and the streaming reads. It is the standard fetch-and-skip: a path fetches `m+n` matches (the top-N heap keeps `m+n`) and drops the first `m`, so a large offset still walks that many matches — the usual SQL `OFFSET` cost. `LIMIT m, n` (MySQL short form) is not accepted; use `LIMIT n OFFSET m`.
 
 **Read consistency of multi-shard SELECT (explicit).** A `SELECT` pinned to a single shard — `WHERE id = ?` on a non-partitioned table, or any scan confined to one partition value on a partitioned table — reads under that shard's read lock and is a consistent point-in-time view. A `SELECT` whose `WHERE`/`ORDER BY`/`LIMIT` spans multiple shards (no PK/PartitionKey pin) does **not** read all shards under a single lock by default: it takes and releases each shard's read lock in turn, so concurrent writes between shard reads mean the assembled result can reflect a mix of moments and may represent no single instant that ever existed. This is the read-side counterpart of the multi-shard write rule. The contract is: **per-shard consistent, not globally point-in-time.** Callers needing a consistent cross-shard snapshot must either pin the query to one shard, or use the consistent path — read-lock all involved shards for the duration of the scan (correct, but an all-shard read-lock contention spike, same tradeoff as multi-shard writes). `ORDER BY` + `LIMIT` over a multi-shard scan inherits this: it merges per-shard results that were each consistent only at their own read instant. **And it must gather-then-sort: `LIMIT n` cannot be pushed down to each shard.** A correct multi-shard `ORDER BY col LIMIT n` collects all matching rows (or at least the top-n per shard) from every involved shard, merges, sorts globally, then applies `LIMIT n`. Taking `n` rows *per shard* and concatenating gives wrong results; even taking the per-shard top-n is only valid as an optimisation if each shard is individually sorted on `col` first. Document which mode a given query uses; do not assume snapshot semantics for unpinned scans.
 

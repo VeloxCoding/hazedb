@@ -37,6 +37,7 @@ const (
 	tkAsc
 	tkDesc
 	tkLimit
+	tkOffset
 	tkInsert
 	tkInto
 	tkValues
@@ -64,6 +65,7 @@ var keywords = map[string]tokenKind{
 	"asc":    tkAsc,
 	"desc":   tkDesc,
 	"limit":  tkLimit,
+	"offset": tkOffset,
 	"insert": tkInsert,
 	"into":   tkInto,
 	"values": tkValues,

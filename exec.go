@@ -561,6 +561,10 @@ func (db *DB) execSelectPK(pl *plan, keyVal Value) ([]string, []Row, error) {
 	st := pl.st.(*selectStmt)
 	tbl := pl.rt
 	colNames := pl.colNames
+	// A PK match is at most one row, so LIMIT 0 or any OFFSET drops it.
+	if st.limit == 0 || st.offset > 0 {
+		return colNames, nil, nil
+	}
 	if keyVal.IsNull() {
 		return colNames, nil, nil
 	}
@@ -588,6 +592,10 @@ func (db *DB) execSelectPKOne(pl *plan, keyVal Value) ([]string, Row, error) {
 	st := pl.st.(*selectStmt)
 	tbl := pl.rt
 	colNames := pl.colNames
+	// A PK match is at most one row, so LIMIT 0 or any OFFSET drops it.
+	if st.limit == 0 || st.offset > 0 {
+		return colNames, nil, nil
+	}
 	if keyVal.IsNull() {
 		return colNames, nil, nil
 	}
@@ -757,14 +765,17 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 		// tracks the LIMIT, not the matched-set size (offer reads/clones the live
 		// row under the shard lock). st.limit == 0 already returned above.
 		if st.limit >= 0 {
-			top := &topN{ord: pl.orderOrdinal, desc: st.orderDesc, capN: st.limit}
+			// Keep offset+limit rows so the offset can be dropped after sorting.
+			top := &topN{ord: pl.orderOrdinal, desc: st.orderDesc, capN: fetchBound(st.limit, st.offset)}
 			cand.emit(func(pk UUID) bool {
 				tbl.offerLiveRow(pk, pred, top)
 				return false
 			})
-			return colNames, projectRows(top.sorted(), st.starAll, pl.projOrdinals), nil
+			kept := sliceOffsetLimit(top.sorted(), st.offset, st.limit)
+			return colNames, projectRows(kept, st.starAll, pl.projOrdinals), nil
 		}
-		// ORDER BY without LIMIT: gather every match, then sort.
+		// ORDER BY without LIMIT: gather every match, then sort (OFFSET drops the
+		// leading rows).
 		var matched []Row
 		cand.emit(func(pk UUID) bool {
 			if r, ok := tbl.getByPK(pk); ok && pred(r) {
@@ -773,12 +784,14 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 			return false
 		})
 		sortRowsByCol(matched, pl.orderOrdinal, st.orderDesc)
-		return colNames, projectRows(matched, st.starAll, pl.projOrdinals), nil
+		kept := sliceOffsetLimit(matched, st.offset, st.limit)
+		return colNames, projectRows(kept, st.starAll, pl.projOrdinals), nil
 	}
 
-	// No ORDER BY: project and stop as soon as LIMIT is reached. Presize from the
-	// candidate count so a multi-row indexed read does not regrow the result slice.
-	out := make([]Row, 0, cand.capHint(st.limit))
+	// No ORDER BY: project and stop once offset+limit rows are collected. Presize
+	// from the candidate count so a multi-row indexed read does not regrow.
+	eff := fetchBound(st.limit, st.offset)
+	out := make([]Row, 0, cand.capHint(eff))
 	cand.emit(func(pk UUID) bool {
 		r, ok := tbl.getByPK(pk)
 		if !ok {
@@ -793,9 +806,9 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 		} else {
 			out = append(out, projectClone(r, pl.projOrdinals))
 		}
-		return st.limit >= 0 && len(out) >= st.limit
+		return eff >= 0 && len(out) >= eff
 	})
-	return colNames, out, nil
+	return colNames, sliceOffsetLimit(out, st.offset, st.limit), nil
 }
 
 // execSelectIdxOne is the single-row (QueryRow) form of execSelectIdx for a
@@ -922,7 +935,8 @@ func (db *DB) execSelectOrderedWalk(pl *plan, args []Value) ([]string, []Row, er
 		return a.less(b)
 	}
 
-	capHint := st.limit
+	eff := fetchBound(st.limit, st.offset) // collect offset+limit, drop offset at the end
+	capHint := eff
 	if capHint < 0 || capHint > 1024 {
 		capHint = 1024
 	}
@@ -964,7 +978,8 @@ func (db *DB) execSelectOrderedWalk(pl *plan, args []Value) ([]string, []Row, er
 			out = append(out, project(r))
 		}
 	}
-	for st.limit < 0 || len(out) < st.limit {
+walk:
+	for eff < 0 || len(out) < eff {
 		for idxOK() { // skip index entries shadowed by the dirty overlay
 			if _, d := dirtySet[snap[ii].pk]; !d {
 				break
@@ -985,10 +1000,38 @@ func (db *DB) execSelectOrderedWalk(pl *plan, args []Value) ([]string, []Row, er
 		case idxOK():
 			takeIdx()
 		default:
-			return colNames, out, nil // both streams exhausted
+			break walk // both streams exhausted
 		}
 	}
-	return colNames, out, nil
+	return colNames, sliceOffsetLimit(out, st.offset, st.limit), nil
+}
+
+// fetchBound is the number of in-order matches a LIMIT/OFFSET query collects
+// before discarding the first offset: offset+limit, or -1 (unbounded) when there
+// is no LIMIT. Early-stopping paths fetch this many (and the top-N heap keeps
+// this many); sliceOffsetLimit then drops the offset.
+func fetchBound(limit, offset int) int {
+	if limit < 0 {
+		return -1
+	}
+	return limit + offset
+}
+
+// sliceOffsetLimit returns the rows[offset : offset+limit] window: it drops the
+// first offset rows (offset<=0 is a no-op) then caps the rest at limit (limit<0
+// means to the end). For a path that already fetched exactly offset+limit rows
+// the cap is a no-op; the gather-all paths rely on it to apply both bounds.
+func sliceOffsetLimit(rows []Row, offset, limit int) []Row {
+	if offset > 0 {
+		if offset >= len(rows) {
+			return nil
+		}
+		rows = rows[offset:]
+	}
+	if limit >= 0 && limit < len(rows) {
+		rows = rows[:limit]
+	}
+	return rows
 }
 
 // execSelect runs the SELECT plan. Returns the columns and a slice of
@@ -1006,6 +1049,10 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 	// Project directly into the result row to skip the matched-list
 	// allocation and the full-row clone.
 	if pl.pkLookup {
+		// A PK match is at most one row, so LIMIT 0 or any OFFSET drops it.
+		if st.limit == 0 || st.offset > 0 {
+			return colNames, nil, nil
+		}
 		keyVal, err := evalExpr(pl.pkSource, &ctx)
 		if err != nil {
 			return nil, nil, err
@@ -1071,10 +1118,11 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 		if st.limit == 0 {
 			return colNames, nil, nil
 		}
-		// Cap the prealloc: a huge LIMIT over a small result must not allocate a
-		// giant slice up front. The scan still stops at st.limit; append grows
-		// past the hint only if that many rows actually match.
-		capHint := st.limit
+		// Collect offset+limit rows during the scan, then drop the offset. Cap the
+		// prealloc: a huge bound over a small result must not allocate a giant
+		// slice up front; append grows past the hint only if that many match.
+		eff := fetchBound(st.limit, st.offset)
+		capHint := eff
 		if capHint > 1024 {
 			capHint = 1024
 		}
@@ -1112,12 +1160,12 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 					packed = appendProjectClone(packed, r, pl.projOrdinals)
 				}
 				out = append(out, Row(packed[start:len(packed):len(packed)]))
-				if len(out) >= st.limit {
+				if len(out) >= eff {
 					break
 				}
 			}
 			s.mu.RUnlock()
-			return colNames, out, nil
+			return colNames, sliceOffsetLimit(out, st.offset, st.limit), nil
 		}
 		for i := range tbl.shards {
 			s := &tbl.shards[i]
@@ -1144,7 +1192,7 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 					packed = appendProjectClone(packed, r, pl.projOrdinals)
 				}
 				out = append(out, Row(packed[start:len(packed):len(packed)]))
-				if len(out) >= st.limit {
+				if len(out) >= eff {
 					stop = true
 					break
 				}
@@ -1154,7 +1202,7 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 				break
 			}
 		}
-		return colNames, out, nil
+		return colNames, sliceOffsetLimit(out, st.offset, st.limit), nil
 	}
 
 	scan := tbl.scanAll
@@ -1170,7 +1218,8 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 		if st.limit == 0 {
 			return colNames, nil, nil
 		}
-		top := topN{ord: pl.orderOrdinal, desc: st.orderDesc, capN: st.limit}
+		// Keep offset+limit rows so the offset can be dropped after sorting.
+		top := topN{ord: pl.orderOrdinal, desc: st.orderDesc, capN: fetchBound(st.limit, st.offset)}
 		scan(func(r Row) bool {
 			if st.where != nil {
 				ctx.row = r
@@ -1182,7 +1231,8 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 			top.offer(r)
 			return true
 		})
-		return colNames, projectRows(top.sorted(), st.starAll, pl.projOrdinals), nil
+		kept := sliceOffsetLimit(top.sorted(), st.offset, st.limit)
+		return colNames, projectRows(kept, st.starAll, pl.projOrdinals), nil
 	}
 
 	// ORDER BY without LIMIT, or no-ORDER-BY/no-LIMIT full scan: gather all
@@ -1202,9 +1252,7 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 	if pl.orderOrdinal >= 0 {
 		sortRowsByCol(matched, pl.orderOrdinal, st.orderDesc)
 	}
-	if st.limit >= 0 && st.limit < len(matched) {
-		matched = matched[:st.limit]
-	}
+	matched = sliceOffsetLimit(matched, st.offset, st.limit)
 	return colNames, projectRows(matched, st.starAll, pl.projOrdinals), nil
 }
 

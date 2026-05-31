@@ -283,6 +283,21 @@ func (p *parser) parseSelect() (*selectStmt, error) {
 		st.limit = n
 	}
 
+	// OFFSET m skips the first m matched rows. Standard order is LIMIT ... OFFSET
+	// ...; OFFSET alone (no LIMIT) is also valid — skip m, return the rest.
+	if p.peek().kind == tkOffset {
+		p.advance()
+		ot, err := p.expect(tkInt, "OFFSET integer")
+		if err != nil {
+			return nil, err
+		}
+		m, err := strconv.Atoi(ot.text)
+		if err != nil {
+			return nil, fmt.Errorf("%w: bad OFFSET integer: %v", ErrParse, err)
+		}
+		st.offset = m
+	}
+
 	return st, nil
 }
 

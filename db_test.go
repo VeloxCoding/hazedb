@@ -220,6 +220,140 @@ func TestSelectLimitRowsDoNotAppendAlias(t *testing.T) {
 	}
 }
 
+// ages extracts column `col` from every row as int64s — a small oracle helper
+// for OFFSET window assertions.
+func ages(rows []Row, col int) []int64 {
+	out := make([]int64, len(rows))
+	for i, r := range rows {
+		out[i] = r[col].Int()
+	}
+	return out
+}
+
+func eqInts(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// OFFSET on the ORDER BY paths (top-N heap when LIMIT is present, gather+sort
+// when it is not). Deterministic order lets us assert exact contents.
+func TestSelectOffsetOrderBy(t *testing.T) {
+	db := openMem(t)
+	for i, name := range []string{"alice", "bob", "carol", "dave", "erin"} {
+		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i+1), name, 20+i*5) // 20,25,30,35,40
+	}
+	cases := []struct {
+		sql  string
+		want []int64
+	}{
+		{"SELECT age FROM users ORDER BY age LIMIT 2 OFFSET 1", []int64{25, 30}},      // top-N + offset
+		{"SELECT age FROM users ORDER BY age DESC LIMIT 2 OFFSET 1", []int64{35, 30}}, // desc
+		{"SELECT age FROM users ORDER BY age OFFSET 2", []int64{30, 35, 40}},          // offset, no limit
+		{"SELECT age FROM users ORDER BY age LIMIT 2 OFFSET 0", []int64{20, 25}},      // offset 0 == none
+		{"SELECT age FROM users ORDER BY age LIMIT 10 OFFSET 4", []int64{40}},         // tail
+		{"SELECT age FROM users ORDER BY age LIMIT 5 OFFSET 10", nil},                 // beyond end → empty
+		{"SELECT age FROM users ORDER BY age LIMIT 0 OFFSET 1", nil},                  // limit 0 → empty
+	}
+	for _, c := range cases {
+		_, rows, err := db.Query(c.sql)
+		if err != nil {
+			t.Fatalf("%q: %v", c.sql, err)
+		}
+		if got := ages(rows, 0); !eqInts(got, c.want) {
+			t.Errorf("%q: got %v, want %v", c.sql, got, c.want)
+		}
+	}
+}
+
+// OFFSET on the no-ORDER-BY scan paths (scan-and-stop with LIMIT, gather without)
+// and the PK fast path. Scan order is undefined, so assert the offset window is
+// the matching slice of the full unoffset result, plus row counts.
+func TestSelectOffsetNoOrderByAndPK(t *testing.T) {
+	db := openMem(t)
+	for i := 0; i < 10; i++ {
+		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i+1), "u", 20+i)
+	}
+	_, all, _ := db.Query("SELECT age FROM users") // scan order, stable for this table
+
+	// OFFSET with no LIMIT == all[offset:].
+	_, off, _ := db.Query("SELECT age FROM users OFFSET 4")
+	if !eqInts(ages(off, 0), ages(all, 0)[4:]) {
+		t.Errorf("OFFSET 4: got %v, want %v", ages(off, 0), ages(all, 0)[4:])
+	}
+	// LIMIT + OFFSET == all[offset:offset+limit].
+	_, win, _ := db.Query("SELECT age FROM users LIMIT 3 OFFSET 5")
+	if !eqInts(ages(win, 0), ages(all, 0)[5:8]) {
+		t.Errorf("LIMIT 3 OFFSET 5: got %v, want %v", ages(win, 0), ages(all, 0)[5:8])
+	}
+	// OFFSET past the end → empty.
+	if _, r, _ := db.Query("SELECT age FROM users LIMIT 3 OFFSET 100"); len(r) != 0 {
+		t.Errorf("OFFSET 100: got %d rows, want 0", len(r))
+	}
+
+	// PK lookup: at most one row, so any OFFSET drops it; OFFSET 0 keeps it.
+	if _, r, _ := db.Query("SELECT age FROM users WHERE id = ? OFFSET 1", tid(3)); len(r) != 0 {
+		t.Errorf("PK OFFSET 1: got %d rows, want 0", len(r))
+	}
+	if _, r, _ := db.Query("SELECT age FROM users WHERE id = ? OFFSET 0", tid(3)); len(r) != 1 {
+		t.Errorf("PK OFFSET 0: got %d rows, want 1", len(r))
+	}
+	if _, row, _ := db.QueryRow("SELECT age FROM users WHERE id = ? OFFSET 1", tid(3)); row != nil {
+		t.Errorf("QueryRow PK OFFSET 1: got %v, want nil", row)
+	}
+}
+
+// Streaming reads (QueryEach / QueryJSON) must honour OFFSET identically to the
+// materialized Query, on both the scan and the no-ORDER-BY indexed paths.
+func TestSelectOffsetStreaming(t *testing.T) {
+	db := openMem(t)
+	for i := 0; i < 8; i++ {
+		db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i+1), "u", 20+i)
+	}
+	const sql = "SELECT age FROM users LIMIT 3 OFFSET 2"
+	_, want, _ := db.Query(sql)
+
+	var got []int64
+	if err := db.QueryEach(sql, nil, func(_ []string, row Row) bool {
+		got = append(got, row[0].Int())
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !eqInts(got, ages(want, 0)) {
+		t.Errorf("QueryEach OFFSET: got %v, want %v", got, ages(want, 0))
+	}
+}
+
+// The parser accepts LIMIT ... OFFSET ... and bare OFFSET, and rejects a
+// non-integer offset.
+func TestParseOffset(t *testing.T) {
+	db := openMem(t)
+	sel := func(sql string) *selectStmt {
+		t.Helper()
+		pl, err := db.prepare(sql, db.cat.Load())
+		if err != nil {
+			t.Fatalf("prepare %q: %v", sql, err)
+		}
+		return pl.st.(*selectStmt)
+	}
+	if st := sel("SELECT id FROM users LIMIT 5 OFFSET 3"); st.offset != 3 || st.limit != 5 {
+		t.Errorf("LIMIT 5 OFFSET 3: limit/offset = %d/%d, want 5/3", st.limit, st.offset)
+	}
+	if st := sel("SELECT id FROM users OFFSET 7"); st.offset != 7 || st.limit != -1 {
+		t.Errorf("bare OFFSET: limit/offset = %d/%d, want -1/7", st.limit, st.offset)
+	}
+	if _, err := db.prepare("SELECT id FROM users OFFSET x", db.cat.Load()); err == nil {
+		t.Error("OFFSET x should be a parse error")
+	}
+}
+
 // A []byte passed to INSERT/UPDATE must be cloned at the write boundary, so a
 // caller that mutates its slice after the call cannot corrupt stored state
 // (which would also diverge from the already-written WAL record).

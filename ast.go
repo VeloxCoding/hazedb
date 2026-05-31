@@ -12,6 +12,7 @@ type selectStmt struct {
 	orderCol  string // empty means no ORDER BY
 	orderDesc bool
 	limit     int // -1 means no LIMIT
+	offset    int // 0 means no OFFSET; skips the first offset matched rows
 }
 
 type insertStmt struct {

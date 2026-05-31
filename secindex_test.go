@@ -33,6 +33,44 @@ func TestIndexPointReadAndPlan(t *testing.T) {
 	}
 }
 
+// OFFSET on the index-backed read paths: indexed equality (with and without
+// ORDER BY) and the ordered-index walk. Merged so the index snapshot — not just
+// the dirty overlay — drives the result.
+func TestIndexOffset(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE posts (id uuid primary key, owner text, age int, INDEX (owner), ORDERED INDEX (age))")
+	for i := 0; i < 10; i++ {
+		db.Exec("INSERT INTO posts (id, owner, age) VALUES (?, ?, ?)", NewUUIDv7(), "o", i) // ages 0..9, one owner
+	}
+	db.mergeIndexes()
+
+	// Indexed equality + ORDER BY + LIMIT + OFFSET (execSelectIdx ORDER BY path).
+	if _, rows, err := db.Query("SELECT age FROM posts WHERE owner = ? ORDER BY age LIMIT 3 OFFSET 2", "o"); err != nil {
+		t.Fatal(err)
+	} else if got := ages(rows, 0); !eqInts(got, []int64{2, 3, 4}) {
+		t.Errorf("idx+order offset: got %v, want [2 3 4]", got)
+	}
+
+	// Indexed equality, no ORDER BY: emission order is undefined, so the offset
+	// window must be the matching slice of the full unoffset result.
+	_, full, _ := db.Query("SELECT age FROM posts WHERE owner = ?", "o")
+	_, win, _ := db.Query("SELECT age FROM posts WHERE owner = ? LIMIT 3 OFFSET 4", "o")
+	if !eqInts(ages(win, 0), ages(full, 0)[4:7]) {
+		t.Errorf("idx no-order offset: got %v, want %v", ages(win, 0), ages(full, 0)[4:7])
+	}
+
+	// Ordered-index walk + LIMIT + OFFSET (no equality index chosen).
+	if _, rows, err := db.Query("SELECT age FROM posts ORDER BY age LIMIT 3 OFFSET 5"); err != nil {
+		t.Fatal(err)
+	} else if got := ages(rows, 0); !eqInts(got, []int64{5, 6, 7}) {
+		t.Errorf("ordered-walk offset: got %v, want [5 6 7]", got)
+	}
+	// Ordered-index walk descending + OFFSET.
+	if _, rows, _ := db.Query("SELECT age FROM posts ORDER BY age DESC LIMIT 2 OFFSET 1"); !eqInts(ages(rows, 0), []int64{8, 7}) {
+		t.Errorf("ordered-walk desc offset: got %v, want [8 7]", ages(rows, 0))
+	}
+}
+
 // S2: incremental maintenance keeps the index correct across an indexed-column
 // UPDATE (old value gone, new value findable) and a DELETE.
 func TestIndexMaintainedOnUpdateDelete(t *testing.T) {
