@@ -81,14 +81,14 @@ func (db *DB) selectEach(pl *plan, args []Value, visit func(row Row) bool) ([]st
 	// Indexed equality: visit each candidate's live row under its shard lock
 	// (locked per row, like offerLiveRow).
 	if pl.idxLookup {
-		emit, _, ok, err := db.idxCandidates(pl, &ctx)
+		cand, ok, err := db.idxCandidates(pl, &ctx)
 		if err != nil {
 			return nil, err
 		}
 		if !ok {
 			return colNames, nil
 		}
-		emit(func(pk UUID) bool {
+		cand.emit(func(pk UUID) bool {
 			s := tbl.shardOf(pk)
 			s.mu.RLock()
 			stop := false

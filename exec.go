@@ -614,15 +614,70 @@ func (t *table) offerLiveRow(pk UUID, pred func(Row) bool, top *topN) {
 // evaluates the full WHERE on each live row. With an ORDER BY it gathers all
 // matches and sorts before LIMIT (the filtered-list pattern); otherwise it
 // projects and stops at LIMIT.
-// idxCandidates resolves the candidate-PK enumerator for an indexed SELECT and
-// returns emit(fn), which calls fn(pk) for each unique candidate (fn returns
-// true to stop). nhint is an upper bound on the candidate count (index hits +
-// dirty overlay, before dedup) — the materialized caller presizes its result
-// slice from it. ok=false means the result is provably empty (a NULL key, a
-// missing index, or no index hit AND no dirty overlay) — the caller returns no
-// rows. Shared by execSelectIdx (materialized) and selectEach (streaming) so the
-// hybrid index∪dirty correctness has a single definition.
-func (db *DB) idxCandidates(pl *plan, ctx *evalCtx) (emit func(func(pk UUID) bool), nhint int, ok bool, err error) {
+// idxCandidateSet is the candidate-PK enumerator for an indexed SELECT: the
+// (intersected) index hits UNION the dirty overlay. Returned by value — pks
+// aliases the index bucket and dirty aliases dirtyPKs(), so constructing it
+// allocates nothing, and emit takes its visitor as an argument rather than
+// being a heap closure that captures the slices (which escaped). Shared by
+// execSelectIdx (materialized) and selectEach (streaming) so the hybrid
+// index∪dirty correctness has a single definition.
+type idxCandidateSet struct {
+	pks   []UUID // index hits (intersected); already unique within the index
+	dirty []UUID // dirty overlay (mutated since the last merge); may overlap pks
+}
+
+// capHint is a result-slice capacity proportional to the candidate count,
+// capped by limit (the scan stops there) and an absolute ceiling (a huge
+// candidate set with no LIMIT must not prealloc pathologically). limit < 0
+// means no LIMIT.
+func (c idxCandidateSet) capHint(limit int) int {
+	n := len(c.pks) + len(c.dirty)
+	if limit >= 0 && limit < n {
+		n = limit
+	}
+	if n > 1024 {
+		n = 1024
+	}
+	return n
+}
+
+// emit visits each unique candidate PK once, calling fn (true to stop). The
+// index buckets are already unique, so a dedup set is built only when the dirty
+// overlay is non-empty (a PK may then be in both) — the steady-state read
+// (merged, dirty empty) walks the bucket with no per-candidate map.
+func (c idxCandidateSet) emit(fn func(pk UUID) bool) {
+	if len(c.dirty) == 0 {
+		for _, pk := range c.pks {
+			if fn(pk) {
+				return
+			}
+		}
+		return
+	}
+	seen := make(map[UUID]struct{}, len(c.pks)+len(c.dirty))
+	visit := func(pk UUID) bool {
+		if _, dup := seen[pk]; dup {
+			return false
+		}
+		seen[pk] = struct{}{}
+		return fn(pk)
+	}
+	for _, pk := range c.pks {
+		if visit(pk) {
+			return
+		}
+	}
+	for _, pk := range c.dirty {
+		if visit(pk) {
+			return
+		}
+	}
+}
+
+// idxCandidates resolves the candidate set for an indexed SELECT. ok=false means
+// the result is provably empty (a NULL key, a missing index, or no index hit AND
+// no dirty overlay) — the caller returns no rows.
+func (db *DB) idxCandidates(pl *plan, ctx *evalCtx) (cand idxCandidateSet, ok bool, err error) {
 	tbl := pl.rt
 	// Index side: one bucket per indexed equality conjunct, intersected. With
 	// two indexes (WHERE name = ? AND city = ?) this shrinks the candidate set
@@ -632,14 +687,14 @@ func (db *DB) idxCandidates(pl *plan, ctx *evalCtx) (emit func(func(pk UUID) boo
 	for i, ord := range pl.idxCols {
 		keyVal, err := evalExpr(pl.idxSrcs[i], ctx)
 		if err != nil {
-			return nil, 0, false, err
+			return idxCandidateSet{}, false, err
 		}
 		if keyVal.IsNull() {
-			return nil, 0, false, nil
+			return idxCandidateSet{}, false, nil
 		}
 		si := tbl.indexFor(ord)
 		if si == nil {
-			return nil, 0, false, nil
+			return idxCandidateSet{}, false, nil
 		}
 		bucket := si.lookup(keyOf(keyVal))
 		if i == 0 {
@@ -651,47 +706,15 @@ func (db *DB) idxCandidates(pl *plan, ctx *evalCtx) (emit func(func(pk UUID) boo
 			break // index side empty; the dirty overlay below may still match
 		}
 	}
-	// Hybrid candidate set: the (intersected) index hits UNION the dirty PKs
-	// (mutated since the last merge, membership uncertain). Every candidate's
-	// live row is evaluated against the FULL WHERE by the caller, so neither a
-	// stale entry, an unrelated dirty PK, nor an extra conjunct yields a wrong row.
+	// Hybrid candidate set: index hits UNION the dirty PKs (membership uncertain).
+	// Every candidate's live row is evaluated against the FULL WHERE by the
+	// caller, so neither a stale entry, an unrelated dirty PK, nor an extra
+	// conjunct yields a wrong row.
 	dirty := tbl.dirtyPKs()
 	if len(pks) == 0 && len(dirty) == 0 {
-		return nil, 0, false, nil
+		return idxCandidateSet{}, false, nil
 	}
-	// emit visits each candidate PK once, calling fn (stop on true). The index
-	// buckets are already unique, so a dedup set is only built when the dirty
-	// overlay is non-empty (a PK may then be in both) — the steady-state read
-	// (merged, dirty empty) walks the bucket with no per-candidate map.
-	emit = func(fn func(pk UUID) bool) {
-		if len(dirty) == 0 {
-			for _, pk := range pks {
-				if fn(pk) {
-					return
-				}
-			}
-			return
-		}
-		seen := make(map[UUID]struct{}, len(pks)+len(dirty))
-		visit := func(pk UUID) bool {
-			if _, dup := seen[pk]; dup {
-				return false
-			}
-			seen[pk] = struct{}{}
-			return fn(pk)
-		}
-		for _, pk := range pks {
-			if visit(pk) {
-				return
-			}
-		}
-		for _, pk := range dirty {
-			if visit(pk) {
-				return
-			}
-		}
-	}
-	return emit, len(pks) + len(dirty), true, nil
+	return idxCandidateSet{pks: pks, dirty: dirty}, true, nil
 }
 
 func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
@@ -701,7 +724,7 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 	if st.limit == 0 {
 		return colNames, nil, nil
 	}
-	emit, nhint, ok, err := db.idxCandidates(pl, ctx)
+	cand, ok, err := db.idxCandidates(pl, ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -725,7 +748,7 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 		// row under the shard lock). st.limit == 0 already returned above.
 		if st.limit >= 0 {
 			top := &topN{ord: pl.orderOrdinal, desc: st.orderDesc, capN: st.limit}
-			emit(func(pk UUID) bool {
+			cand.emit(func(pk UUID) bool {
 				tbl.offerLiveRow(pk, pred, top)
 				return false
 			})
@@ -733,7 +756,7 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 		}
 		// ORDER BY without LIMIT: gather every match, then sort.
 		var matched []Row
-		emit(func(pk UUID) bool {
+		cand.emit(func(pk UUID) bool {
 			if r, ok := tbl.getByPK(pk); ok && pred(r) {
 				matched = append(matched, r)
 			}
@@ -743,19 +766,10 @@ func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 		return colNames, projectRows(matched, st.starAll, pl.projOrdinals), nil
 	}
 
-	// No ORDER BY: project and stop as soon as LIMIT is reached. Presize to the
-	// candidate count so a multi-row indexed read does not regrow the result
-	// slice — capped by LIMIT (we stop there) and an absolute ceiling so a huge
-	// candidate set with no LIMIT does not prealloc pathologically.
-	capHint := nhint
-	if st.limit >= 0 && st.limit < capHint {
-		capHint = st.limit
-	}
-	if capHint > 1024 {
-		capHint = 1024
-	}
-	out := make([]Row, 0, capHint)
-	emit(func(pk UUID) bool {
+	// No ORDER BY: project and stop as soon as LIMIT is reached. Presize from the
+	// candidate count so a multi-row indexed read does not regrow the result slice.
+	out := make([]Row, 0, cand.capHint(st.limit))
+	cand.emit(func(pk UUID) bool {
 		r, ok := tbl.getByPK(pk)
 		if !ok {
 			return false
