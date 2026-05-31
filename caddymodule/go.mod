@@ -3,16 +3,21 @@
 // get no Caddy, no quic-go, no prometheus. Caddy-wrapper consumers pull this
 // submodule via xcaddy.
 //
-// The replace below points at the in-repo core during local builds and the
-// xcaddy/FrankenPHP build (the adapter needs core's db_registry.go + wire.go,
-// which post-date the latest core tag). For a tagged release: publish the core
-// version that contains them, bump the require, and drop the replace.
+// The require below pins a PUBLISHED core tag, so `go get` / xcaddy consumers
+// build against exactly that core. There is deliberately no `replace` to the
+// in-repo core: scripts/release.sh bumps this require in lockstep with the core
+// tag on every release, and a repo-root go.work is avoided on purpose (it would
+// drag Caddy into the core module's `go test ./...`, breaking its stdlib-clean
+// guarantee). To co-develop core + adapter before a core tag exists, add a
+// LOCAL-ONLY replace with `go mod edit -replace github.com/VeloxCoding/hazedb=../`
+// and do not commit it. The xcaddy/FrankenPHP build passes every module via
+// --with local paths, so it is independent of this require either way.
 module github.com/VeloxCoding/hazedb/caddymodule
 
 go 1.25.0
 
 require (
-	github.com/VeloxCoding/hazedb v0.1.3
+	github.com/VeloxCoding/hazedb v0.1.11
 	github.com/caddyserver/caddy/v2 v2.11.2
 )
 
@@ -144,5 +149,3 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 	modernc.org/sqlite v1.44.3 // indirect
 )
-
-replace github.com/VeloxCoding/hazedb => ../
