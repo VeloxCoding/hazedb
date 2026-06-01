@@ -28,7 +28,7 @@ every statement the parser accepts — but that set is a deliberate subset of SQ
 
 | area | accepted |
 |---|---|
-| DDL | `CREATE TABLE name (col TYPE …)` with `PRIMARY KEY` / `PARTITION KEY` constraints and `[ORDERED] INDEX [name] (col)` declarations; `DROP TABLE name` |
+| DDL | `CREATE TABLE name (col TYPE …)` with `PRIMARY KEY` / `PARTITION KEY` constraints and `[ORDERED] INDEX [name] (col[, col…])` declarations (a composite/multi-column index must be `ORDERED`); `DROP TABLE name` |
 | Column types | `int`, `text`/`string`, `bool`, `bytes`/`blob`, `uuid` |
 | Writes | `INSERT INTO … VALUES (…)`, `UPDATE … SET … WHERE …`, `DELETE FROM … WHERE …` |
 | `SELECT` | `*` or an explicit column list, `FROM t [alias]`, optional `WHERE`, `ORDER BY col [ASC\|DESC]`, `LIMIT n`, `OFFSET m` |
@@ -39,6 +39,98 @@ every statement the parser accepts — but that set is a deliberate subset of SQ
 **Primary key:** every table has exactly one PK, type `uuid`. INSERT
 auto-generates a UUIDv7 when the id is omitted; supply your own (any canonical
 UUID string) only when the app needs to address the row later.
+
+## CREATE TABLE — full syntax
+
+```sql
+CREATE TABLE name (
+    col_name TYPE [constraints],
+    ...,
+    [ORDERED] INDEX [index_name] (col[, col…])
+)
+```
+
+**Column constraints** (any order, all optional):
+
+| constraint | meaning |
+|---|---|
+| `PRIMARY KEY` | required PK column (exactly one, type `uuid`) |
+| `PARTITION KEY` | co-locates rows sharing this value into one shard |
+| `IMMUTABLE` | value set on INSERT, rejected on UPDATE |
+| `NULL` | column is nullable (default is `NOT NULL`) |
+| `NOT NULL` | explicit — same as the default |
+
+**Index variants:**
+
+| syntax | type | serves |
+|---|---|---|
+| `INDEX (col)` | hash | `WHERE col = ?` lookups |
+| `ORDERED INDEX (col)` | sorted | `WHERE col = ?` + `ORDER BY col` walks |
+| `ORDERED INDEX (a, b)` | sorted, composite | `WHERE a = ?`, `WHERE a = ? AND b = ?`, and the killer `WHERE a = ? ORDER BY b` (no sort) — see *Composite indexes* below |
+| `INDEX name (col)` | hash, named | same as hash; name is optional metadata |
+| `ORDERED INDEX name (col)` | sorted, named | same as ordered |
+
+A composite index must be `ORDERED` (the hash form would only serve exact
+whole-tuple equality — no better than the bucket intersection the planner already
+does) and all its columns must be `NOT NULL` (a `(a=X, b=NULL)` row matches
+`WHERE a=?` but a composite never indexes a row with a NULL component, so a
+nullable-component composite would miss it — such a query falls back to a scan).
+
+**Examples:**
+
+```sql
+-- Minimal
+CREATE TABLE users (id uuid primary key, name text, age int)
+
+-- Hash index: equality lookups
+CREATE TABLE users (id uuid primary key, email text, INDEX (email))
+
+-- Named hash index
+CREATE TABLE users (id uuid primary key, name text, INDEX by_name (name))
+
+-- Ordered index: equality lookups + ORDER BY walks (no full scan)
+CREATE TABLE posts (id uuid primary key, score int, ORDERED INDEX (score))
+
+-- Multiple indexes on one table
+CREATE TABLE users (
+    id uuid primary key,
+    name text,
+    email text,
+    INDEX (email),
+    ORDERED INDEX (name)
+)
+
+-- Composite (must be ORDERED): serves WHERE author = ? ORDER BY title with no
+-- sort, the per-author list-view pattern
+CREATE TABLE posts (
+    id uuid primary key,
+    author uuid,
+    title text,
+    ORDERED INDEX (author, title)
+)
+
+-- All constraint types combined
+CREATE TABLE messages (
+    id   uuid primary key,
+    thread uuid partition key,
+    seq  int  immutable,
+    body text null,
+    INDEX (thread)
+)
+```
+
+**Rejected — will error:**
+
+| case | example | error |
+|---|---|---|
+| Hash composite index | `INDEX (a, b)` | "composite index must be ORDERED" (use `ORDERED INDEX (a, b)`) |
+| Index on the PK column | `INDEX (id)` | rejected at plan time |
+| Index repeating a column | `ORDERED INDEX (a, a)` | rejected |
+| Duplicate index on same column | two `INDEX (email)` | rejected |
+| Index on a partitioned table | table has `PARTITION KEY` + `INDEX` | rejected |
+| Re-creating an existing table | `CREATE TABLE users …` twice | `ErrTableExists` |
+| `ALTER TABLE` | not in the grammar | parse error |
+| `IF NOT EXISTS` | not in the grammar | parse error |
 
 ## Secondary indexes
 
@@ -91,9 +183,44 @@ testbed reproduces the SQLite comparison):
   one-time, in the background (every 50 ms) or once at boot after WAL replay.
 
 **Limits:** non-partitioned tables only (an `INDEX` on a partitioned table is
-rejected); single-column only (no composite).
+rejected). Composite (multi-column) indexes are supported in the `ORDERED` form
+with `NOT NULL` columns — see below.
+
+### Composite indexes
+
+`ORDERED INDEX (a, b)` stores rows ordered by the `(a, b)` tuple, so a query
+pinning a leading prefix is served directly:
+
+- **`WHERE a = ?`** — a prefix lookup (every row under that `a`). ~310 ns whether
+  the prefix holds 50 or 5000 rows — O(1) in bucket size.
+- **`WHERE a = ? AND b = ?`** — an exact tuple lookup to ~1 row.
+- **`WHERE a = ? ORDER BY b [LIMIT n]`** — the killer: the `a = ?` sub-range is
+  *already sorted by `b`*, so the walk emits in order and stops at `LIMIT` — **no
+  sort, no whole-bucket fetch.** Measured ~1.6 µs / 27 allocs at a 5000-row
+  bucket vs ~196 µs for the single-column gather-then-sort — ~124×, and **flat in
+  bucket size**. Concurrent readers scale (≈1.0 µs/op across 32 cores).
+
+**In a join**, a composite `(joinkey, ordercol)` on the probed table serves a
+probe-side `ORDER BY` the same way: the single-driver case walks the probe in
+order and stops at `LIMIT`. The headline `posts p JOIN users u ON p.author = u.id
+WHERE u.name = ? ORDER BY p.title LIMIT 10 OFFSET 20` runs in ~4.9 µs — ~4× the
+single-column top-N plan, and faster than the same query on SQLite `:memory:`.
+
+**Rules:** composite must be `ORDERED` (a hash composite only serves exact
+whole-tuple equality — no better than bucket intersection — and is rejected);
+all components must be `NOT NULL` (else a NULL-component row matching the prefix
+would be missing from the index, so the planner falls back to a scan); only a
+contiguous leading prefix can be pinned (`(a, b)` serves `WHERE a = ?` but not
+`WHERE b = ?` alone). Maintenance cost is ~1 alloc/row on the background merge —
+on par with a single single-column index.
 
 ### `ORDER BY` cost on very large buckets
+
+A *single-column* index ordered by a *different* column than the filter still
+ranks the whole bucket (the case below). When the hot pattern is `WHERE key = ?
+ORDER BY sortcol`, an `ORDERED INDEX (key, sortcol)` composite removes that cost
+structurally — the walk above is flat in bucket size. The remarks below apply to
+the single-column case where no such composite exists.
 
 Index-assisted `ORDER BY` scales with how many rows share the filter value (the
 bucket), not with the `LIMIT`. A `LIMIT n` keeps only the top `n` via a heap, so
