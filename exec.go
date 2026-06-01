@@ -760,6 +760,30 @@ func (t *table) offerLiveRow(pk UUID, pred func(Row) bool, top *topN) {
 	s.mu.RUnlock()
 }
 
+// getMatchProject fetches pk's live row, evaluates pred (the full WHERE) on it
+// UNDER the shard read lock, and on a pass returns the projection: the ords
+// columns cloned, or the whole row for SELECT *. Folding the WHERE check into the
+// lock lets an indexed read skip the full-row clone getByPK takes only to
+// evaluate and then project from — it clones just the columns it returns.
+// Mirrors offerLiveRow; the secondary-index path is non-partitioned.
+func (t *table) getMatchProject(pk UUID, pred func(Row) bool, ords []int, starAll bool) (Row, bool) {
+	s := t.shardOf(pk)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rowID, ok := s.pk[pk]
+	if !ok {
+		return nil, false
+	}
+	r := s.rows[rowID]
+	if r == nil || !pred(r) {
+		return nil, false
+	}
+	if starAll {
+		return r.Clone(), true
+	}
+	return projectClone(r, ords), true
+}
+
 // execSelectIdx runs a SELECT whose WHERE pins one or more secondary-indexed
 // columns by equality. It resolves candidate PKs through the index(es)
 // (intersecting buckets for an AND of equalities) plus the dirty overlay, then
@@ -935,20 +959,17 @@ func (db *DB) execCandidates(pl *plan, ctx *evalCtx, cand idxCandidateSet) ([]st
 	// from the candidate count so a multi-row indexed read does not regrow.
 	eff := fetchBound(st.limit, st.offset)
 	out := make([]Row, 0, cand.capHint(eff))
+	pred := func(r Row) bool {
+		ctx.row = r
+		v, err := evalExpr(st.where, ctx)
+		return err == nil && truthy(v)
+	}
 	cand.emit(func(pk UUID) bool {
-		r, ok := tbl.getByPK(pk)
+		r, ok := tbl.getMatchProject(pk, pred, pl.projOrdinals, st.starAll)
 		if !ok {
 			return false
 		}
-		ctx.row = r
-		if v, err := evalExpr(st.where, ctx); err != nil || !truthy(v) {
-			return false
-		}
-		if st.starAll {
-			out = append(out, r)
-		} else {
-			out = append(out, projectClone(r, pl.projOrdinals))
-		}
+		out = append(out, r)
 		return eff >= 0 && len(out) >= eff
 	})
 	return colNames, sliceOffsetLimit(out, st.offset, st.limit), nil
@@ -990,19 +1011,13 @@ func (db *DB) execSelectIdxOne(pl *plan, args []Value) ([]string, Row, error) {
 			break
 		}
 	}
-	try := func(pk UUID) (Row, bool) {
-		r, ok := tbl.getByPK(pk)
-		if !ok {
-			return nil, false
-		}
+	pred := func(r Row) bool {
 		ctx.row = r
-		if v, err := evalExpr(st.where, &ctx); err != nil || !truthy(v) {
-			return nil, false
-		}
-		if st.starAll {
-			return r, true
-		}
-		return projectClone(r, pl.projOrdinals), true
+		v, err := evalExpr(st.where, &ctx)
+		return err == nil && truthy(v)
+	}
+	try := func(pk UUID) (Row, bool) {
+		return tbl.getMatchProject(pk, pred, pl.projOrdinals, st.starAll)
 	}
 	for _, pk := range pks {
 		if r, ok := try(pk); ok {
