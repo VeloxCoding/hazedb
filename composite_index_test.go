@@ -502,6 +502,76 @@ func TestJoinStreamingDriverNoWhere(t *testing.T) {
 	}
 }
 
+// seedCatJoin builds users(name) + posts(author uuid, cat, title) with the given
+// posts index, one user "alice" with tech/food posts (titles out of order) — for
+// driver composite-prefix-walk tests (WHERE p.cat = ? ORDER BY p.title).
+func seedCatJoin(t *testing.T, postsIdx string) *DB {
+	t.Helper()
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE users (id uuid primary key, name text)")
+	db.Exec("CREATE TABLE posts (id uuid primary key, author uuid, cat text, title text, " + postsIdx + ")")
+	u := NewUUIDv7()
+	db.Exec("INSERT INTO users (id, name) VALUES (?, ?)", u, "alice")
+	for _, ct := range []struct{ cat, title string }{
+		{"tech", "delta"}, {"tech", "alpha"}, {"tech", "charlie"}, {"tech", "bravo"}, {"food", "zzz"},
+	} {
+		db.Exec("INSERT INTO posts (id, author, cat, title) VALUES (?, ?, ?, ?)", NewUUIDv7(), u, ct.cat, ct.title)
+	}
+	db.mergeIndexes()
+	return db
+}
+
+// Driver composite-prefix walk: WHERE pins the leading column of a composite and
+// ORDER BY is the next column → walk that prefix in order. Must match the
+// materialise+sort path (ref: single-column INDEX (cat)) across ASC/DESC/LIMIT/OFFSET.
+func TestJoinDriverCompWalkCrossCheck(t *testing.T) {
+	walk := seedCatJoin(t, "ORDERED INDEX (cat, title)")
+	ref := seedCatJoin(t, "INDEX (cat)")
+	q := "SELECT p.title FROM posts p JOIN users u ON p.author = u.id WHERE p.cat = ? ORDER BY p.title"
+	if pl, _ := walk.prepare(q, walk.cat.Load()); pl.joinPlan == nil || !pl.joinPlan.driverCompWalk {
+		t.Fatalf("walk db should use driverCompWalk: %+v", pl.joinPlan)
+	}
+	if pl, _ := ref.prepare(q, ref.cat.Load()); pl.joinPlan != nil && pl.joinPlan.driverCompWalk {
+		t.Fatal("ref db should NOT use driverCompWalk")
+	}
+	for _, qq := range []string{q, q + " LIMIT 2", q + " LIMIT 2 OFFSET 1", q + " DESC", q + " DESC LIMIT 2 OFFSET 1"} {
+		_, wr, we := walk.Query(qq, "tech")
+		_, rr, re := ref.Query(qq, "tech")
+		if we != nil || re != nil {
+			t.Fatalf("%q: walk %v ref %v", qq, we, re)
+		}
+		if join(strs(wr, 0)) != join(strs(rr, 0)) {
+			t.Fatalf("%q: walk %v != ref %v", qq, strs(wr, 0), strs(rr, 0))
+		}
+	}
+}
+
+// Driver composite-prefix walk over a LEFT join (the codex weak spot): the
+// preserved driver is walked at the cat-prefix in title order, an orphan is
+// padded in place, and a not-yet-merged row merges into the walk.
+func TestJoinDriverCompWalkLeft(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE users (id uuid primary key, name text)")
+	db.Exec("CREATE TABLE posts (id uuid primary key, author uuid, cat text, title text, ORDERED INDEX (cat, title))")
+	u := NewUUIDv7()
+	db.Exec("INSERT INTO users (id, name) VALUES (?, ?)", u, "alice")
+	db.Exec("INSERT INTO posts (id, author, cat, title) VALUES (?, ?, ?, ?)", NewUUIDv7(), u, "tech", "beta")
+	db.Exec("INSERT INTO posts (id, author, cat, title) VALUES (?, ?, ?, ?)", NewUUIDv7(), NewUUIDv7(), "tech", "alpha") // orphan
+	db.mergeIndexes()
+	q := "SELECT p.title, u.name FROM posts p LEFT JOIN users u ON p.author = u.id WHERE p.cat = ? ORDER BY p.title"
+	if pl, _ := db.prepare(q, db.cat.Load()); pl.joinPlan == nil || !pl.joinPlan.driverCompWalk {
+		t.Fatalf("LEFT should use driverCompWalk: %+v", pl.joinPlan)
+	}
+	_, rows, err := db.Query(q, "tech")
+	if err != nil || len(rows) != 2 || rows[0][0].Str() != "alpha" || !rows[0][1].IsNull() || rows[1][0].Str() != "beta" {
+		t.Fatalf("LEFT driverCompWalk: %v err=%v", rows, err)
+	}
+	db.Exec("INSERT INTO posts (id, author, cat, title) VALUES (?, ?, ?, ?)", NewUUIDv7(), u, "tech", "aaa") // dirty
+	if _, r2, _ := db.Query(q+" LIMIT 1", "tech"); len(r2) != 1 || r2[0][0].Str() != "aaa" {
+		t.Fatalf("dirty driverCompWalk: want aaa first, got %v", strs(r2, 0))
+	}
+}
+
 // Codex regression: driver-pushdown must fetch through a composite index's
 // LEADING column (probeIndexFor), not only single-column indexes — else a driver
 // filtered on a composite-only column falls back to a full scan (the slow

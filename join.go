@@ -65,6 +65,16 @@ type joinPlan struct {
 	// column's within-driver ordinal. INNER and OUTER (drives the preserved side).
 	driverWalk    bool
 	driverSortOrd int
+
+	// driverCompWalk: the driver's WHERE pins the leading column(s) of a composite
+	// ORDERED index and ORDER BY is the next column — walk that prefix in order
+	// (the driver analog of the single-table composite walk / probeWalk), probe
+	// each, early-stop. Supersedes the pushdown fetch + sort. driverCompOrdinals is
+	// the index's column list (within driver); driverCompPrefixSrcs yields the
+	// pinned leading values. INNER and OUTER.
+	driverCompWalk       bool
+	driverCompOrdinals   []int
+	driverCompPrefixSrcs []expr
 }
 
 // planJoin resolves the two tables, binds every column to a global concat-row
@@ -349,6 +359,13 @@ func (db *DB) planJoin(pl *plan, st *selectStmt, cat *catalog) error {
 	if jp.orderOrdinal >= 0 && !jp.probeWalk {
 		jp.planDriverWalk()
 	}
+	// Driver composite-prefix walk: the driver's WHERE pins the leading column(s)
+	// of a composite ordered index and ORDER BY is the next column — walk that
+	// prefix in order (this is the lever for a filtered LEFT join, where probeWalk
+	// does not apply). driverWalk (unfiltered single-column) takes precedence.
+	if jp.orderOrdinal >= 0 && !jp.probeWalk && !jp.driverWalk {
+		jp.planDriverCompWalk(driverConj, driverOff)
+	}
 
 	// Pre-escape the output column names for the streaming JSON encoder, as the
 	// single-table planner does.
@@ -414,6 +431,61 @@ func (jp *joinPlan) planDriverWalk() {
 	}
 	jp.driverSortOrd = sortWithin
 	jp.driverWalk = true
+}
+
+// planDriverCompWalk sets driverCompWalk when the driver's WHERE pins a
+// contiguous leading prefix of a composite ORDERED index and ORDER BY is the
+// first unpinned column of that index — so probing one prefix yields the driver
+// rows already ordered by the sort column (the driver analog of the single-table
+// composite walk; covers the filtered LEFT join, where probeWalk cannot apply).
+func (jp *joinPlan) planDriverCompWalk(driverConj []expr, driverOff int) {
+	driverWidth := jp.nLeft
+	if !jp.driverIsLeft {
+		driverWidth = jp.nRight
+	}
+	orderWithin := jp.orderOrdinal - driverOff
+	if orderWithin < 0 || orderWithin >= driverWidth {
+		return // ORDER BY is not on the driver table
+	}
+	// pinned: within-driver ordinal -> value expr, from the driver's equality conjuncts.
+	pinned := map[int]expr{}
+	for _, p := range driverConj {
+		if b, ok := p.(*binOp); ok && b.op == tkEq {
+			if cr, val := colAndLit(b); cr != nil {
+				if within := cr.ord - driverOff; within >= 0 && within < driverWidth {
+					pinned[within] = val
+				}
+			}
+		}
+	}
+	if len(pinned) == 0 {
+		return
+	}
+	rt := jp.driverRT.def
+	for i := range rt.indexes {
+		ri := &rt.indexes[i]
+		if !ri.ordered || len(ri.ordinals) < 2 || rt.anyNullable(ri.ordinals) {
+			continue
+		}
+		k := 0
+		for k < len(ri.ordinals) {
+			if _, has := pinned[ri.ordinals[k]]; !has {
+				break
+			}
+			k++
+		}
+		if k == 0 || k >= len(ri.ordinals) || ri.ordinals[k] != orderWithin {
+			continue // need ≥1 pinned leading column AND ORDER BY as the next column
+		}
+		srcs := make([]expr, k)
+		for j := 0; j < k; j++ {
+			srcs[j] = pinned[ri.ordinals[j]]
+		}
+		jp.driverCompOrdinals = ri.ordinals
+		jp.driverCompPrefixSrcs = srcs
+		jp.driverCompWalk = true
+		return
+	}
 }
 
 // bindJoinExpr walks a WHERE expression and binds each colRef to its global
@@ -581,8 +653,9 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 	ordered := jp.orderOrdinal >= 0
 	streaming := jp.driverIdxSrc == nil && !ordered
 	var drivers []Row
-	if jp.driverIdxSrc != nil {
-		// Indexed driver fetch: key from the equality's value side.
+	if jp.driverIdxSrc != nil && !jp.driverCompWalk {
+		// Indexed driver fetch: key from the equality's value side. (Skipped for a
+		// driver composite walk, which pulls the driver via its own prefix walk.)
 		kctx := evalCtx{args: args}
 		key, err := evalExpr(jp.driverIdxSrc, &kctx)
 		if err != nil {
@@ -594,7 +667,7 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 			}
 			return false
 		})
-	} else if !streaming && !jp.driverWalk {
+	} else if jp.driverIdxSrc == nil && !streaming && !jp.driverWalk {
 		jp.driverRT.scanAll(func(r Row) bool {
 			if passDriver(r) {
 				drivers = append(drivers, r.Clone())
@@ -751,12 +824,52 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 		}
 	}
 
-	// Driver ordered walk: ORDER BY is on a driver column with an ordered index and
-	// the driver is a full scan. Walk the driver in ORDER BY order (index ∪ dirty),
-	// probe each, emit matched (OUTER pads a miss), and stop at offset+limit results
-	// — no full materialise, no sort. Reuses mergeOrderedStreams on the driver.
-	if jp.driverWalk {
-		if si := jp.driverRT.indexFor(jp.driverSortOrd); si != nil {
+	// Driver ordered walk: ORDER BY a driver column reachable in order — either a
+	// single-column ordered index over the whole driver (driverWalk), or a
+	// composite (filter…, ordercol) whose leading columns the WHERE pins, walked at
+	// that prefix (driverCompWalk, the filtered-LEFT lever). Walk the driver in
+	// ORDER BY order (index ∪ dirty), probe each, emit matched (OUTER pads a miss),
+	// stop at offset+limit — no full materialise, no sort. Reuses mergeOrderedStreams.
+	if jp.driverWalk || jp.driverCompWalk {
+		var snap []ordEntry
+		var dirtyKey func(Row) indexKey
+		walkable := false
+		if jp.driverCompWalk {
+			if si := jp.driverRT.indexByOrdinals(jp.driverCompOrdinals); si != nil {
+				prefix := make([]Value, len(jp.driverCompPrefixSrcs))
+				nullPrefix := false
+				for i, src := range jp.driverCompPrefixSrcs {
+					v, err := evalExpr(src, &ctx)
+					if err != nil {
+						return nil, nil, err
+					}
+					if v.IsNull() {
+						nullPrefix = true
+						break
+					}
+					prefix[i] = v
+				}
+				if nullPrefix {
+					return colNames, nil, nil // WHERE pins the prefix to NULL → no driver rows
+				}
+				ords := si.ordinals
+				snap = si.snapshotPrefix(encodeCompositeKey(prefix))
+				dirtyKey = func(r Row) indexKey {
+					cells := make([]Value, len(ords))
+					for i, o := range ords {
+						cells[i] = r[o]
+					}
+					return encodeCompositeKey(cells)
+				}
+				walkable = true
+			}
+		} else if si := jp.driverRT.indexFor(jp.driverSortOrd); si != nil {
+			ord := jp.driverSortOrd
+			snap = si.snapshot()
+			dirtyKey = func(r Row) indexKey { return keyOf(r[ord]) }
+			walkable = true
+		}
+		if walkable {
 			var out []Row
 			concat := make(Row, nLeft+nRight)
 			appendJoined := func(drow Row) {
@@ -792,9 +905,9 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 					}
 				}
 			}
-			dc, dirtySet := jp.driverRT.buildDirtyCands(passDriver, func(r Row) indexKey { return keyOf(r[jp.driverSortOrd]) })
+			dc, dirtySet := jp.driverRT.buildDirtyCands(passDriver, dirtyKey)
 			done := func() bool { return eff >= 0 && len(out) >= eff }
-			mergeOrderedStreams(si.snapshot(), dc, dirtySet, st.orderDesc, done,
+			mergeOrderedStreams(snap, dc, dirtySet, st.orderDesc, done,
 				func(pk UUID) {
 					if r, ok := jp.driverRT.getByPK(pk); ok && passDriver(r) {
 						appendJoined(r)

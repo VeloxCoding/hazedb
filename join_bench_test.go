@@ -218,6 +218,51 @@ func BenchmarkJoinFiltered_SQLiteMem(b *testing.B) {
 	}
 }
 
+// LEFT join filtered on the driver (posts) with ORDER BY the trailing column:
+// SELECT p.title, u.name FROM posts p LEFT JOIN users u ON p.author = u.id
+// WHERE p.author = ? ORDER BY p.title LIMIT 10 OFFSET 20.
+// On the composite (author,title) dataset this is the driver composite-prefix
+// walk; on the single-column INDEX(author) dataset it is fetch-author-then-sort.
+const joinLeftSQL = "SELECT p.title, u.name FROM posts p LEFT JOIN users u ON p.author = u.id WHERE p.author = ? ORDER BY p.title LIMIT 10 OFFSET 20"
+
+func BenchmarkJoinLeftFiltered_Hazedb(b *testing.B) { // single-col INDEX(author): fetch + sort
+	db := joinHazedb(b)
+	arg := UUIDVal(tid(8)) // user0007's id; ~100 posts
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, rows, err := db.QueryValues(joinLeftSQL, arg); err != nil || len(rows) != 10 {
+			b.Fatalf("rows=%d err=%v", len(rows), err)
+		}
+	}
+}
+
+func BenchmarkJoinLeftFiltered_HazedbComposite(b *testing.B) { // ORDERED INDEX(author,title): driver walk
+	db := joinHazedbComposite(b)
+	arg := UUIDVal(tid(8))
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, rows, err := db.QueryValues(joinLeftSQL, arg); err != nil || len(rows) != 10 {
+			b.Fatalf("rows=%d err=%v", len(rows), err)
+		}
+	}
+}
+
+func BenchmarkJoinLeftFiltered_SQLiteMem(b *testing.B) {
+	stmt, err := joinSQLite(b).Prepare(joinLeftSQL)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer stmt.Close()
+	arg := key16(8)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		scanSQLiteJoin(b, stmt, 10, arg)
+	}
+}
+
 // No WHERE, no ORDER BY, just LIMIT — the cheapest join shape (can stop early in
 // phase 2), but v1 still materialises the whole driver in phase 1.
 func BenchmarkJoinNoWhereLimit_Hazedb(b *testing.B) {
