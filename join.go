@@ -486,10 +486,12 @@ func (db *DB) probeRows(tbl *tableRT, onOrd int, byPK bool, key Value, fn func(R
 	})
 }
 
-// execJoin runs a two-table indexed nested-loop join: materialise the driver
-// (so no driver lock is held across the probe), probe the other side per row,
-// assemble [left..right..] concat rows, filter by the full WHERE, then sort /
-// OFFSET / LIMIT / project on the result.
+// execJoin runs a two-table indexed nested-loop join: feed driver rows (never
+// holding a driver lock across the probe), probe the other side per row, assemble
+// [left..right..] concat rows, filter by the full WHERE, then sort / OFFSET /
+// LIMIT / project on the result. The driver is materialised when it is
+// index-fetched or an ORDER BY needs all of it; a scanned no-ORDER-BY driver is
+// streamed chunk by chunk with early-stop (see drive).
 func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 	st := pl.st.(*selectStmt)
 	jp := pl.joinPlan
@@ -529,6 +531,13 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 		}
 		return true
 	}
+	// A scanned driver with no ORDER BY can STREAM: drive() pulls it chunk by chunk
+	// and stops at offset+limit instead of materialising the whole table up front
+	// (the result order is undefined, so any offset+limit rows are valid). With an
+	// ORDER BY every driver must be seen to sort, and an index-fetched driver is
+	// already bounded — both materialise here.
+	ordered := jp.orderOrdinal >= 0
+	streaming := jp.driverIdxSrc == nil && !ordered
 	var drivers []Row
 	if jp.driverIdxSrc != nil {
 		// Indexed driver fetch: key from the equality's value side.
@@ -543,7 +552,7 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 			}
 			return false
 		})
-	} else {
+	} else if !streaming {
 		jp.driverRT.scanAll(func(r Row) bool {
 			if passDriver(r) {
 				drivers = append(drivers, r.Clone())
@@ -554,7 +563,6 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 
 	// Phase 2: probe + assemble, holding no driver lock.
 	eff := fetchBound(st.limit, st.offset)
-	ordered := jp.orderOrdinal >= 0
 
 	// passResidual applies the WHERE conjuncts NOT already pushed into the driver
 	// (probe-side / cross-table / constant). Driver conjuncts ran in passDriver, so
@@ -588,15 +596,17 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 			}
 		}
 	}
-	// drive iterates the materialised drivers, probing each and calling emit(left,
-	// right) per matched pair — plus once with the padded side nil for an unmatched
-	// OUTER driver (LEFT pads right, RIGHT pads left). emit returns true to stop the
-	// whole join early; drive returns when emit stops or the drivers are exhausted.
+	// drive feeds driver rows to emit(left, right) per matched pair — plus once with
+	// the padded side nil for an unmatched OUTER driver (LEFT pads right, RIGHT pads
+	// left). emit returns true to stop the whole join early. A materialised driver
+	// (index-fetched, or an ORDER BY scan) is iterated directly; a streaming driver
+	// is pulled chunk by chunk via scanShardsBatched (clone under the shard lock,
+	// release, probe — no driver lock held across the probe), so emit's early-stop
+	// avoids materialising the rest of the table.
 	drive := func(emit func(left, right Row) bool) {
-		for _, drow := range drivers {
-			key := drow[jp.driverOnOrd]
+		probeAndEmit := func(drow Row) bool { // returns true to stop the whole join
 			matched, stop := false, false
-			db.probeRows(jp.probeRT, jp.probeOnOrd, jp.probeByPK, key, func(prow Row) bool {
+			db.probeRows(jp.probeRT, jp.probeOnOrd, jp.probeByPK, drow[jp.driverOnOrd], func(prow Row) bool {
 				matched = true
 				left, right := drow, prow
 				if !jp.driverIsLeft {
@@ -609,21 +619,43 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 				return false
 			})
 			if stop {
-				return
+				return true
 			}
 			if !matched {
-				var so bool
 				switch jp.typ {
 				case tkLeft:
-					so = emit(drow, nil)
+					return emit(drow, nil)
 				case tkRight:
-					so = emit(nil, drow)
+					return emit(nil, drow)
 				}
-				if so {
+			}
+			return false
+		}
+		if !streaming {
+			for _, drow := range drivers {
+				if probeAndEmit(drow) {
 					return
 				}
 			}
+			return
 		}
+		// Size the clone-chunk to the output bound: a small LIMIT should clone ~its
+		// own size, not a fixed 256, before the first probe. Floor 32 absorbs probe
+		// misses without an extra lock cycle; unbounded (eff<0) uses 256.
+		chunk := 256
+		if eff >= 0 && eff < chunk {
+			if chunk = eff; chunk < 32 {
+				chunk = 32
+			}
+		}
+		jp.driverRT.scanShardsBatched(chunk, passDriver, func(batch []Row) bool {
+			for _, dr := range batch {
+				if probeAndEmit(dr) {
+					return true
+				}
+			}
+			return false
+		})
 	}
 
 	// Single-driver probe walk: ORDER BY is on a probe column backed by a composite

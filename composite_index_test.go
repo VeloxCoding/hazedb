@@ -2,6 +2,7 @@ package hazedb
 
 import (
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -407,6 +408,49 @@ func TestJoinProbeWalkDirtyOverlay(t *testing.T) {
 	}
 	if got := strs(rows, 0); join(got) != "alpha,bravo,charlie,delta" {
 		t.Fatalf("probe walk dirty merge order wrong: %v", got)
+	}
+}
+
+// Streaming driver: a no-WHERE no-ORDER-BY join with LIMIT must early-stop
+// without materialising the whole driver — across multiple shards/chunks
+// (chunk=256) — and stay correct: exact count at LIMIT, full count without, and
+// LEFT must still emit the orphan miss in the streamed path.
+func TestJoinStreamingDriverNoWhere(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE users (id uuid primary key, name text)")
+	db.Exec("CREATE TABLE posts (id uuid primary key, author uuid, title text, INDEX (author))")
+	u := NewUUIDv7()
+	db.Exec("INSERT INTO users (id, name) VALUES (?, ?)", u, "alice")
+	const n = 700 // > chunk (256) and spans shards: exercises chunk-resume
+	for i := 0; i < n; i++ {
+		db.Exec("INSERT INTO posts (id, author, title) VALUES (?, ?, ?)", NewUUIDv7(), u, "t"+strconv.Itoa(i))
+	}
+	db.mergeIndexes()
+
+	// INNER, drives posts (scanned, no WHERE/ORDER BY) and probes users by PK.
+	if _, rows, err := db.Query("SELECT p.title, u.name FROM posts p JOIN users u ON p.author = u.id LIMIT 10"); err != nil || len(rows) != 10 {
+		t.Fatalf("streamed LIMIT 10: rows=%d err=%v", len(rows), err)
+	}
+	if _, all, err := db.Query("SELECT p.title FROM posts p JOIN users u ON p.author = u.id"); err != nil || len(all) != n {
+		t.Fatalf("streamed no-limit: rows=%d want %d err=%v", len(all), n, err)
+	}
+
+	// LEFT JOIN with an orphan post (author not in users) — the streamed path must
+	// still NULL-pad the miss.
+	db.Exec("INSERT INTO posts (id, author, title) VALUES (?, ?, ?)", NewUUIDv7(), NewUUIDv7(), "orphan")
+	db.mergeIndexes()
+	_, lrows, err := db.Query("SELECT p.title, u.name FROM posts p LEFT JOIN users u ON p.author = u.id")
+	if err != nil || len(lrows) != n+1 {
+		t.Fatalf("streamed LEFT no-limit: rows=%d want %d err=%v", len(lrows), n+1, err)
+	}
+	orphans := 0
+	for _, r := range lrows {
+		if r[1].IsNull() {
+			orphans++
+		}
+	}
+	if orphans != 1 {
+		t.Fatalf("streamed LEFT: want 1 orphan (NULL name), got %d", orphans)
 	}
 }
 

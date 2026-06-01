@@ -395,6 +395,42 @@ func (t *table) scanAll(fn func(Row) bool) {
 	}
 }
 
+// scanShardsBatched walks rows shard by shard in chunks: under each shard's read
+// lock it clones up to `chunk` rows passing keep into a batch, releases the lock,
+// then calls process(batch). process returns true to stop the whole walk. The
+// shard lock is NEVER held across process, so process may safely lock another
+// table (the streaming join driver probes the other side there) without the
+// cross-table lock cycle that holding the driver lock would risk. The arena is
+// append-only (indices [0,n) are stable across the unlock/relock between chunks;
+// only later appends extend it), so resuming from `start` is safe — per-shard
+// consistent, the standard multi-shard-read contract.
+func (t *table) scanShardsBatched(chunk int, keep func(Row) bool, process func([]Row) bool) {
+	for i := range t.shards {
+		s := &t.shards[i]
+		for start := 0; ; start += chunk {
+			var batch []Row
+			s.mu.RLock()
+			n := len(s.rows)
+			end := start + chunk
+			if end > n {
+				end = n
+			}
+			for j := start; j < end; j++ {
+				if r := s.rows[j]; r != nil && keep(r) {
+					batch = append(batch, r.Clone())
+				}
+			}
+			s.mu.RUnlock()
+			if len(batch) > 0 && process(batch) {
+				return
+			}
+			if end >= n {
+				break // shard exhausted
+			}
+		}
+	}
+}
+
 // update mutates the row at pk using mutate (the WAL-replay apply path).
 // Returns false if the row is absent, OR if mutate violates the storage
 // invariant: it must return a non-nil row whose PK is unchanged (PK and
