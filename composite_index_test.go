@@ -301,6 +301,115 @@ func TestCompositeWalkNullableFallsBack(t *testing.T) {
 	}
 }
 
+// seedJoin builds users(name indexed) + posts(author uuid, title) with the given
+// posts index DDL, one "alice" (returned) and a decoy "bob", alice's titles out
+// of order plus a bob post that must never leak, then merges.
+func seedJoin(t *testing.T, postsIndexDDL string, titles ...string) (*DB, UUID) {
+	t.Helper()
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE users (id uuid primary key, name text, INDEX (name))")
+	db.Exec("CREATE TABLE posts (id uuid primary key, author uuid, title text, " + postsIndexDDL + ")")
+	alice := NewUUIDv7()
+	db.Exec("INSERT INTO users (id, name) VALUES (?, ?)", alice, "alice")
+	bob := NewUUIDv7()
+	db.Exec("INSERT INTO users (id, name) VALUES (?, ?)", bob, "bob")
+	for _, ti := range titles {
+		db.Exec("INSERT INTO posts (id, author, title) VALUES (?, ?, ?)", NewUUIDv7(), alice, ti)
+	}
+	db.Exec("INSERT INTO posts (id, author, title) VALUES (?, ?, ?)", NewUUIDv7(), bob, "zzz")
+	db.mergeIndexes()
+	return db, alice
+}
+
+const joinHeadline = "SELECT p.title FROM posts p JOIN users u ON p.author = u.id WHERE u.name = ? ORDER BY p.title"
+
+// Step 4: the headline join plans as a probe walk and returns the probe rows in
+// trailing-column order, prefix-isolated from the decoy author.
+func TestJoinProbeWalkPlanAndOrder(t *testing.T) {
+	db, _ := seedJoin(t, "ORDERED INDEX (author, title)", "delta", "alpha", "charlie", "bravo")
+	pl, err := db.prepare(joinHeadline, db.cat.Load())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pl.joinPlan == nil || !pl.joinPlan.probeWalk {
+		t.Fatalf("headline join should plan as a probe walk: %+v", pl.joinPlan)
+	}
+	_, rows, err := db.Query(joinHeadline, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strs(rows, 0); join(got) != "alpha,bravo,charlie,delta" {
+		t.Fatalf("probe walk order wrong: %v", got)
+	}
+}
+
+// Step 4: the probe walk must match the top-N path byte-for-byte across ASC/DESC
+// and LIMIT/OFFSET — same data, composite (walk) vs single-column INDEX (top-N).
+func TestJoinProbeWalkCrossCheck(t *testing.T) {
+	titles := []string{"delta", "alpha", "charlie", "bravo", "echo", "foxtrot"}
+	walkDB, _ := seedJoin(t, "ORDERED INDEX (author, title)", titles...)
+	refDB, _ := seedJoin(t, "INDEX (author)", titles...)
+	// Sanity: the two plans really take different paths.
+	if pw, _ := walkDB.prepare(joinHeadline, walkDB.cat.Load()); pw.joinPlan == nil || !pw.joinPlan.probeWalk {
+		t.Fatal("walkDB should use the probe walk")
+	}
+	if pr, _ := refDB.prepare(joinHeadline, refDB.cat.Load()); pr.joinPlan != nil && pr.joinPlan.probeWalk {
+		t.Fatal("refDB should NOT use the probe walk")
+	}
+	for _, q := range []string{
+		joinHeadline,
+		joinHeadline + " LIMIT 3",
+		joinHeadline + " LIMIT 2 OFFSET 1",
+		joinHeadline + " DESC",
+		joinHeadline + " DESC LIMIT 3",
+		joinHeadline + " DESC LIMIT 2 OFFSET 3",
+	} {
+		_, wr, we := walkDB.Query(q, "alice")
+		_, rr, re := refDB.Query(q, "alice")
+		if we != nil || re != nil {
+			t.Fatalf("%q: walk err=%v ref err=%v", q, we, re)
+		}
+		if join(strs(wr, 0)) != join(strs(rr, 0)) {
+			t.Fatalf("%q: walk %v != ref %v", q, strs(wr, 0), strs(rr, 0))
+		}
+	}
+}
+
+// Step 4: >1 driver (two users sharing the filter name) falls back to the top-N
+// path — still correct (both authors' posts, globally ordered by title).
+func TestJoinProbeWalkMultiDriverFallback(t *testing.T) {
+	db, _ := seedJoin(t, "ORDERED INDEX (author, title)", "delta", "bravo")
+	// A second "alice": her posts must merge into the global title order.
+	alice2 := NewUUIDv7()
+	db.Exec("INSERT INTO users (id, name) VALUES (?, ?)", alice2, "alice")
+	db.Exec("INSERT INTO posts (id, author, title) VALUES (?, ?, ?)", NewUUIDv7(), alice2, "alpha")
+	db.Exec("INSERT INTO posts (id, author, title) VALUES (?, ?, ?)", NewUUIDv7(), alice2, "charlie")
+	db.mergeIndexes()
+	_, rows, err := db.Query(joinHeadline, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strs(rows, 0); join(got) != "alpha,bravo,charlie,delta" {
+		t.Fatalf("multi-driver fallback order wrong: %v", got)
+	}
+}
+
+// Step 4: a not-yet-merged probe row appears in the correct walk position (the
+// probe walk merges the dirty overlay, like the single-table walk).
+func TestJoinProbeWalkDirtyOverlay(t *testing.T) {
+	db, alice := seedJoin(t, "ORDERED INDEX (author, title)", "delta", "alpha")
+	// Add two more for alice WITHOUT merging.
+	db.Exec("INSERT INTO posts (id, author, title) VALUES (?, ?, ?)", NewUUIDv7(), alice, "charlie")
+	db.Exec("INSERT INTO posts (id, author, title) VALUES (?, ?, ?)", NewUUIDv7(), alice, "bravo")
+	_, rows, err := db.Query(joinHeadline, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strs(rows, 0); join(got) != "alpha,bravo,charlie,delta" {
+		t.Fatalf("probe walk dirty merge order wrong: %v", got)
+	}
+}
+
 // join concatenates string column values with commas (test readability).
 func join(ss []string) string {
 	out := ""

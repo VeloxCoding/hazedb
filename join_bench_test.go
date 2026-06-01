@@ -96,6 +96,49 @@ func BenchmarkJoinFiltered_Hazedb(b *testing.B) {
 	}
 }
 
+var (
+	joinHzCompOnce sync.Once
+	joinHzCompDB   *DB
+)
+
+// Same dataset as joinHazedb but posts carries ORDERED INDEX (author, title), so
+// the headline query plans as a single-driver probe walk instead of gather +
+// top-N sort.
+func joinHazedbComposite(b *testing.B) *DB {
+	joinHzCompOnce.Do(func() {
+		db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1})
+		if err != nil {
+			b.Fatal(err)
+		}
+		db.Exec("CREATE TABLE users (id uuid primary key, name text, INDEX (name))")
+		db.Exec("CREATE TABLE posts (id uuid primary key, author uuid, title text, ORDERED INDEX (author, title))")
+		for i := 0; i < joinUsers; i++ {
+			db.Exec("INSERT INTO users (id, name) VALUES (?, ?)", tid(i+1), fmt.Sprintf("user%04d", i))
+		}
+		for j := 0; j < joinPosts; j++ {
+			db.Exec("INSERT INTO posts (id, author, title) VALUES (?, ?, ?)",
+				tid(1_000_000+j), tid((j%joinUsers)+1), fmt.Sprintf("t%06d", j))
+		}
+		db.mergeIndexes()
+		joinHzCompDB = db
+	})
+	return joinHzCompDB
+}
+
+// The exact query, hazedb with a composite (author, title) index — probe walk.
+func BenchmarkJoinFiltered_HazedbComposite(b *testing.B) {
+	db := joinHazedbComposite(b)
+	arg := Str(joinName)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, rows, err := db.QueryValues(joinFilteredSQL, arg)
+		if err != nil || len(rows) != 10 {
+			b.Fatalf("rows=%d err=%v", len(rows), err)
+		}
+	}
+}
+
 // The exact query, in-memory SQLite (cgo).
 func BenchmarkJoinFiltered_SQLiteMem(b *testing.B) {
 	d := joinSQLite(b)

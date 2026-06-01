@@ -1062,6 +1062,89 @@ func (db *DB) execSelectCompositeWalk(pl *plan, args []Value) ([]string, []Row, 
 // fresh (its key equals the live value), so the index key drives the ordering
 // and the row is fetched only when selected. Dirty PKs are excluded from the
 // index walk (the entry may be stale) and supplied from their live rows.
+
+// dcand is one dirty-overlay candidate for an ordered walk: a row mutated since
+// the last merge, tagged with its sort key.
+type dcand struct {
+	key indexKey
+	row Row
+}
+
+// buildDirtyCands returns the dirty rows that pass match, each tagged with its
+// sort key (keyFn) and sorted ascending, plus dirtySet — ALL dirty PKs, used to
+// shadow possibly-stale index entries during the merge. Shared by every ordered
+// walk (single-column, composite, join probe).
+func (tbl *tableRT) buildDirtyCands(match func(Row) bool, keyFn func(Row) indexKey) ([]dcand, map[UUID]struct{}) {
+	dirty := tbl.dirtyPKs()
+	dirtySet := make(map[UUID]struct{}, len(dirty))
+	var dc []dcand
+	for _, pk := range dirty {
+		if _, dup := dirtySet[pk]; dup {
+			continue
+		}
+		dirtySet[pk] = struct{}{}
+		if r, ok := tbl.getByPK(pk); ok && match(r) {
+			dc = append(dc, dcand{keyFn(r), r})
+		}
+	}
+	sort.Slice(dc, func(i, j int) bool { return dc[i].key.less(dc[j].key) })
+	return dc, dirtySet
+}
+
+// mergeOrderedStreams walks the sorted index slice snap and the pre-matched dirty
+// candidates dc in the requested order (desc reverses both), skipping snap entries
+// shadowed by dirtySet, and calls emitIdx(pk) for each surviving index entry and
+// emitDirty(row) for each dirty row — in one merged ORDER BY order. It stops when
+// done() reports enough collected, or both streams are exhausted. The consumer
+// owns fetching/filtering/counting (so done() reflects rows actually kept).
+func mergeOrderedStreams(snap []ordEntry, dc []dcand, dirtySet map[UUID]struct{}, desc bool, done func() bool, emitIdx func(pk UUID), emitDirty func(row Row)) {
+	before := func(a, b indexKey) bool { // a comes before b in the requested order
+		if desc {
+			return b.less(a)
+		}
+		return a.less(b)
+	}
+	ii, dj := 0, 0
+	if desc {
+		ii, dj = len(snap)-1, len(dc)-1
+	}
+	idxOK := func() bool { return ii >= 0 && ii < len(snap) }
+	dcOK := func() bool { return dj >= 0 && dj < len(dc) }
+	step := func(p *int) {
+		if desc {
+			*p--
+		} else {
+			*p++
+		}
+	}
+	for !done() {
+		for idxOK() { // skip index entries shadowed by the dirty overlay
+			if _, d := dirtySet[snap[ii].pk]; !d {
+				break
+			}
+			step(&ii)
+		}
+		switch {
+		case idxOK() && dcOK():
+			if before(dc[dj].key, snap[ii].key) {
+				emitDirty(dc[dj].row)
+				step(&dj)
+			} else {
+				emitIdx(snap[ii].pk)
+				step(&ii)
+			}
+		case dcOK():
+			emitDirty(dc[dj].row)
+			step(&dj)
+		case idxOK():
+			emitIdx(snap[ii].pk)
+			step(&ii)
+		default:
+			return // both streams exhausted
+		}
+	}
+}
+
 func (db *DB) execSelectOrderedWalk(pl *plan, args []Value) ([]string, []Row, error) {
 	si := pl.rt.indexFor(pl.orderOrdinal)
 	if si == nil {
@@ -1095,38 +1178,7 @@ func (db *DB) orderedWalk(pl *plan, args []Value, snap []ordEntry, dirtyKey func
 		v, err := evalExpr(st.where, &ctx)
 		return err == nil && truthy(v)
 	}
-	project := func(r Row) Row {
-		if st.starAll {
-			return r
-		}
-		return projectClone(r, pl.projOrdinals)
-	}
-
-	dirty := tbl.dirtyPKs()
-	dirtySet := make(map[UUID]struct{}, len(dirty))
-	type dcand struct {
-		key indexKey
-		row Row
-	}
-	var dc []dcand
-	for _, pk := range dirty {
-		if _, dup := dirtySet[pk]; dup {
-			continue
-		}
-		dirtySet[pk] = struct{}{}
-		if r, ok := tbl.getByPK(pk); ok && matches(r) {
-			dc = append(dc, dcand{dirtyKey(r), r})
-		}
-	}
-	sort.Slice(dc, func(i, j int) bool { return dc[i].key.less(dc[j].key) })
-
-	desc := st.orderDesc
-	before := func(a, b indexKey) bool { // a comes before b in the requested order
-		if desc {
-			return b.less(a)
-		}
-		return a.less(b)
-	}
+	dc, dirtySet := tbl.buildDirtyCands(matches, dirtyKey)
 
 	eff := fetchBound(st.limit, st.offset) // collect offset+limit, drop offset at the end
 	capHint := eff
@@ -1134,29 +1186,8 @@ func (db *DB) orderedWalk(pl *plan, args []Value, snap []ordEntry, dirtyKey func
 		capHint = 1024
 	}
 	out := make([]Row, 0, capHint)
-	ii, dj := 0, 0
-	if desc {
-		ii, dj = len(snap)-1, len(dc)-1
-	}
-	idxOK := func() bool { return ii >= 0 && ii < len(snap) }
-	dcOK := func() bool { return dj >= 0 && dj < len(dc) }
-	stepIdx := func() {
-		if desc {
-			ii--
-		} else {
-			ii++
-		}
-	}
-	stepDc := func() {
-		if desc {
-			dj--
-		} else {
-			dj++
-		}
-	}
-	takeIdx := func() {
-		pk := snap[ii].pk
-		stepIdx()
+	done := func() bool { return eff >= 0 && len(out) >= eff }
+	emitIdx := func(pk UUID) {
 		if st.where == nil { // no residual: fetch projected directly (one clone)
 			if st.starAll {
 				if r, ok := tbl.getByPK(pk); ok {
@@ -1168,34 +1199,21 @@ func (db *DB) orderedWalk(pl *plan, args []Value, snap []ordEntry, dirtyKey func
 			return
 		}
 		if r, ok := tbl.getByPK(pk); ok && matches(r) { // residual needs the full row
-			out = append(out, project(r))
-		}
-	}
-walk:
-	for eff < 0 || len(out) < eff {
-		for idxOK() { // skip index entries shadowed by the dirty overlay
-			if _, d := dirtySet[snap[ii].pk]; !d {
-				break
-			}
-			stepIdx()
-		}
-		switch {
-		case idxOK() && dcOK():
-			if before(dc[dj].key, snap[ii].key) {
-				out = append(out, project(dc[dj].row))
-				stepDc()
+			if st.starAll {
+				out = append(out, r)
 			} else {
-				takeIdx()
+				out = append(out, projectClone(r, pl.projOrdinals))
 			}
-		case dcOK():
-			out = append(out, project(dc[dj].row))
-			stepDc()
-		case idxOK():
-			takeIdx()
-		default:
-			break walk // both streams exhausted
 		}
 	}
+	emitDirty := func(row Row) { // dc rows are owned clones, already matched
+		if st.starAll {
+			out = append(out, row)
+		} else {
+			out = append(out, projectClone(row, pl.projOrdinals))
+		}
+	}
+	mergeOrderedStreams(snap, dc, dirtySet, st.orderDesc, done, emitIdx, emitDirty)
 	return colNames, sliceOffsetLimit(out, st.offset, st.limit), nil
 }
 

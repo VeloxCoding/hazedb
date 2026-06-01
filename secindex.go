@@ -320,6 +320,29 @@ func (t *table) indexFor(ord int) *secIndex {
 	return nil
 }
 
+// probeIndexFor returns an index usable to probe equality on column ord: a
+// single-column index on ord, or a composite whose LEADING column is ord (an
+// (ord, ...) prefix lookup yields the same PKs). Used by joins, which can probe
+// through a composite's leading column. First match wins.
+func (t *table) probeIndexFor(ord int) *secIndex {
+	for _, si := range t.indexes {
+		if len(si.ordinals) >= 1 && si.ordinals[0] == ord {
+			return si
+		}
+	}
+	return nil
+}
+
+// lookupLeading returns the PKs whose leading indexed column equals key: a direct
+// bucket lookup for a single-column index, or a prefix lookup on the encoded
+// leading value for a composite.
+func (si *secIndex) lookupLeading(key Value) []UUID {
+	if len(si.ordinals) == 1 {
+		return si.lookup(keyOf(key))
+	}
+	return si.prefixLookup(encodeCompositeKey([]Value{key}))
+}
+
 // indexByOrdinals returns the secondary index whose columns are exactly ords, in
 // order, or nil. Locates a composite index chosen at plan time (stored as its
 // ordinal list on the plan).

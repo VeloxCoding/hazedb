@@ -49,6 +49,14 @@ type joinPlan struct {
 	residualPreds []expr
 
 	orderOrdinal int // global ordinal of the ORDER BY column, -1 if none
+
+	// probeWalk: ORDER BY is on a probe-side column backed by a composite
+	// (joinkey, ordercol) ordered index, so the probe can return that key's rows
+	// already sorted. probeWalkOrdinals is the index's column list (within the
+	// probe table). Used only for the single-driver case in execJoin (walk the
+	// prefix sub-range + early-stop, no sort); >1 driver falls back to top-N.
+	probeWalk         bool
+	probeWalkOrdinals []int
 }
 
 // planJoin resolves the two tables, binds every column to a global concat-row
@@ -150,7 +158,7 @@ func (db *DB) planJoin(pl *plan, st *selectStmt, cat *catalog) error {
 		leftOnOrd, rightOnOrd = rw, lw
 	}
 
-	indexed := func(rt *tableRT, ord int) bool { return ord == rt.def.pkOrdinal || rt.indexFor(ord) != nil }
+	indexed := func(rt *tableRT, ord int) bool { return ord == rt.def.pkOrdinal || rt.probeIndexFor(ord) != nil }
 	leftIdx, rightIdx := indexed(leftRT, leftOnOrd), indexed(rightRT, rightOnOrd)
 
 	// Bind every WHERE colRef to its global ordinal first, so the conjunct split
@@ -315,6 +323,15 @@ func (db *DB) planJoin(pl *plan, st *selectStmt, cat *catalog) error {
 		jp.orderOrdinal = g
 	}
 
+	// Probe-side ordered walk (INNER only): ORDER BY a probe column backed by a
+	// composite (joinkey, ordercol) ordered index lets the single-driver probe
+	// return that key's rows already sorted — walk + early-stop instead of
+	// gather + sort. OUTER joins add NULL-padded misses that complicate the walk;
+	// they keep the top-N path.
+	if jp.typ == tkInner && jp.orderOrdinal >= 0 {
+		jp.planProbeWalk()
+	}
+
 	// Pre-escape the output column names for the streaming JSON encoder, as the
 	// single-table planner does.
 	pl.colJSONPrefix = make([][]byte, len(pl.colNames))
@@ -324,6 +341,37 @@ func (db *DB) planJoin(pl *plan, st *selectStmt, cat *catalog) error {
 
 	pl.joinPlan = jp
 	return nil
+}
+
+// planProbeWalk sets probeWalk when the ORDER BY column is a probe-table column
+// whose ordinal, together with the join key, forms the leading two columns of a
+// NOT-NULL composite ordered index on the probe — i.e. (joinkey, ordercol). Then
+// probing one join key yields its rows already ordered by ordercol.
+func (jp *joinPlan) planProbeWalk() {
+	probeOff, probeWidth := 0, jp.nLeft // probe is the left table
+	if jp.driverIsLeft {
+		probeOff, probeWidth = jp.nLeft, jp.nRight // probe is the right table
+	}
+	orderWithin := jp.orderOrdinal - probeOff
+	if orderWithin < 0 || orderWithin >= probeWidth {
+		return // ORDER BY is not on the probe table
+	}
+	rt := jp.probeRT.def
+	for i := range rt.indexes {
+		ri := &rt.indexes[i]
+		if !ri.ordered || len(ri.ordinals) < 2 {
+			continue
+		}
+		if ri.ordinals[0] != jp.probeOnOrd || ri.ordinals[1] != orderWithin {
+			continue
+		}
+		if rt.anyNullable(ri.ordinals) {
+			continue
+		}
+		jp.probeWalkOrdinals = ri.ordinals
+		jp.probeWalk = true
+		return
+	}
 }
 
 // bindJoinExpr walks a WHERE expression and binds each colRef to its global
@@ -421,11 +469,11 @@ func (db *DB) probeRows(tbl *tableRT, onOrd int, byPK bool, key Value, fn func(R
 		}
 		return
 	}
-	si := tbl.indexFor(onOrd)
+	si := tbl.probeIndexFor(onOrd)
 	if si == nil {
 		return
 	}
-	cand := idxCandidateSet{pks: si.lookup(keyOf(key)), dirty: tbl.dirtyPKs()}
+	cand := idxCandidateSet{pks: si.lookupLeading(key), dirty: tbl.dirtyPKs()}
 	cand.emit(func(pk UUID) bool {
 		r, ok := tbl.getByPK(pk)
 		if !ok {
@@ -575,6 +623,57 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 					return
 				}
 			}
+		}
+	}
+
+	// Single-driver probe walk: ORDER BY is on a probe column backed by a composite
+	// (joinkey, ordercol) index. Walk that key's prefix sub-range — already ordered
+	// by ordercol — assembling concat rows and stopping at offset+limit, so neither
+	// the whole bucket is fetched nor a sort runs. One driver only: >1 needs a k-way
+	// merge across prefixes and falls through to the top-N path below.
+	if jp.probeWalk && ordered && len(drivers) == 1 {
+		drow := drivers[0]
+		key := drow[jp.driverOnOrd]
+		if key.IsNull() {
+			return colNames, nil, nil // INNER: a NULL join key matches nothing
+		}
+		if si := jp.probeRT.indexByOrdinals(jp.probeWalkOrdinals); si != nil {
+			ords := si.ordinals
+			dirtyKey := func(r Row) indexKey {
+				cells := make([]Value, len(ords))
+				for i, o := range ords {
+					cells[i] = r[o]
+				}
+				return encodeCompositeKey(cells)
+			}
+			matchKey := func(r Row) bool { return r[jp.probeOnOrd].Equal(key) }
+			dc, dirtySet := jp.probeRT.buildDirtyCands(matchKey, dirtyKey)
+			snap := si.snapshotPrefix(encodeCompositeKey([]Value{key}))
+			scratch := make(Row, nLeft+nRight)
+			var out []Row
+			done := func() bool { return eff >= 0 && len(out) >= eff }
+			keep := func(prow Row) {
+				left, right := drow, prow
+				if !jp.driverIsLeft {
+					left, right = prow, drow
+				}
+				fillConcat(scratch, left, right)
+				if passResidual(scratch) {
+					row := make(Row, nLeft+nRight)
+					copy(row, scratch)
+					out = append(out, row)
+				}
+			}
+			mergeOrderedStreams(snap, dc, dirtySet, st.orderDesc, done,
+				func(pk UUID) {
+					if r, ok := jp.probeRT.getByPK(pk); ok {
+						keep(r)
+					}
+				},
+				func(r Row) { keep(r) },
+			)
+			out = sliceOffsetLimit(out, st.offset, st.limit)
+			return colNames, projectRows(out, st.starAll, pl.projOrdinals), nil
 		}
 	}
 
