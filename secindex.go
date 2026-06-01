@@ -494,8 +494,21 @@ func (t *table) dirtyPKs() []UUID {
 	for i := range t.shards {
 		s := &t.shards[i]
 		s.mu.RLock()
-		if len(s.dirty) > 0 {
+		// Skip dirty PKs whose row is no longer live. A delete removes the PK from
+		// s.pk (store.go) but leaves it in s.dirty so the merger still cleans the
+		// stale index entry. A deleted row can never match a read, and every read
+		// consumer already drops it at getByPK — excluding it here keeps it out of
+		// the candidate copy and emit's dedup map, which is the bulk of the
+		// read-overlay allocation under a delete-heavy load. Partitioned shards have
+		// no per-shard pk map, so they keep the unfiltered behaviour.
+		if s.pk == nil {
 			out = append(out, s.dirty...)
+		} else {
+			for _, pk := range s.dirty {
+				if _, live := s.pk[pk]; live {
+					out = append(out, pk)
+				}
+			}
 		}
 		s.mu.RUnlock()
 	}
