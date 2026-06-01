@@ -32,7 +32,7 @@ every statement the parser accepts — but that set is a deliberate subset of SQ
 | Column types | `int`, `text`/`string`, `bool`, `bytes`/`blob`, `uuid` |
 | Writes | `INSERT INTO … VALUES (…)`, `UPDATE … SET … WHERE …`, `DELETE FROM … WHERE …` |
 | `SELECT` | `*` or an explicit column list, `FROM t [alias]`, optional `WHERE`, `ORDER BY col [ASC\|DESC]`, `LIMIT n`, `OFFSET m` |
-| `JOIN` | two-table `[INNER\|LEFT [OUTER]\|RIGHT [OUTER]] JOIN t2 [alias] ON a.col = b.col` (single equi-join); the probed join column **must be the PK or indexed**; columns are `table.col` / `alias.col` |
+| `JOIN` | **two tables only** (for now) — `[INNER\|LEFT [OUTER]\|RIGHT [OUTER]] JOIN t2 [alias] ON a.col = b.col` (single equi-join); the probed join column **must be the PK or indexed**; columns are `table.col` / `alias.col`. A 3rd+ `JOIN` is rejected. |
 | `WHERE` expressions | comparisons `= != < <= > >=`, `IS [NOT] NULL`, boolean `AND` / `OR` / `NOT`, arithmetic `+ - *`, parentheses, `?` positional parameters |
 | Literals | integer, string, `true`/`false`, `null` |
 
@@ -171,6 +171,16 @@ re-checks each against the live row, so it is correct at any merge lag — never
 stale, never a wrong row. This fits the cache contract (a brief index lag is
 acceptable in front of a source of truth).
 
+**No `UNIQUE` secondary indexes — the flip side of that async design.** Enforcing
+uniqueness means *rejecting a duplicate at write time*, which needs a synchronous
+index lookup (plus locking, so two concurrent inserts of the same value can't
+both pass the check). The async index keeps writes cheap precisely by *not*
+touching the index synchronously — a write just flags its row (~69 ns), and the
+index catches up in the background — so a write cannot synchronously prove a
+value is unique. Uniqueness therefore stays outside the cache: the PK (a UUID) is
+unique by construction; any other uniqueness is the source-of-truth database's
+job. A secondary index here is a *lookup accelerator, not a constraint.*
+
 **Costs** (measured, 50k rows; see [secondary-indexes.md](secondary-indexes.md)
 for the full design; the `idxcmp` harness in the external `demo_and_perf`
 testbed reproduces the SQLite comparison):
@@ -183,7 +193,8 @@ testbed reproduces the SQLite comparison):
   one-time, in the background (every 50 ms) or once at boot after WAL replay.
 
 **Limits:** non-partitioned tables only (an `INDEX` on a partitioned table is
-rejected). Composite (multi-column) indexes are supported in the `ORDERED` form
+rejected); no `UNIQUE` secondary indexes (only the PK is unique — see the async
+note above). Composite (multi-column) indexes are supported in the `ORDERED` form
 with `NOT NULL` columns — see below.
 
 ### Composite indexes
@@ -252,7 +263,7 @@ For the common (filtered, modest-bucket) list view none of these matter; see
 
 ## Not supported — will error or fail to parse
 
-- **No `FULL OUTER` / `CROSS` / N-way `JOIN`** — two-table `INNER`/`LEFT`/`RIGHT` equi-joins work (the probed column must be the PK or indexed); `CROSS` is excluded by design (a Cartesian product has no indexable join column), `FULL OUTER` and 3+ table joins are deferred.
+- **Joins are limited to two tables for now.** `INNER`/`LEFT`/`RIGHT` equi-joins on exactly two tables work (the probed column must be the PK or indexed); a query with a 3rd+ `JOIN` is rejected. 3+-table (N-way) joins are not a design ban — just not built yet; do multi-table work in your application or the source-of-truth database for now. `CROSS` is excluded by design (a Cartesian product has no indexable join column), and `FULL OUTER` is also deferred.
 - **No aggregates / grouping** — `COUNT`, `SUM`, `AVG`, `GROUP BY`, `HAVING` are absent.
 - **No `DISTINCT`, no subqueries**, no expressions or aliases in the `SELECT` column list (bare column names only).
 - **No `ALTER TABLE`**, and **no `IF [NOT] EXISTS`** — re-running `CREATE TABLE` on an existing table errors.
@@ -298,12 +309,15 @@ question is design fit, not feasibility — see the note at the end.
 
 **Tier 3 — genuine design effort:**
 
-- **`JOIN`** — *partly shipped* (rev. 26). Two-table `INNER`/`LEFT`/`RIGHT`
-  equi-joins run today as an indexed nested-loop, but only where the probed
-  join column is the PK or indexed (the **indexed-only law** — no O(A×B) scan).
-  Still on the deliberate line: `FULL OUTER` (would need driving both sides),
-  `CROSS` (a Cartesian product has no indexable join column — excluded by
-  design), N-way joins, and non-equi `ON` conditions.
+- **`JOIN`** — *partly shipped*. Two-table `INNER`/`LEFT`/`RIGHT` equi-joins run
+  today as an indexed nested-loop, but only where the probed join column is the
+  PK or indexed (the **indexed-only law** — no O(A×B) scan). Not yet built:
+  **N-way (3+ table) joins** — a left-deep extension of the same indexed
+  nested-loop (each probe stays indexed, O(driver) per level), so it fits the
+  engine's grain; it is *deferred, not design-banned* (the open question is
+  join-order, not feasibility). `FULL OUTER` is deferred (would need driving both
+  sides), and non-equi `ON` is too. `CROSS` alone is excluded **by design** — a
+  Cartesian product has no indexable join column.
 - **SQL `BEGIN`/`COMMIT`** — *not* "add a token." The transaction engine already
   exists (the Go `db.Tx` closure, M6). The hard part is that SQL-level
   transactions need **session state** to tie multiple statements together, and
@@ -315,10 +329,11 @@ question is whether it *should* land here. hazedb is the hot-read / write-buffer
 layer in front of a source-of-truth DB — its value is speed + simplicity.
 `OFFSET` / `DISTINCT` / `COUNT(*)` fit without bloat. The two-table indexed
 join landed for the same reason — it stays `O(driver)` and never degrades to a
-scan. Unbounded joins (`FULL OUTER`, `CROSS`, N-way) and reporting-style
-aggregation are where it starts turning into a general SQL engine — exactly the
-work normally left to the database behind it. So that part of Tier 3 stays a
-deliberate "probably not, by design," not a "not yet."
+scan. An N-way join keeps that property (indexed probe per level), so it is a
+"not yet," not a "no" — the limit today is two tables purely because it is
+unbuilt. `CROSS` (Cartesian, no indexable column) and reporting-style aggregation
+are the cases that would turn it into a general SQL engine — those stay a
+deliberate "probably not, by design."
 
 ## Examples
 
