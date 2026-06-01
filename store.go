@@ -477,6 +477,29 @@ func (t *table) unlockAllShards() {
 	}
 }
 
+// lockCandidateShards locks only the shard(s) the candidate PKs fall on and
+// returns an unlock func. The common case — every candidate on one shard (a
+// single-row index update/delete) — takes exactly ONE lock with no allocation,
+// instead of all 32. A multi-shard candidate set falls back to lockAllShards
+// (ascending, deadlock-safe, same order); narrowing buys little there and
+// avoids per-call bookkeeping. A single held lock never waits while holding
+// another, so it cannot deadlock with the ascending all-shard path.
+func (t *table) lockCandidateShards(pks []UUID) func() {
+	if len(pks) == 0 {
+		return func() {}
+	}
+	oi := t.shardIdxOf(pks[0])
+	for _, pk := range pks[1:] {
+		if t.shardIdxOf(pk) != oi {
+			t.lockAllShards()
+			return t.unlockAllShards
+		}
+	}
+	s := &t.shards[oi]
+	s.mu.Lock()
+	return s.mu.Unlock
+}
+
 // updateWhereAll applies a predicate UPDATE across the whole table while
 // holding EVERY shard lock for the entire operation — both for serializability
 // (the one-shard-at-a-time pattern is a write-serializability + replay-
@@ -540,8 +563,7 @@ func (t *table) updateWhereAll(match func(Row) bool, ords []int, compute func(Ro
 // single-TXN atomicity. Non-partitioned only (secondary indexes are not on
 // partitioned tables, so idxLookup never fires for them).
 func (t *table) updateByCandidates(pks []UUID, match func(Row) bool, ords []int, compute func(Row) ([]Value, error), encode func(Row) []byte, journalAll func([][]byte) error) (int, error) {
-	t.lockAllShards()
-	defer t.unlockAllShards()
+	defer t.lockCandidateShards(pks)()
 	type pendingUpdate struct {
 		s  *tableShard
 		j  uint64
@@ -655,8 +677,7 @@ func (t *table) deleteWhereAll(match func(Row) bool, encode func(pk Value) []byt
 // scanning. Same all-shard-lock + single-TXN atomicity. Non-partitioned only.
 func (t *table) deleteByCandidates(pks []UUID, match func(Row) bool, encode func(pk Value) []byte, journalAll func([][]byte) error) (int, error) {
 	pkOrd := t.def.pkOrdinal
-	t.lockAllShards()
-	defer t.unlockAllShards()
+	defer t.lockCandidateShards(pks)()
 	type pendingDelete struct {
 		s  *tableShard
 		j  uint64
