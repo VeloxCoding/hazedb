@@ -617,4 +617,3 @@ func BenchmarkDeleteByScan_SQLiteMem(b *testing.B) {
 		del.Exec(cd)
 	}
 }
-
