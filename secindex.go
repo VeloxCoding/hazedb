@@ -418,13 +418,14 @@ func (db *DB) startMergeLoop(interval time.Duration, threshold int64) {
 	}()
 }
 
-// totalDirty sums the pending dirty-PK count across every table in the current
-// catalog. Cheap (one atomic load per table) — the merger's size-trigger poll.
+// totalDirty sums the pending dirty-PK count (read + delete entries — both need
+// merging) across every table in the current catalog. Cheap (two atomic loads
+// per table) — the merger's size-trigger poll.
 func (db *DB) totalDirty() int64 {
 	var n int64
 	for _, rt := range db.cat.Load().byID {
 		if rt != nil {
-			n += rt.table.dirtyCount.Load()
+			n += rt.table.readDirtyCount.Load() + rt.table.delDirtyCount.Load()
 		}
 	}
 	return n
@@ -445,7 +446,7 @@ func (db *DB) sizeTriggerFired(fixed int64) bool {
 		if rt == nil {
 			continue
 		}
-		d := rt.table.dirtyCount.Load()
+		d := rt.table.readDirtyCount.Load() + rt.table.delDirtyCount.Load()
 		if d < floor {
 			continue // overlay tiny: cheap to walk, no early merge
 		}
@@ -487,24 +488,22 @@ func (db *DB) mergeIndexes() {
 // not-yet-merged row is still a candidate (then re-checked against its live
 // row). Copied out under each shard's read lock.
 func (t *table) dirtyPKs() []UUID {
-	if t.dirtyCount.Load() == 0 {
-		return nil // steady state: skip the 32-shard scan entirely
+	if t.readDirtyCount.Load() == 0 {
+		return nil // no read-relevant dirty (deletes don't count): skip the scan
 	}
 	var out []UUID
 	for i := range t.shards {
 		s := &t.shards[i]
 		s.mu.RLock()
-		// Skip dirty PKs whose row is no longer live. A delete removes the PK from
-		// s.pk (store.go) but leaves it in s.dirty so the merger still cleans the
-		// stale index entry. A deleted row can never match a read, and every read
-		// consumer already drops it at getByPK — excluding it here keeps it out of
-		// the candidate copy and emit's dedup map, which is the bulk of the
-		// read-overlay allocation under a delete-heavy load. Partitioned shards have
-		// no per-shard pk map, so they keep the unfiltered behaviour.
+		// Walk only dirtyRead (inserts + indexed updates); deletes live in dirtyDel
+		// and never belong in the read overlay. The s.pk liveness check still drops
+		// the rare insert-then-delete pair (the insert's PK lingers in dirtyRead but
+		// its row is already gone). Partitioned shards have no per-shard pk map, so
+		// they keep the unfiltered behaviour.
 		if s.pk == nil {
-			out = append(out, s.dirty...)
+			out = append(out, s.dirtyRead...)
 		} else {
-			for _, pk := range s.dirty {
+			for _, pk := range s.dirtyRead {
 				if _, live := s.pk[pk]; live {
 					out = append(out, pk)
 				}
@@ -550,20 +549,24 @@ func (t *table) mergeIndexes() {
 	var scratch []Value
 	var encBuf []byte // reused across rows so composite encoding allocs only the key string
 	type pending struct {
-		s *tableShard
-		n int
+		s      *tableShard
+		nr, nd int
 	}
 	var drops []pending
 	for i := range t.shards {
 		s := &t.shards[i]
 		s.mu.RLock()
-		n := len(s.dirty)
+		nr := len(s.dirtyRead)
+		nd := len(s.dirtyDel)
 		var batch []UUID
-		if n > 0 {
-			batch = append(batch, s.dirty[:n]...)
+		if nr > 0 {
+			batch = append(batch, s.dirtyRead[:nr]...)
+		}
+		if nd > 0 {
+			batch = append(batch, s.dirtyDel[:nd]...)
 		}
 		s.mu.RUnlock()
-		if n == 0 {
+		if len(batch) == 0 {
 			continue
 		}
 		for _, pk := range batch {
@@ -580,7 +583,7 @@ func (t *table) mergeIndexes() {
 				si.apply(pk, key, indexable)
 			}
 		}
-		drops = append(drops, pending{s, n})
+		drops = append(drops, pending{s, nr, nd})
 	}
 	if len(drops) == 0 {
 		return
@@ -593,9 +596,11 @@ func (t *table) mergeIndexes() {
 	}
 	for _, d := range drops {
 		d.s.mu.Lock()
-		d.s.dirty = d.s.dirty[d.n:] // drop the processed prefix; later appends remain
+		d.s.dirtyRead = d.s.dirtyRead[d.nr:] // drop processed prefixes; later appends remain
+		d.s.dirtyDel = d.s.dirtyDel[d.nd:]
 		d.s.mu.Unlock()
-		t.dirtyCount.Add(-int64(d.n))
+		t.readDirtyCount.Add(-int64(d.nr))
+		t.delDirtyCount.Add(-int64(d.nd))
 	}
 }
 
@@ -655,8 +660,10 @@ func (t *table) rebuildIndexes() {
 	for i := range t.shards {
 		s := &t.shards[i]
 		s.mu.Lock()
-		s.dirty = nil // replay marked rows dirty; the full rebuild covers them
+		s.dirtyRead = nil // replay marked rows dirty; the full rebuild covers them
+		s.dirtyDel = nil
 		s.mu.Unlock()
 	}
-	t.dirtyCount.Store(0)
+	t.readDirtyCount.Store(0)
+	t.delDirtyCount.Store(0)
 }

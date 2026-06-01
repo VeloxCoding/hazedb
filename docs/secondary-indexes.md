@@ -75,13 +75,20 @@ a bucket list — a value may map to many PKs (there is no enforced-unique form)
   (A later optimisation may swap to an immutable snapshot + atomic pointer for
   lock-free reads — only if reads are shown to contend on the lock.)
 
-**Per-shard dirty list.** Added to `tableShard`: `dirty []UUID` — just the PKs
-mutated since the last merge, no op or key payload. The merger re-reads each
-PK's live row and uses the index's own reverse map (`rev`) to find the stale key
-to drop, so the write side records nothing but the PK. Allocated only when the
-table declares ≥1 index — zero cost otherwise, exactly like `tails`/`pkDir`
-exist only for partitioned tables. A store-wide `dirtyCount` atomic lets a read
-skip the 32-shard overlay scan entirely in steady state (count == 0).
+**Per-shard dirty lists.** Added to `tableShard`: `dirtyRead []UUID` and
+`dirtyDel []UUID` — just the PKs mutated since the last merge, no op or key
+payload. The split is by read-relevance: `dirtyRead` holds inserts and
+indexed-column updates (rows the read overlay must consider — their live state
+may not yet be in the index); `dirtyDel` holds deletes (the merger removes their
+stale entry via the reverse map `rev`, but reads skip them — a deleted row can
+never match). An UPDATE that touches no indexed column is recorded in neither:
+the index stays valid, so the row needs no merge and no overlay slot. Allocated
+only when the table declares ≥1 index — zero cost otherwise, like `tails`/`pkDir`
+for partitioned tables. Two store-wide atomics: `readDirtyCount` lets a read skip
+the overlay scan in steady state (and gates `dirtyTooDenseForScan`, so a delete
+burst never pushes reads onto the scan path); `delDirtyCount` adds in for the
+merge size-trigger (both lists need merging). The write side records one PK in
+one list — one append, no extra atomic.
 
 ---
 

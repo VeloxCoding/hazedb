@@ -46,10 +46,15 @@ type table struct {
 	// per-shard pk map can't enforce table-wide PK uniqueness or answer
 	// WHERE id=? — the directory does both.
 	pkDir *pkDirectory
-	// dirtyCount is the total pending dirty PKs across all shards (+1 per
-	// markDirtyLocked, -n per merge drop). An indexed read skips the 32-shard
-	// dirty-overlay scan when this is 0 — the steady-state fast path.
-	dirtyCount atomic.Int64
+	// readDirtyCount / delDirtyCount are the pending dirty-PK totals across all
+	// shards, split by purpose. readDirtyCount tracks inserts + indexed-column
+	// updates — rows whose live state may not yet be in the index, so reads must
+	// overlay them. delDirtyCount tracks deletes — needed only so the merger
+	// later removes the stale index entry, never for reads (a deleted row can
+	// never match). An indexed read skips the overlay scan when readDirtyCount is
+	// 0; the size-trigger and merge use the sum (both lists need merging).
+	readDirtyCount atomic.Int64
+	delDirtyCount  atomic.Int64
 }
 
 type tableShard struct {
@@ -63,12 +68,14 @@ type tableShard struct {
 	// rowIDs stay in the list (rows[rowID] is nil) and the scan skips them.
 	tails map[UUID][]uint64
 	live  int // count of non-tombstoned rows
-	// dirty lists PKs mutated on this shard since the last index merge (nil
-	// unless the table has secondary indexes). Appended under mu by every live
-	// write; drained by mergeIndexes. The read overlay unions it with the index
-	// so a not-yet-merged row is still found (then re-checked against the live
-	// row). See docs/secondary-indexes.md.
-	dirty []UUID
+	// dirtyRead / dirtyDel list PKs mutated on this shard since the last merge
+	// (nil unless the table has secondary indexes). dirtyRead holds inserts +
+	// indexed-column updates (rows the read overlay must consider); dirtyDel holds
+	// deletes (merge-only — the merger removes their stale index entry, but reads
+	// skip them). Appended under mu by live writes; both drained by mergeIndexes.
+	// See docs/secondary-indexes.md.
+	dirtyRead []UUID
+	dirtyDel  []UUID
 }
 
 // markDirtyLocked records pk as needing an index merge. No-op when the table has
@@ -76,8 +83,19 @@ type tableShard struct {
 // this adds no lock to the write path.
 func (t *table) markDirtyLocked(s *tableShard, pk UUID) {
 	if len(t.indexes) > 0 {
-		s.dirty = append(s.dirty, pk)
-		t.dirtyCount.Add(1)
+		s.dirtyRead = append(s.dirtyRead, pk)
+		t.readDirtyCount.Add(1)
+	}
+}
+
+// markDelDirtyLocked records a deleted pk for index cleanup only. The merger
+// removes its stale index entry, but it never enters the read overlay — a
+// deleted row can never match a read. Same one-append, no-new-lock cost as
+// markDirtyLocked. No-op when the table has no secondary indexes.
+func (t *table) markDelDirtyLocked(s *tableShard, pk UUID) {
+	if len(t.indexes) > 0 {
+		s.dirtyDel = append(s.dirtyDel, pk)
+		t.delDirtyCount.Add(1)
 	}
 }
 
@@ -316,7 +334,7 @@ func (t *table) deleteByPKJournaled(pk UUID, journal func() error) (bool, error)
 	s.rows[rowID] = nil
 	delete(s.pk, pk)
 	s.live--
-	t.markDirtyLocked(s, pk)
+	t.markDelDirtyLocked(s, pk)
 	return true, nil
 }
 
@@ -698,7 +716,7 @@ func (t *table) deleteByPK(pk UUID) bool {
 	s.rows[rowID] = nil
 	delete(s.pk, pk)
 	s.live--
-	t.markDirtyLocked(s, pk)
+	t.markDelDirtyLocked(s, pk)
 	return true
 }
 
@@ -742,7 +760,7 @@ func (t *table) deleteWhereAll(match func(Row) bool, encode func(pk Value) []byt
 		delete(p.s.pk, p.pk)
 		p.s.rows[p.j] = nil
 		p.s.live--
-		t.markDirtyLocked(p.s, p.pk)
+		t.markDelDirtyLocked(p.s, p.pk)
 	}
 	return len(pending), nil
 }
@@ -784,7 +802,7 @@ func (t *table) deleteByCandidates(pks []UUID, match func(Row) bool, encode func
 		delete(p.s.pk, p.pk)
 		p.s.rows[p.j] = nil
 		p.s.live--
-		t.markDirtyLocked(p.s, p.pk)
+		t.markDelDirtyLocked(p.s, p.pk)
 	}
 	return len(pending), nil
 }
@@ -802,14 +820,16 @@ func (t *table) liveCount() int {
 	return n
 }
 
-// dirtyTooDenseForScan reports whether the dirty overlay has grown large enough
-// that the hybrid candidate path (idxCandidates walks every dirty PK to dedup
-// against the index hits) would do MORE work than a full table scan. When true,
-// an indexed UPDATE/DELETE falls back to the scan path so it is never slower
-// than the pre-index full-scan behaviour under a heavy write burst. Steady state
-// (no dirty) returns false without the 32-shard liveCount sweep.
+// dirtyTooDenseForScan reports whether the READ overlay has grown large enough
+// that the hybrid candidate path (idxCandidates walks every read-dirty PK to
+// dedup against the index hits) would do MORE work than a full table scan. When
+// true, an indexed UPDATE/DELETE falls back to the scan path so it is never
+// slower than the pre-index full-scan behaviour under a heavy write burst. Only
+// readDirtyCount matters: deletes never enter the overlay, so a delete burst
+// must not push UPDATE/DELETE onto the scan path. Steady state returns false
+// without the 32-shard liveCount sweep.
 func (t *table) dirtyTooDenseForScan() bool {
-	dc := t.dirtyCount.Load()
+	dc := t.readDirtyCount.Load()
 	if dc == 0 {
 		return false
 	}

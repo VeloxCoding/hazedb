@@ -419,5 +419,5 @@ func (t *table) txDeleteLocked(pk UUID) {
 	s.rows[rowID] = nil
 	delete(s.pk, pk)
 	s.live--
-	t.markDirtyLocked(s, pk)
+	t.markDelDirtyLocked(s, pk)
 }

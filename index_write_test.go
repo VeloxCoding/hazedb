@@ -112,14 +112,14 @@ func TestUpdateNonIndexedColumnSkipsDirty(t *testing.T) {
 	}
 	db.mergeIndexes()
 	tbl := db.cat.Load().byName["u"].table
-	if d := tbl.dirtyCount.Load(); d != 0 {
+	if d := tbl.readDirtyCount.Load(); d != 0 {
 		t.Fatalf("dirty after merge = %d, want 0", d)
 	}
 	// Non-indexed column: must not dirty the overlay, row still found with new value.
 	if n, _ := db.Exec("UPDATE u SET score = ? WHERE name = ?", 42, "n2"); n != 1 {
 		t.Fatalf("update non-indexed: n=%d want 1", n)
 	}
-	if d := tbl.dirtyCount.Load(); d != 0 {
+	if d := tbl.readDirtyCount.Load(); d != 0 {
 		t.Fatalf("non-indexed update marked dirty (%d) — must stay out of the overlay", d)
 	}
 	if _, rows, _ := db.Query("SELECT score FROM u WHERE name = ?", "n2"); len(rows) != 1 || rows[0][0].Int() != 42 {
@@ -129,7 +129,7 @@ func TestUpdateNonIndexedColumnSkipsDirty(t *testing.T) {
 	if n, _ := db.Exec("UPDATE u SET name = ? WHERE name = ?", "renamed", "n3"); n != 1 {
 		t.Fatalf("update indexed: n=%d want 1", n)
 	}
-	if d := tbl.dirtyCount.Load(); d == 0 {
+	if d := tbl.readDirtyCount.Load(); d == 0 {
 		t.Fatal("indexed-column update should mark dirty")
 	}
 	if _, rows, _ := db.Query("SELECT score FROM u WHERE name = ?", "renamed"); len(rows) != 1 {
@@ -143,14 +143,14 @@ func TestUpdateNonIndexedColumnSkipsDirty(t *testing.T) {
 // When the dirty overlay outgrows the table (merger not keeping up), the hybrid
 // candidate walk costs more than a scan, so idxLookup falls through to the scan
 // path (dirtyTooDenseForScan). That fallback must still touch exactly the right
-// rows — these inserts are never merged, so dirtyCount == liveCount triggers it.
+// rows — these inserts are never merged, so readDirtyCount == liveCount triggers it.
 func TestIndexWriteScanFallbackWhenDirtyDense(t *testing.T) {
 	db := openEmpty(t)
 	db.Exec("CREATE TABLE u (id uuid primary key, email text, age int, INDEX (email))")
 	for i := 0; i < 50; i++ {
 		db.Exec("INSERT INTO u (id, email, age) VALUES (?, ?, ?)", NewUUIDv7(), "e"+strconv.Itoa(i), 10)
 	}
-	// No mergeIndexes(): every row is in the dirty overlay, so dirtyCount equals
+	// No mergeIndexes(): every row is in the read overlay, so readDirtyCount equals
 	// liveCount and the density guard forces the scan path.
 	tbl := db.cat.Load().byName["u"].table
 	if !tbl.dirtyTooDenseForScan() {
