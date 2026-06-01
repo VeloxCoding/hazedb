@@ -68,6 +68,10 @@ func joinSQLite(b *testing.B) *sql.DB {
 		mustExec("CREATE TABLE posts (id BLOB PRIMARY KEY, author BLOB, title TEXT)")
 		mustExec("CREATE INDEX idx_posts_author ON posts(author)")
 		mustExec("CREATE INDEX idx_users_name ON users(name)")
+		// Composite so SQLite can serve WHERE author=? ORDER BY title without a sort
+		// — the fair counterpart to hazedb's ORDERED INDEX (author, title). SQLite's
+		// planner picks the best index per query (PK for point, this for the feed).
+		mustExec("CREATE INDEX idx_posts_author_title ON posts(author, title)")
 		for i := 0; i < joinUsers; i++ {
 			mustExec("INSERT INTO users (id, name) VALUES (?, ?)", key16(i+1), fmt.Sprintf("user%04d", i))
 		}
@@ -281,5 +285,50 @@ func BenchmarkJoinOrderedNoWhere_Hazedb(b *testing.B) {
 		if err != nil || len(rows) != 10 {
 			b.Fatalf("rows=%d err=%v", len(rows), err)
 		}
+	}
+}
+
+// scanSQLiteJoin runs q on the shared SQLite db and counts (title,name) rows,
+// asserting want — the read loop every SQLite join bench shares.
+func scanSQLiteJoin(b *testing.B, stmt *sql.Stmt, want int, args ...any) {
+	rows, err := stmt.Query(args...)
+	if err != nil {
+		b.Fatal(err)
+	}
+	n := 0
+	for rows.Next() {
+		var a, c string
+		rows.Scan(&a, &c)
+		n++
+	}
+	rows.Close()
+	if n != want {
+		b.Fatalf("rows=%d want %d", n, want)
+	}
+}
+
+func BenchmarkJoinNoWhereLimit_SQLiteMem(b *testing.B) {
+	stmt, err := joinSQLite(b).Prepare("SELECT p.title, u.name FROM posts p JOIN users u ON p.author = u.id LIMIT 10")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer stmt.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		scanSQLiteJoin(b, stmt, 10)
+	}
+}
+
+func BenchmarkJoinOrderedNoWhere_SQLiteMem(b *testing.B) {
+	stmt, err := joinSQLite(b).Prepare("SELECT p.title, u.name FROM posts p JOIN users u ON p.author = u.id ORDER BY p.title LIMIT 10 OFFSET 20")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer stmt.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		scanSQLiteJoin(b, stmt, 10)
 	}
 }
