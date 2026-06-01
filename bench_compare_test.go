@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3" // cgo driver: "sqlite3"
@@ -396,5 +397,215 @@ func BenchmarkDeleteByPK_Bolt(b *testing.B) {
 			bkt := tx.Bucket([]byte("users"))
 			return bkt.Delete(key16(i))
 		})
+	}
+}
+
+// -------- DELETE BY PK (in-memory, fair RAM-vs-RAM) --------
+// Mirrors BenchmarkDeleteByPK_FASTSQL_Mem: fresh in-memory store, insert b.N
+// rows, then time deleting them.
+func BenchmarkDeleteByPK_SQLiteMem(b *testing.B) {
+	d, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		b.Fatal(err)
+	}
+	d.SetMaxOpenConns(1)
+	defer d.Close()
+	d.Exec("CREATE TABLE users (id BLOB PRIMARY KEY, name TEXT, age INTEGER)")
+	ins, _ := d.Prepare("INSERT INTO users (id, name, age) VALUES (?, ?, ?)")
+	for i := 0; i < b.N; i++ {
+		ins.Exec(key16(i), "name", i%100)
+	}
+	ins.Close()
+	del, _ := d.Prepare("DELETE FROM users WHERE id = ?")
+	defer del.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		del.Exec(key16(i))
+	}
+}
+
+// ===== Index vs scan: find ONE row three ways (PK / secondary index / scan) =====
+// Shared table t(id PK, email [INDEX], code [no index], age), compareN rows. Every
+// op below targets a single row found by its indexed column (email) or by an
+// UN-indexed column (code, a full scan) — isolating the lookup cost. PK variants
+// are the *ByPK benchmarks above. compareN rows; email/code unique per row.
+//
+// Note on hazedb's async index: an index lookup unions the dirty overlay, so a
+// tight WRITE loop on an indexed column would grow that overlay and inflate the
+// next lookup. The by-index UPDATE/DELETE below therefore drain the overlay with
+// an untimed mergeIndexes() each iteration, so the TIMED op measures the
+// steady-state (merged) index path. Scan paths read live rows directly and need
+// no such drain. (SQLite has no async index — its loops are plain.)
+
+func newIdxScanDB(b *testing.B) *DB {
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: compareN})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { db.Close() })
+	db.Exec("CREATE TABLE t (id uuid primary key, email text, code text, age int, INDEX (email))")
+	for i := 0; i < compareN; i++ {
+		db.Exec("INSERT INTO t (id, email, code, age) VALUES (?, ?, ?, ?)", tid(i), "e"+strconv.Itoa(i), "c"+strconv.Itoa(i), i%100)
+	}
+	db.mergeIndexes()
+	return db
+}
+
+func newIdxScanSQLite(b *testing.B) *sql.DB {
+	d, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		b.Fatal(err)
+	}
+	d.SetMaxOpenConns(1)
+	b.Cleanup(func() { d.Close() })
+	d.Exec("CREATE TABLE t (id BLOB PRIMARY KEY, email TEXT, code TEXT, age INTEGER)")
+	d.Exec("CREATE INDEX idx_t_email ON t(email)")
+	ins, _ := d.Prepare("INSERT INTO t (id, email, code, age) VALUES (?, ?, ?, ?)")
+	for i := 0; i < compareN; i++ {
+		ins.Exec(key16(i), "e"+strconv.Itoa(i), "c"+strconv.Itoa(i), i%100)
+	}
+	ins.Close()
+	return d
+}
+
+// ---- FETCH by indexed column / by scan ----
+func BenchmarkFetchByIndex_FASTSQL_Mem(b *testing.B) {
+	db := newIdxScanDB(b)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, r, err := db.Query("SELECT age FROM t WHERE email = ?", "e"+strconv.Itoa(i%compareN)); err != nil || len(r) != 1 {
+			b.Fatalf("rows=%d err=%v", len(r), err)
+		}
+	}
+}
+func BenchmarkFetchByIndex_SQLiteMem(b *testing.B) {
+	s, _ := newIdxScanSQLite(b).Prepare("SELECT age FROM t WHERE email = ?")
+	defer s.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var a int64
+		s.QueryRow("e" + strconv.Itoa(i%compareN)).Scan(&a)
+	}
+}
+func BenchmarkFetchByScan_FASTSQL_Mem(b *testing.B) {
+	db := newIdxScanDB(b)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, r, err := db.Query("SELECT age FROM t WHERE code = ?", "c"+strconv.Itoa(i%compareN)); err != nil || len(r) != 1 {
+			b.Fatalf("rows=%d err=%v", len(r), err)
+		}
+	}
+}
+func BenchmarkFetchByScan_SQLiteMem(b *testing.B) {
+	s, _ := newIdxScanSQLite(b).Prepare("SELECT age FROM t WHERE code = ?")
+	defer s.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var a int64
+		s.QueryRow("c" + strconv.Itoa(i%compareN)).Scan(&a)
+	}
+}
+
+// ---- UPDATE by indexed column / by scan (1 row; WHERE column unchanged) ----
+func BenchmarkUpdateByIndex_FASTSQL_Mem(b *testing.B) {
+	db := newIdxScanDB(b)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		db.Exec("UPDATE t SET age = ? WHERE email = ?", (i%100)+1, "e"+strconv.Itoa(i%compareN))
+		b.StopTimer()
+		db.mergeIndexes() // drain the overlay so the next lookup is steady-state
+		b.StartTimer()
+	}
+}
+func BenchmarkUpdateByIndex_SQLiteMem(b *testing.B) {
+	s, _ := newIdxScanSQLite(b).Prepare("UPDATE t SET age = ? WHERE email = ?")
+	defer s.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		s.Exec((i%100)+1, "e"+strconv.Itoa(i%compareN))
+	}
+}
+func BenchmarkUpdateByScan_FASTSQL_Mem(b *testing.B) {
+	db := newIdxScanDB(b)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		db.Exec("UPDATE t SET age = ? WHERE code = ?", (i%100)+1, "c"+strconv.Itoa(i%compareN))
+	}
+}
+func BenchmarkUpdateByScan_SQLiteMem(b *testing.B) {
+	s, _ := newIdxScanSQLite(b).Prepare("UPDATE t SET age = ? WHERE code = ?")
+	defer s.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		s.Exec((i%100)+1, "c"+strconv.Itoa(i%compareN))
+	}
+}
+
+// ---- DELETE by indexed column / by scan (insert a fresh row untimed, time its
+// removal; table size stays ~constant) ----
+func BenchmarkDeleteByIndex_FASTSQL_Mem(b *testing.B) {
+	db := newIdxScanDB(b)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		em := "ek" + strconv.Itoa(i)
+		db.Exec("INSERT INTO t (id, email, code, age) VALUES (?, ?, ?, ?)", tid(compareN+i), em, "x", 1)
+		db.mergeIndexes() // merge the fresh row into the email index → steady-state delete
+		b.StartTimer()
+		db.Exec("DELETE FROM t WHERE email = ?", em)
+	}
+}
+func BenchmarkDeleteByIndex_SQLiteMem(b *testing.B) {
+	d := newIdxScanSQLite(b)
+	ins, _ := d.Prepare("INSERT INTO t (id, email, code, age) VALUES (?, ?, ?, ?)")
+	defer ins.Close()
+	del, _ := d.Prepare("DELETE FROM t WHERE email = ?")
+	defer del.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		em := "ek" + strconv.Itoa(i)
+		ins.Exec(key16(compareN+i), em, "x", 1)
+		b.StartTimer()
+		del.Exec(em)
+	}
+}
+func BenchmarkDeleteByScan_FASTSQL_Mem(b *testing.B) {
+	db := newIdxScanDB(b)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		cd := "ck" + strconv.Itoa(i)
+		db.Exec("INSERT INTO t (id, email, code, age) VALUES (?, ?, ?, ?)", tid(compareN+i), "x"+strconv.Itoa(i), cd, 1)
+		b.StartTimer()
+		db.Exec("DELETE FROM t WHERE code = ?", cd) // full scan finds the live row
+	}
+}
+func BenchmarkDeleteByScan_SQLiteMem(b *testing.B) {
+	d := newIdxScanSQLite(b)
+	ins, _ := d.Prepare("INSERT INTO t (id, email, code, age) VALUES (?, ?, ?, ?)")
+	defer ins.Close()
+	del, _ := d.Prepare("DELETE FROM t WHERE code = ?")
+	defer del.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		cd := "ck" + strconv.Itoa(i)
+		ins.Exec(key16(compareN+i), "x"+strconv.Itoa(i), cd, 1)
+		b.StartTimer()
+		del.Exec(cd)
 	}
 }

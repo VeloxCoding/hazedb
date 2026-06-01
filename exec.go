@@ -295,6 +295,8 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 			if ok, src := detectPKEq(s.where, rt); ok {
 				pl.pkLookup = true
 				pl.pkSource = src
+			} else {
+				rt.planIndexEq(pl, s.where) // secondary-index candidates instead of a scan
 			}
 		}
 	case *deleteStmt:
@@ -305,6 +307,8 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 			if ok, src := detectPKEq(s.where, rt); ok {
 				pl.pkLookup = true
 				pl.pkSource = src
+			} else {
+				rt.planIndexEq(pl, s.where) // secondary-index candidates instead of a scan
 			}
 		}
 	}
@@ -336,6 +340,28 @@ func detectColEq(e expr, rt *resolvedTable, ordinal int) (bool, expr) {
 // detectPKEq is detectColEq pinned to the PK column.
 func detectPKEq(e expr, rt *resolvedTable) (bool, expr) {
 	return detectColEq(e, rt, rt.pkOrdinal)
+}
+
+// planIndexEq sets idxLookup + idxCols/idxSrcs when the WHERE pins one or more
+// single-column secondary-indexed columns by equality, so UPDATE/DELETE resolve
+// candidates through the index (like SELECT) instead of scanning every row.
+func (rt *resolvedTable) planIndexEq(pl *plan, where expr) {
+	if where == nil || len(rt.indexes) == 0 {
+		return
+	}
+	eqs := map[int]expr{}
+	collectEqConjuncts(where, eqs)
+	for i := range rt.indexes {
+		ri := &rt.indexes[i]
+		if len(ri.ordinals) != 1 {
+			continue
+		}
+		if src, has := eqs[ri.ordinals[0]]; has {
+			pl.idxCols = append(pl.idxCols, ri.ordinals[0])
+			pl.idxSrcs = append(pl.idxSrcs, src)
+		}
+	}
+	pl.idxLookup = len(pl.idxCols) > 0
 }
 
 // planComposite selects a composite ordered index for a SELECT whose WHERE pins
@@ -1850,6 +1876,20 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		}
 		journalAll = db.journalTxnBodies
 	}
+	// Secondary-index WHERE: update only the index candidates (∪ dirty), re-checked
+	// against the full WHERE, instead of scanning every row.
+	if pl.idxLookup {
+		cand, ok, err := db.idxCandidates(pl, ctx)
+		if err != nil {
+			return 0, err
+		}
+		if !ok {
+			return 0, nil
+		}
+		var pks []UUID
+		cand.emit(func(pk UUID) bool { pks = append(pks, pk); return false })
+		return tbl.updateByCandidates(pks, match, pl.updateOrdinals, compute, encode, journalAll)
+	}
 	return tbl.updateWhereAll(match, pl.updateOrdinals, compute, encode, journalAll)
 }
 
@@ -1919,6 +1959,20 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 			return encodeDeleteMutation(nil, tbl.tableID, pk)
 		}
 		journalAll = db.journalTxnBodies
+	}
+	// Secondary-index WHERE: delete only the index candidates (∪ dirty), re-checked
+	// against the full WHERE, instead of scanning every row.
+	if pl.idxLookup {
+		cand, ok, err := db.idxCandidates(pl, ctx)
+		if err != nil {
+			return 0, err
+		}
+		if !ok {
+			return 0, nil
+		}
+		var pks []UUID
+		cand.emit(func(pk UUID) bool { pks = append(pks, pk); return false })
+		return tbl.deleteByCandidates(pks, match, encode, journalAll)
 	}
 	return tbl.deleteWhereAll(match, encode, journalAll)
 }

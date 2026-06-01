@@ -533,6 +533,58 @@ func (t *table) updateWhereAll(match func(Row) bool, ords []int, compute func(Ro
 	return len(pending), nil
 }
 
+// updateByCandidates is updateWhereAll narrowed to a candidate PK set resolved
+// through a secondary index: it visits only those rows — re-checking match (the
+// full WHERE) under the lock, so a stale index hit or unrelated dirty PK yields
+// no wrong write — instead of scanning every row. Same all-shard-lock +
+// single-TXN atomicity. Non-partitioned only (secondary indexes are not on
+// partitioned tables, so idxLookup never fires for them).
+func (t *table) updateByCandidates(pks []UUID, match func(Row) bool, ords []int, compute func(Row) ([]Value, error), encode func(Row) []byte, journalAll func([][]byte) error) (int, error) {
+	t.lockAllShards()
+	defer t.unlockAllShards()
+	type pendingUpdate struct {
+		s  *tableShard
+		j  uint64
+		nr Row
+	}
+	var pending []pendingUpdate
+	var bodies [][]byte
+	for _, pk := range pks {
+		s := t.shardOf(pk)
+		rowID, ok := s.pk[pk]
+		if !ok {
+			continue
+		}
+		r := s.rows[rowID]
+		if r == nil || !match(r) {
+			continue
+		}
+		vals, err := compute(r)
+		if err != nil {
+			return 0, err
+		}
+		nr := r.Clone()
+		for k, ord := range ords {
+			nr[ord] = vals[k]
+		}
+		pending = append(pending, pendingUpdate{s, rowID, nr})
+		if encode != nil {
+			bodies = append(bodies, encode(nr))
+		}
+	}
+	if journalAll != nil && len(bodies) > 0 {
+		if err := journalAll(bodies); err != nil {
+			return 0, err
+		}
+	}
+	pkOrd := t.def.pkOrdinal
+	for _, p := range pending {
+		p.s.rows[p.j] = p.nr
+		t.markDirtyLocked(p.s, p.nr[pkOrd].UUID())
+	}
+	return len(pending), nil
+}
+
 // deleteByPK removes the row at pk. Returns false if absent.
 // Tombstones in place (rows[rowID] = nil) so rowIDs stay stable.
 func (t *table) deleteByPK(pk UUID) bool {
@@ -582,6 +634,49 @@ func (t *table) deleteWhereAll(match func(Row) bool, encode func(pk Value) []byt
 			if encode != nil {
 				bodies = append(bodies, encode(r[pkOrd]))
 			}
+		}
+	}
+	if journalAll != nil && len(bodies) > 0 {
+		if err := journalAll(bodies); err != nil {
+			return 0, err
+		}
+	}
+	for _, p := range pending {
+		delete(p.s.pk, p.pk)
+		p.s.rows[p.j] = nil
+		p.s.live--
+		t.markDirtyLocked(p.s, p.pk)
+	}
+	return len(pending), nil
+}
+
+// deleteByCandidates is deleteWhereAll narrowed to a secondary-index candidate
+// set: it visits only those PKs — re-checking match under the lock — instead of
+// scanning. Same all-shard-lock + single-TXN atomicity. Non-partitioned only.
+func (t *table) deleteByCandidates(pks []UUID, match func(Row) bool, encode func(pk Value) []byte, journalAll func([][]byte) error) (int, error) {
+	pkOrd := t.def.pkOrdinal
+	t.lockAllShards()
+	defer t.unlockAllShards()
+	type pendingDelete struct {
+		s  *tableShard
+		j  uint64
+		pk UUID
+	}
+	var pending []pendingDelete
+	var bodies [][]byte
+	for _, pk := range pks {
+		s := t.shardOf(pk)
+		rowID, ok := s.pk[pk]
+		if !ok {
+			continue
+		}
+		r := s.rows[rowID]
+		if r == nil || !match(r) {
+			continue
+		}
+		pending = append(pending, pendingDelete{s, rowID, pk})
+		if encode != nil {
+			bodies = append(bodies, encode(r[pkOrd]))
 		}
 	}
 	if journalAll != nil && len(bodies) > 0 {
