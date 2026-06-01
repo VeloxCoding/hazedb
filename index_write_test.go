@@ -99,3 +99,36 @@ func TestUpdateDeleteByIndexDirtyOverlay(t *testing.T) {
 		t.Fatal("fresh row not deleted")
 	}
 }
+
+// When the dirty overlay outgrows the table (merger not keeping up), the hybrid
+// candidate walk costs more than a scan, so idxLookup falls through to the scan
+// path (dirtyTooDenseForScan). That fallback must still touch exactly the right
+// rows — these inserts are never merged, so dirtyCount == liveCount triggers it.
+func TestIndexWriteScanFallbackWhenDirtyDense(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE u (id uuid primary key, email text, age int, INDEX (email))")
+	for i := 0; i < 50; i++ {
+		db.Exec("INSERT INTO u (id, email, age) VALUES (?, ?, ?)", NewUUIDv7(), "e"+strconv.Itoa(i), 10)
+	}
+	// No mergeIndexes(): every row is in the dirty overlay, so dirtyCount equals
+	// liveCount and the density guard forces the scan path.
+	tbl := db.cat.Load().byName["u"].table
+	if !tbl.dirtyTooDenseForScan() {
+		t.Fatal("dense dirty overlay should force the scan fallback")
+	}
+	if n, err := db.Exec("UPDATE u SET age = ? WHERE email = ?", 99, "e7"); err != nil || n != 1 {
+		t.Fatalf("scan-fallback update: n=%d err=%v", n, err)
+	}
+	if _, rows, _ := db.Query("SELECT age FROM u WHERE email = ?", "e7"); len(rows) != 1 || rows[0][0].Int() != 99 {
+		t.Fatalf("e7 not updated via scan fallback: %v", rows)
+	}
+	if _, rows, _ := db.Query("SELECT age FROM u WHERE email = ?", "e8"); rows[0][0].Int() != 10 {
+		t.Fatal("e8 wrongly updated by scan fallback")
+	}
+	if n, err := db.Exec("DELETE FROM u WHERE email = ?", "e7"); err != nil || n != 1 {
+		t.Fatalf("scan-fallback delete: n=%d err=%v", n, err)
+	}
+	if got := tbl.liveCount(); got != 49 {
+		t.Fatalf("live count after scan-fallback delete = %d, want 49", got)
+	}
+}

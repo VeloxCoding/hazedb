@@ -1877,8 +1877,10 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		journalAll = db.journalTxnBodies
 	}
 	// Secondary-index WHERE: update only the index candidates (∪ dirty), re-checked
-	// against the full WHERE, instead of scanning every row.
-	if pl.idxLookup {
+	// against the full WHERE, instead of scanning every row. Under a heavy write
+	// burst the dirty overlay can outgrow the table, making the candidate walk
+	// cost more than a scan — dirtyTooDenseForScan falls through to updateWhereAll.
+	if pl.idxLookup && !tbl.dirtyTooDenseForScan() {
 		cand, ok, err := db.idxCandidates(pl, ctx)
 		if err != nil {
 			return 0, err
@@ -1984,8 +1986,10 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 		journalAll = db.journalTxnBodies
 	}
 	// Secondary-index WHERE: delete only the index candidates (∪ dirty), re-checked
-	// against the full WHERE, instead of scanning every row.
-	if pl.idxLookup {
+	// against the full WHERE, instead of scanning every row. Under a heavy write
+	// burst the dirty overlay can outgrow the table, making the candidate walk
+	// cost more than a scan — dirtyTooDenseForScan falls through to deleteWhereAll.
+	if pl.idxLookup && !tbl.dirtyTooDenseForScan() {
 		cand, ok, err := db.idxCandidates(pl, ctx)
 		if err != nil {
 			return 0, err

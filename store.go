@@ -763,3 +763,17 @@ func (t *table) liveCount() int {
 	}
 	return n
 }
+
+// dirtyTooDenseForScan reports whether the dirty overlay has grown large enough
+// that the hybrid candidate path (idxCandidates walks every dirty PK to dedup
+// against the index hits) would do MORE work than a full table scan. When true,
+// an indexed UPDATE/DELETE falls back to the scan path so it is never slower
+// than the pre-index full-scan behaviour under a heavy write burst. Steady state
+// (no dirty) returns false without the 32-shard liveCount sweep.
+func (t *table) dirtyTooDenseForScan() bool {
+	dc := t.dirtyCount.Load()
+	if dc == 0 {
+		return false
+	}
+	return dc >= int64(t.liveCount())
+}
