@@ -26,14 +26,22 @@ import "encoding/binary"
 // where all component columns are non-NULL (mirrors the scalar "NULL is never
 // indexed" rule); the caller enforces indexability, so a NULL never reaches here.
 func encodeCompositeKey(vals []Value) indexKey {
-	var buf []byte
+	k, _ := encodeCompositeKeyInto(nil, vals)
+	return k
+}
+
+// encodeCompositeKeyInto encodes vals into buf[:0] and returns the key plus the
+// (grown) buffer to reuse on the next call. A merge encoding many keys then
+// allocates only the per-key string (string(buf)), not a fresh scratch buffer
+// per row. KindBytes routes less() to the bytewise s compare — exactly what a
+// composite key needs; the component count is fixed per index, so two keys of
+// one index always compare correctly.
+func encodeCompositeKeyInto(buf []byte, vals []Value) (indexKey, []byte) {
+	buf = buf[:0]
 	for i := range vals {
 		buf = appendOrderedColumn(buf, vals[i])
 	}
-	// KindBytes routes less() to the bytewise s compare — exactly what a composite
-	// key needs. The component count is fixed per index, so two keys of the same
-	// index always have comparable, well-formed encodings.
-	return indexKey{kind: KindBytes, s: string(buf)}
+	return indexKey{kind: KindBytes, s: string(buf)}, buf
 }
 
 // appendOrderedColumn appends v's order-preserving encoding to buf. See the file

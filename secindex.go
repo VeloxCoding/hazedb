@@ -108,18 +108,27 @@ func newSecIndex(ri resolvedIndex) *secIndex {
 // indexed, so the row drops out of this index entirely. Single-column reuses the
 // scalar keyOf (no allocation, unchanged hot path); composite encodes the tuple.
 func (si *secIndex) keyFromCells(cells []Value) (indexKey, bool) {
+	k, ok, _ := si.keyFromCellsInto(cells, nil)
+	return k, ok
+}
+
+// keyFromCellsInto is keyFromCells with a reusable encode buffer: it returns the
+// (grown) buffer so a merge encoding many composite keys reuses one scratch and
+// allocates only the per-key string. The single-column path ignores buf.
+func (si *secIndex) keyFromCellsInto(cells []Value, buf []byte) (indexKey, bool, []byte) {
 	if len(si.ordinals) == 1 {
 		if cells[0].Kind == KindNull {
-			return indexKey{}, false
+			return indexKey{}, false, buf
 		}
-		return keyOf(cells[0]), true
+		return keyOf(cells[0]), true, buf
 	}
 	for i := range cells {
 		if cells[i].Kind == KindNull {
-			return indexKey{}, false
+			return indexKey{}, false, buf
 		}
 	}
-	return encodeCompositeKey(cells), true
+	k, buf := encodeCompositeKeyInto(buf, cells)
+	return k, true, buf
 }
 
 // apply records pk's current indexed key. indexable=false means the row is gone
@@ -462,6 +471,7 @@ func (t *table) mergeIndexes() {
 		ords = append(ords, si.ordinals...)
 	}
 	var scratch []Value
+	var encBuf []byte // reused across rows so composite encoding allocs only the key string
 	type pending struct {
 		s *tableShard
 		n int
@@ -488,7 +498,8 @@ func (t *table) mergeIndexes() {
 					continue
 				}
 				cells := pr[spans[k].off : spans[k].off+spans[k].n]
-				key, indexable := si.keyFromCells(cells)
+				key, indexable, b := si.keyFromCellsInto(cells, encBuf)
+				encBuf = b
 				si.apply(pk, key, indexable)
 			}
 		}

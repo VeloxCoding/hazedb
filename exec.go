@@ -123,6 +123,11 @@ type plan struct {
 	compWalk       bool
 	compOrdinals   []int
 	compPrefixSrcs []expr
+	// compResidual (compWalk only) is the WHERE conjuncts the pinned prefix does
+	// NOT already guarantee. The walk's snap sub-range is exactly the pinned-key
+	// rows, so re-checking the prefix equalities per row is wasted work; an empty
+	// residual lets the walk take the one-clone fast path.
+	compResidual []expr
 
 	// joinPlan is non-nil for a two-table join; execSelect dispatches to execJoin.
 	// projOrdinals / colNames / orderOrdinal are then bound to global concat-row
@@ -238,7 +243,7 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 				}
 				pl.idxLookup = len(pl.idxCols) > 0
 				if !pl.idxLookup {
-					rt.planComposite(pl, eqs, pl.orderOrdinal)
+					rt.planComposite(pl, s.where, eqs, pl.orderOrdinal)
 				}
 			}
 		}
@@ -340,7 +345,7 @@ func detectPKEq(e expr, rt *resolvedTable) (bool, expr) {
 // first unpinned column (already sorted within the prefix — no sort) or
 // compLookup otherwise. The leading column must be pinned (k ≥ 1). First usable
 // index wins.
-func (rt *resolvedTable) planComposite(pl *plan, eqs map[int]expr, orderOrdinal int) {
+func (rt *resolvedTable) planComposite(pl *plan, where expr, eqs map[int]expr, orderOrdinal int) {
 	for i := range rt.indexes {
 		ri := &rt.indexes[i]
 		if len(ri.ordinals) < 2 || !ri.ordered {
@@ -364,13 +369,28 @@ func (rt *resolvedTable) planComposite(pl *plan, eqs map[int]expr, orderOrdinal 
 			continue // leading column not pinned by equality
 		}
 		srcs := make([]expr, k)
+		pinned := make(map[int]bool, k)
 		for j := 0; j < k; j++ {
 			srcs[j] = eqs[ri.ordinals[j]]
+			pinned[ri.ordinals[j]] = true
 		}
 		pl.compOrdinals = ri.ordinals
 		pl.compPrefixSrcs = srcs
 		if orderOrdinal >= 0 && k < len(ri.ordinals) && ri.ordinals[k] == orderOrdinal {
 			pl.compWalk = true // ORDER BY on the trailing column: walk in order, no sort
+			// Residual = WHERE conjuncts the prefix does not already guarantee. Drop
+			// only the EXACT pin equalities (by value-expr identity), so a second
+			// constraint on a pinned column survives and stays correct.
+			var conj []expr
+			collectConjuncts(where, &conj)
+			for _, c := range conj {
+				if b, ok := c.(*binOp); ok && b.op == tkEq {
+					if cr, val := colAndLit(b); cr != nil && pinned[cr.ord] && val == eqs[cr.ord] {
+						continue
+					}
+				}
+				pl.compResidual = append(pl.compResidual, c)
+			}
 		} else {
 			pl.compLookup = true
 		}
@@ -1052,7 +1072,7 @@ func (db *DB) execSelectCompositeWalk(pl *plan, args []Value) ([]string, []Row, 
 		}
 		return encodeCompositeKey(cells)
 	}
-	return db.orderedWalk(pl, args, snap, dirtyKey)
+	return db.orderedWalk(pl, args, snap, dirtyKey, pl.compResidual)
 }
 
 // execSelectOrderedWalk serves an ORDER BY on an ordered-indexed column by
@@ -1151,7 +1171,11 @@ func (db *DB) execSelectOrderedWalk(pl *plan, args []Value) ([]string, []Row, er
 		return pl.colNames, nil, nil
 	}
 	ord := pl.orderOrdinal
-	return db.orderedWalk(pl, args, si.snapshot(), func(r Row) indexKey { return keyOf(r[ord]) })
+	// The single-column index sits on the ORDER BY column, not the WHERE columns,
+	// so the snap guarantees nothing about the WHERE: the whole WHERE is residual.
+	var residual []expr
+	collectConjuncts(pl.st.(*selectStmt).where, &residual)
+	return db.orderedWalk(pl, args, si.snapshot(), func(r Row) indexKey { return keyOf(r[ord]) }, residual)
 }
 
 // orderedWalk merges a sorted index slice (snap, ascending key order) with the
@@ -1162,7 +1186,14 @@ func (db *DB) execSelectOrderedWalk(pl *plan, args []Value) ([]string, []Row, er
 // fresh, so its key drives the ordering and the row is fetched only when
 // selected; dirty PKs are excluded from the snap walk (their entry may be stale)
 // and supplied from their live rows.
-func (db *DB) orderedWalk(pl *plan, args []Value, snap []ordEntry, dirtyKey func(Row) indexKey) ([]string, []Row, error) {
+//
+// residual is the WHERE conjuncts NOT already guaranteed by the snap (for a
+// single-column walk that is the whole WHERE; for a composite prefix walk it
+// excludes the pinned equalities the sub-range already enforces). An empty
+// residual means index rows need no per-row check, so they take the one-clone
+// getByPKProject fast path. Dirty rows are always filtered by the FULL WHERE
+// (buildDirtyCands' match) — the snap guarantees nothing about an unmerged row.
+func (db *DB) orderedWalk(pl *plan, args []Value, snap []ordEntry, dirtyKey func(Row) indexKey, residual []expr) ([]string, []Row, error) {
 	st := pl.st.(*selectStmt)
 	tbl := pl.rt
 	colNames := pl.colNames
@@ -1170,13 +1201,23 @@ func (db *DB) orderedWalk(pl *plan, args []Value, snap []ordEntry, dirtyKey func
 		return colNames, nil, nil
 	}
 	ctx := evalCtx{cols: tbl.def.colByName, args: args}
-	matches := func(r Row) bool {
+	matches := func(r Row) bool { // full WHERE — filters dirty candidates
 		if st.where == nil {
 			return true
 		}
 		ctx.row = r
 		v, err := evalExpr(st.where, &ctx)
 		return err == nil && truthy(v)
+	}
+	passResidual := func(r Row) bool { // only the conjuncts the snap doesn't guarantee
+		for _, p := range residual {
+			ctx.row = r
+			v, err := evalExpr(p, &ctx)
+			if err != nil || !truthy(v) {
+				return false
+			}
+		}
+		return true
 	}
 	dc, dirtySet := tbl.buildDirtyCands(matches, dirtyKey)
 
@@ -1188,7 +1229,7 @@ func (db *DB) orderedWalk(pl *plan, args []Value, snap []ordEntry, dirtyKey func
 	out := make([]Row, 0, capHint)
 	done := func() bool { return eff >= 0 && len(out) >= eff }
 	emitIdx := func(pk UUID) {
-		if st.where == nil { // no residual: fetch projected directly (one clone)
+		if len(residual) == 0 { // snap fully satisfies the filter: one clone, projected
 			if st.starAll {
 				if r, ok := tbl.getByPK(pk); ok {
 					out = append(out, r)
@@ -1198,7 +1239,7 @@ func (db *DB) orderedWalk(pl *plan, args []Value, snap []ordEntry, dirtyKey func
 			}
 			return
 		}
-		if r, ok := tbl.getByPK(pk); ok && matches(r) { // residual needs the full row
+		if r, ok := tbl.getByPK(pk); ok && passResidual(r) { // residual needs the full row
 			if st.starAll {
 				out = append(out, r)
 			} else {

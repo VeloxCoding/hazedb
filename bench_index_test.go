@@ -221,6 +221,85 @@ func benchCompositeWalk(b *testing.B, perAuthor int) {
 func BenchmarkCompositeWalk_50(b *testing.B)   { benchCompositeWalk(b, 50) }
 func BenchmarkCompositeWalk_5000(b *testing.B) { benchCompositeWalk(b, 5000) }
 
+// Composite full-tuple lookup: WHERE author = ? AND title = ? on ORDERED INDEX
+// (author, title) resolves to ~1 row via a prefix lookup on the encoded tuple,
+// independent of how many titles the author has (perAuthor) — vs a single-column
+// INDEX (author) which would fetch the whole author bucket then residual-filter.
+func benchCompositeLookup(b *testing.B, perAuthor int) {
+	const authors = 100
+	n := authors * perAuthor
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: n})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec("CREATE TABLE posts (id uuid primary key, author text, title text, ORDERED INDEX (author, title))")
+	for i := 0; i < n; i++ {
+		db.Exec("INSERT INTO posts (id, author, title) VALUES (?, ?, ?)",
+			NewUUIDv7(), "a"+strconv.Itoa(i%authors), "t"+strconv.Itoa(i))
+	}
+	db.mergeIndexes()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ { // author a7's titles are t7, t107, ...; t7 exists for it
+		if _, rows, err := db.Query("SELECT id FROM posts WHERE author = ? AND title = ?", "a7", "t7"); err != nil || len(rows) != 1 {
+			b.Fatalf("rows=%d err=%v", len(rows), err)
+		}
+	}
+}
+
+func BenchmarkCompositeLookup_50(b *testing.B)   { benchCompositeLookup(b, 50) }
+func BenchmarkCompositeLookup_5000(b *testing.B) { benchCompositeLookup(b, 5000) }
+
+// Composite-index merge cost: the encoder builds one order-preserving tuple key
+// (a string alloc) per row. Compare to BenchmarkIndexMerge_50k (two scalar
+// single-column keys per row) to size the maintenance overhead of a composite.
+func BenchmarkCompositeMerge_50k(b *testing.B) {
+	const n = 50000
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: n})
+		if err != nil {
+			b.Fatal(err)
+		}
+		db.Exec("CREATE TABLE t (id uuid primary key, name text, email text, ORDERED INDEX (name, email))")
+		for j := 0; j < n; j++ {
+			db.Exec("INSERT INTO t (id, name, email) VALUES (?, ?, ?)", NewUUIDv7(), "n"+strconv.Itoa(j%100), "u"+strconv.Itoa(j))
+		}
+		b.StartTimer()
+		db.mergeIndexes()
+		b.StopTimer()
+		db.Close()
+	}
+}
+
+// Parallel composite walk: the hot read path holds only brief per-shard RLocks,
+// so concurrent readers must scale. 100 authors x 100 titles, LIMIT 20.
+func BenchmarkCompositeWalk_Parallel(b *testing.B) {
+	const authors, perAuthor = 100, 100
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: authors * perAuthor})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec("CREATE TABLE posts (id uuid primary key, author text, title text, ORDERED INDEX (author, title))")
+	for i := 0; i < authors*perAuthor; i++ {
+		db.Exec("INSERT INTO posts (id, author, title) VALUES (?, ?, ?)",
+			NewUUIDv7(), "a"+strconv.Itoa(i%authors), "t"+strconv.Itoa(i))
+	}
+	db.mergeIndexes()
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if _, rows, err := db.Query("SELECT id, title FROM posts WHERE author = ? ORDER BY title DESC LIMIT 20", "a7"); err != nil || len(rows) != 20 {
+				b.Fatalf("rows=%d err=%v", len(rows), err)
+			}
+		}
+	})
+}
+
 // Global ORDER BY on an ordered index: walk the sorted view + take LIMIT, no
 // scan + sort. Compare to a hash index, which would scan all + top-N heap.
 func BenchmarkOrderedWalk_50k(b *testing.B) {
