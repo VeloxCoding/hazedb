@@ -66,6 +66,15 @@ type Options struct {
 	// indexMergeInterval is how often secondary indexes reconcile dirty rows.
 	// Zero = 50ms; negative disables it (manual merge, for pre-merge assertions).
 	indexMergeInterval time.Duration
+	// indexMergeThreshold is the size-trigger: the merger fires early (before
+	// indexMergeInterval elapses) when the dirty overlay grows dense, bounding
+	// overlay growth under a write burst. Zero (the default) is ADAPTIVE — a
+	// table fires when its overlay reaches a quarter of its live rows (floored,
+	// so a near-empty table does not merge-spam). A positive value is a fixed
+	// absolute total-overlay threshold (explicit tuning). Negative disables the
+	// size-trigger (pure time-trigger). The merger polls these counters itself,
+	// so this never touches the write path.
+	indexMergeThreshold int64
 }
 
 // validate rejects contradictory configs before any resource is opened. The

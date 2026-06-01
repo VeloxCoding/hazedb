@@ -123,9 +123,14 @@ only *narrows* the candidate set; the truth always comes from the live row.
 
 ## 6. The merger (async)
 
-One goroutine per DB, on a fixed interval (`indexMergeInterval`, like the WAL
-flush ticker); `Close` runs one final merge so a clean shutdown leaves no lag.
-Each cycle, per shard:
+One goroutine per DB. It fires on `indexMergeInterval` (like the WAL flush
+ticker) **or early on a size-trigger** — whichever comes first — so a write burst
+cannot grow the overlay unbounded between ticks. The size-trigger is adaptive by
+default (`indexMergeThreshold == 0`): a table fires when its dirty overlay reaches
+~¼ of its live rows. A positive `indexMergeThreshold` is a fixed absolute cap; a
+negative value disables it (pure interval). The merger polls the dirty counters
+itself, so the trigger never touches the write path. `Close` runs one final merge
+so a clean shutdown leaves no lag. Each cycle, per shard:
 
 1. Lock, **snapshot the current dirty prefix** (`dirty[:n]` into a batch),
    unlock — the shard lock is held only momentarily.
@@ -142,11 +147,13 @@ Each cycle, per shard:
 concurrent reader sees the row via the dirty overlay until the moment it is in
 the index — never in the gap between the two.
 
-**Backpressure (not yet implemented).** Today the merger is interval-only with no
-dirty-size cap, so a sustained write burst grows the dirty lists and the merge
-lag between ticks. The intended guard is a bounded-dirty threshold that forces a
-synchronous merge (or a one-off full scan for that read), `log()`ed and never
-silently dropped — see §11.
+**Backpressure.** Two mechanisms bound a sustained write burst. (1) The merger's
+size-trigger (above) fires early when the overlay grows dense, capping its size
+instead of waiting out the interval. (2) On the read side, `dirtyTooDenseForScan`
+([store.go](../store.go)): when the overlay still outgrows the table (the trigger
+hasn't caught up), an indexed UPDATE/DELETE falls back to a full scan rather than
+walking an overlay larger than the table — so it is never slower than the
+pre-index scan path. Both are bounds, not drops: every dirty PK is still merged.
 
 ---
 

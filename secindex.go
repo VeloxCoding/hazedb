@@ -377,23 +377,87 @@ func (t *table) indexByOrdinals(ords []int) *secIndex {
 // startMergeLoop launches the background merger: every interval it reconciles
 // all indexed tables. Mirrors the WAL flush ticker. Started by Open; stopped by
 // Close (which runs a final drain first).
-func (db *DB) startMergeLoop(interval time.Duration) {
+func (db *DB) startMergeLoop(interval time.Duration, threshold int64) {
 	db.mergeStop = make(chan struct{})
 	db.mergeDone = make(chan struct{})
 	go func() {
 		defer close(db.mergeDone)
-		t := time.NewTicker(interval)
+		// Size-trigger disabled (threshold < 0): tick once per interval, merge
+		// every tick — the pure time-trigger. Active (threshold >= 0, adaptive or
+		// fixed): poll at interval/pollDiv and merge as soon as the overlay grows
+		// dense, OR the full interval elapses (a freshness floor) — whichever comes
+		// first. The merger reads the dirty counters itself, so the size-trigger
+		// never adds work to the write path.
+		const pollDiv = 10
+		sizeActive := threshold >= 0
+		poll := interval
+		if sizeActive && interval/pollDiv > 0 {
+			poll = interval / pollDiv
+		}
+		ticksPerInterval := int(interval / poll)
+		if ticksPerInterval < 1 {
+			ticksPerInterval = 1
+		}
+		t := time.NewTicker(poll)
 		defer t.Stop()
+		ticks := 0
 		for {
 			select {
 			case <-db.mergeStop:
 				db.mergeIndexes() // final drain so a clean Close leaves no lag
 				return
 			case <-t.C:
-				db.mergeIndexes()
+				ticks++
+				sizeHit := sizeActive && db.sizeTriggerFired(threshold)
+				if sizeHit || ticks >= ticksPerInterval {
+					db.mergeIndexes()
+					ticks = 0
+				}
 			}
 		}
 	}()
+}
+
+// totalDirty sums the pending dirty-PK count across every table in the current
+// catalog. Cheap (one atomic load per table) — the merger's size-trigger poll.
+func (db *DB) totalDirty() int64 {
+	var n int64
+	for _, rt := range db.cat.Load().byID {
+		if rt != nil {
+			n += rt.table.dirtyCount.Load()
+		}
+	}
+	return n
+}
+
+// sizeTriggerFired reports whether any table's dirty overlay has grown dense
+// enough to merge before the interval elapses. fixed>0 uses an absolute total
+// threshold; fixed==0 is ADAPTIVE — a table fires when its overlay reaches a
+// quarter of its live rows. The floor skips the per-table liveCount sweep for
+// small overlays (cheap to walk anyway) and stops a near-empty table from
+// merge-spamming.
+func (db *DB) sizeTriggerFired(fixed int64) bool {
+	if fixed > 0 {
+		return db.totalDirty() >= fixed
+	}
+	const floor = 256
+	for _, rt := range db.cat.Load().byID {
+		if rt == nil {
+			continue
+		}
+		d := rt.table.dirtyCount.Load()
+		if d < floor {
+			continue // overlay tiny: cheap to walk, no early merge
+		}
+		thr := int64(rt.table.liveCount() / 4)
+		if thr < floor {
+			thr = floor
+		}
+		if d >= thr {
+			return true
+		}
+	}
+	return false
 }
 
 // stopMergeLoop signals the merger to drain once and exit, then waits for it.

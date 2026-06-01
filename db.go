@@ -176,7 +176,7 @@ func Open(opts Options) (*DB, error) {
 		}
 	}
 	if opts.indexMergeInterval > 0 {
-		db.startMergeLoop(opts.indexMergeInterval)
+		db.startMergeLoop(opts.indexMergeInterval, opts.indexMergeThreshold)
 	}
 	return db, nil
 }
