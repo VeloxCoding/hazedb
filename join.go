@@ -14,8 +14,8 @@ package hazedb
 // lock cycles. A join is therefore per-shard-consistent, not point-in-time
 // (the same contract as any multi-shard read).
 //
-// v1 scope: one JOIN (two tables), single `ON a.col = b.col` equality, INNER or
-// LEFT. RIGHT/FULL/CROSS, N-way joins, and WHERE pushdown are deferred.
+// v1 scope: one JOIN (two tables), single `ON a.col = b.col` equality, INNER,
+// LEFT, or RIGHT. FULL/CROSS, N-way joins, and non-equi conditions are deferred.
 
 import "fmt"
 
@@ -23,7 +23,7 @@ import "fmt"
 // execSelect dispatches to execJoin when it is non-nil.
 type joinPlan struct {
 	leftRT, rightRT *tableRT
-	typ             tokenKind // tkInner or tkLeft
+	typ             tokenKind // tkInner, tkLeft, or tkRight
 	nLeft, nRight   int
 
 	driverRT, probeRT *tableRT
@@ -41,6 +41,12 @@ type joinPlan struct {
 	driverIdxOrd  int // within-driver ordinal of the indexed equality, -1 if none
 	driverIdxSrc  expr
 	driverIdxByPK bool
+
+	// residualPreds are the WHERE conjuncts NOT pushed into the driver (probe-side,
+	// cross-table, and constant conjuncts), evaluated on the assembled concat row.
+	// Driver conjuncts are already enforced by passDriver, so re-checking the full
+	// WHERE there would be wasted work; AND(driverPreds) ∧ AND(residualPreds) == WHERE.
+	residualPreds []expr
 
 	orderOrdinal int // global ordinal of the ORDER BY column, -1 if none
 }
@@ -237,6 +243,21 @@ func (db *DB) planJoin(pl *plan, st *selectStmt, cat *catalog) error {
 		driverConj, driverDef, driverOff = rightConj, rightDef, nLeft
 	}
 	jp.driverPreds = driverConj
+	// residualPreds = every conjunct NOT pushed into the driver. driverConj ⊂ conj,
+	// so this is conj \ driverConj (probe-only + cross-table + constant conjuncts).
+	// passDriver already enforces driverConj; the phase-2 filter only needs these.
+	for _, c := range conj {
+		isDriver := false
+		for _, d := range driverConj {
+			if c == d {
+				isDriver = true
+				break
+			}
+		}
+		if !isDriver {
+			jp.residualPreds = append(jp.residualPreds, c)
+		}
+	}
 	for _, p := range driverConj {
 		b, ok := p.(*binOp)
 		if !ok || b.op != tkEq {
@@ -486,75 +507,107 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 	// Phase 2: probe + assemble, holding no driver lock.
 	eff := fetchBound(st.limit, st.offset)
 	ordered := jp.orderOrdinal >= 0
-	var out []Row
 
-	assemble := func(left, right Row) Row { // a nil side is NULL-padded (outer miss)
-		row := make(Row, nLeft+nRight)
-		if left != nil {
-			copy(row, left)
-		} else {
-			for i := 0; i < nLeft; i++ {
-				row[i] = Null()
-			}
-		}
-		if right != nil {
-			copy(row[nLeft:], right)
-		} else {
-			for i := nLeft; i < nLeft+nRight; i++ {
-				row[i] = Null()
-			}
-		}
-		return row
-	}
-	// keep filters by the full WHERE and collects; returns true to STOP (the
-	// fetch bound is offset+limit, dropped to limit by sliceOffsetLimit later).
-	keep := func(concat Row) bool {
-		if st.where != nil {
+	// passResidual applies the WHERE conjuncts NOT already pushed into the driver
+	// (probe-side / cross-table / constant). Driver conjuncts ran in passDriver, so
+	// re-checking the full WHERE here would be wasted work.
+	passResidual := func(concat Row) bool {
+		for _, p := range jp.residualPreds {
 			ctx.row = concat
-			v, err := evalExpr(st.where, &ctx)
+			v, err := evalExpr(p, &ctx)
 			if err != nil || !truthy(v) {
 				return false
 			}
 		}
-		out = append(out, concat)
-		return !ordered && eff >= 0 && len(out) >= eff
+		return true
+	}
+	// fillConcat writes [left.. right..] into dst; a nil side is NULL-padded (an
+	// outer-join miss). dst is caller-owned — reused as scratch on the top-N path,
+	// freshly allocated on the gather path.
+	fillConcat := func(dst, left, right Row) {
+		if left != nil {
+			copy(dst[:nLeft], left)
+		} else {
+			for i := 0; i < nLeft; i++ {
+				dst[i] = Null()
+			}
+		}
+		if right != nil {
+			copy(dst[nLeft:], right)
+		} else {
+			for i := nLeft; i < nLeft+nRight; i++ {
+				dst[i] = Null()
+			}
+		}
+	}
+	// drive iterates the materialised drivers, probing each and calling emit(left,
+	// right) per matched pair — plus once with the padded side nil for an unmatched
+	// OUTER driver (LEFT pads right, RIGHT pads left). emit returns true to stop the
+	// whole join early; drive returns when emit stops or the drivers are exhausted.
+	drive := func(emit func(left, right Row) bool) {
+		for _, drow := range drivers {
+			key := drow[jp.driverOnOrd]
+			matched, stop := false, false
+			db.probeRows(jp.probeRT, jp.probeOnOrd, jp.probeByPK, key, func(prow Row) bool {
+				matched = true
+				left, right := drow, prow
+				if !jp.driverIsLeft {
+					left, right = prow, drow
+				}
+				if emit(left, right) {
+					stop = true
+					return true
+				}
+				return false
+			})
+			if stop {
+				return
+			}
+			if !matched {
+				var so bool
+				switch jp.typ {
+				case tkLeft:
+					so = emit(drow, nil)
+				case tkRight:
+					so = emit(nil, drow)
+				}
+				if so {
+					return
+				}
+			}
+		}
 	}
 
-	for _, drow := range drivers {
-		key := drow[jp.driverOnOrd]
-		matched, stop := false, false
-		db.probeRows(jp.probeRT, jp.probeOnOrd, jp.probeByPK, key, func(prow Row) bool {
-			matched = true
-			left, right := drow, prow
-			if !jp.driverIsLeft {
-				left, right = prow, drow
-			}
-			if keep(assemble(left, right)) {
-				stop = true
-				return true
+	// ORDER BY + LIMIT: keep only the best offset+limit rows by the order column
+	// via a top-N heap. Each candidate is assembled into one reused scratch row and
+	// cloned into the heap only when it places — O(offset+limit) clones instead of
+	// O(matched) full joined rows. Never stops early: a later row may outrank the heap.
+	if ordered && st.limit >= 0 {
+		top := topN{ord: jp.orderOrdinal, desc: st.orderDesc, capN: eff}
+		scratch := make(Row, nLeft+nRight)
+		drive(func(left, right Row) bool {
+			fillConcat(scratch, left, right)
+			if passResidual(scratch) {
+				top.offer(scratch) // clones scratch only if it enters the heap
 			}
 			return false
 		})
-		if stop {
-			break
-		}
-		// An OUTER join preserves its driver: an unmatched driver row is emitted
-		// with the other side NULL-padded. LEFT drives left → pad right; RIGHT
-		// drives right → pad left.
-		if !matched {
-			var stopOuter bool
-			switch jp.typ {
-			case tkLeft:
-				stopOuter = keep(assemble(drow, nil))
-			case tkRight:
-				stopOuter = keep(assemble(nil, drow))
-			}
-			if stopOuter {
-				break
-			}
-		}
+		kept := sliceOffsetLimit(top.sorted(), st.offset, st.limit)
+		return colNames, projectRows(kept, st.starAll, pl.projOrdinals), nil
 	}
 
+	// No ORDER BY (stop once offset+limit rows are collected), or ORDER BY without
+	// LIMIT (gather all, then sort). A kept row is a fresh alloc since it is retained.
+	var out []Row
+	drive(func(left, right Row) bool {
+		row := make(Row, nLeft+nRight)
+		fillConcat(row, left, right)
+		if !passResidual(row) {
+			return false
+		}
+		out = append(out, row)
+		return !ordered && eff >= 0 && len(out) >= eff
+	})
 	if ordered {
 		sortRowsByCol(out, jp.orderOrdinal, st.orderDesc)
 	}
