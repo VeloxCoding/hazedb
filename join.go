@@ -287,7 +287,11 @@ func (db *DB) planJoin(pl *plan, st *selectStmt, cat *catalog) error {
 		if within < 0 || within >= len(driverDef.def.Columns) {
 			continue
 		}
-		if within == driverDef.pkOrdinal || jp.driverRT.indexFor(within) != nil {
+		// probeIndexFor (not indexFor): a composite index's LEADING column drives
+		// the pushdown too — the fetch below (probeRows) already resolves it via a
+		// prefix lookup, so the detection must match or the driver falls back to a
+		// full scan (the slow composite-only LEFT case).
+		if within == driverDef.pkOrdinal || jp.driverRT.probeIndexFor(within) != nil {
 			jp.driverIdxOrd, jp.driverIdxSrc, jp.driverIdxByPK = within, val, within == driverDef.pkOrdinal
 			break
 		}

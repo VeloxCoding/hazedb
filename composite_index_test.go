@@ -502,6 +502,33 @@ func TestJoinStreamingDriverNoWhere(t *testing.T) {
 	}
 }
 
+// Codex regression: driver-pushdown must fetch through a composite index's
+// LEADING column (probeIndexFor), not only single-column indexes — else a driver
+// filtered on a composite-only column falls back to a full scan (the slow
+// composite-only case). Pins driverIdxSrc + checks correctness.
+func TestJoinDriverPushdownComposite(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE users (id uuid primary key, name text)")
+	db.Exec("CREATE TABLE posts (id uuid primary key, author uuid, cat text, title text, ORDERED INDEX (cat, title))")
+	u := NewUUIDv7()
+	db.Exec("INSERT INTO users (id, name) VALUES (?, ?)", u, "alice")
+	db.Exec("INSERT INTO posts (id, author, cat, title) VALUES (?, ?, ?, ?)", NewUUIDv7(), u, "tech", "a")
+	db.Exec("INSERT INTO posts (id, author, cat, title) VALUES (?, ?, ?, ?)", NewUUIDv7(), u, "tech", "b")
+	db.Exec("INSERT INTO posts (id, author, cat, title) VALUES (?, ?, ?, ?)", NewUUIDv7(), u, "food", "c")
+	db.mergeIndexes()
+	q := "SELECT p.title, u.name FROM posts p JOIN users u ON p.author = u.id WHERE p.cat = ?"
+	pl, err := db.prepare(q, db.cat.Load())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pl.joinPlan == nil || pl.joinPlan.driverIdxSrc == nil {
+		t.Fatalf("driver filter on a composite leading column must push down (driverIdxSrc set): %+v", pl.joinPlan)
+	}
+	if _, rows, err := db.Query(q, "tech"); err != nil || len(rows) != 2 {
+		t.Fatalf("composite-leading pushdown wrong: rows=%d err=%v", len(rows), err)
+	}
+}
+
 // join concatenates string column values with commas (test readability).
 func join(ss []string) string {
 	out := ""
