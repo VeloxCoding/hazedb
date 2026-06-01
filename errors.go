@@ -10,6 +10,7 @@ var (
 	ErrParamMismatch = errors.New("fastsql: parameter count mismatch")
 	ErrPKUpdate      = errors.New("fastsql: UPDATE on PK column not supported")
 	ErrParse         = errors.New("fastsql: parse error")
+	ErrUnindexedJoin = errors.New("fastsql: JOIN requires an index on the join column")
 	ErrWALCorrupt    = errors.New("fastsql: WAL corrupted")
 	ErrTableExists   = errors.New("hazedb: table already exists")
 	ErrTxUnsupported = errors.New("hazedb: operation not supported in a transaction")

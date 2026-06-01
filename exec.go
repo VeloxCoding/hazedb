@@ -111,6 +111,11 @@ type plan struct {
 	// with the dirty overlay) in order and stops at LIMIT, instead of scanning +
 	// sorting. orderOrdinal names the column.
 	orderWalk bool
+
+	// joinPlan is non-nil for a two-table join; execSelect dispatches to execJoin.
+	// projOrdinals / colNames / orderOrdinal are then bound to global concat-row
+	// ordinals (see join.go).
+	joinPlan *joinPlan
 }
 
 func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
@@ -141,6 +146,15 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 	pl.table = rt
 	switch s := st.(type) {
 	case *selectStmt:
+		// Two-table join: resolved on its own path (concat-row ordinals, the
+		// indexed-only law, drive-side). pl.rt above is the FROM table; planJoin
+		// re-resolves both tables and sets pl.joinPlan.
+		if len(s.joins) > 0 {
+			if err := db.planJoin(pl, s, cat); err != nil {
+				return nil, err
+			}
+			return pl, nil
+		}
 		if !s.starAll {
 			pl.projOrdinals = make([]int, 0, len(s.cols))
 			for _, c := range s.cols {
@@ -1042,6 +1056,11 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 	tbl := pl.rt
 
 	colNames := pl.colNames
+
+	// Two-table join: indexed nested-loop, its own executor.
+	if pl.joinPlan != nil {
+		return db.execJoin(pl, args)
+	}
 
 	ctx := evalCtx{cols: tbl.def.colByName, args: args}
 

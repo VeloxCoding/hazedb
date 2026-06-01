@@ -212,6 +212,78 @@ func (p *parser) parseDrop() (*dropStmt, error) {
 	return &dropStmt{name: tn.text}, nil
 }
 
+// parseColName parses an optionally-qualified column reference: ident [ . ident ].
+// Returns (qualifier, name); qualifier is "" when unqualified.
+func (p *parser) parseColName() (string, string, error) {
+	id, err := p.expect(tkIdent, "column name")
+	if err != nil {
+		return "", "", err
+	}
+	if p.peek().kind == tkDot {
+		p.advance()
+		c, err := p.expect(tkIdent, "column name after '.'")
+		if err != nil {
+			return "", "", err
+		}
+		return id.text, c.text, nil
+	}
+	return "", id.text, nil
+}
+
+// parseJoins parses zero or more `[INNER|LEFT] JOIN table [alias] ON l.c = r.c`
+// clauses onto st. Bare JOIN means INNER. v1 accepts the chain syntactically;
+// the planner enforces the two-table (single-join) limit.
+func (p *parser) parseJoins(st *selectStmt) error {
+	for {
+		k := p.peek().kind
+		joinType := tkInner
+		switch k {
+		case tkJoin:
+			// bare JOIN = INNER
+		case tkInner, tkLeft, tkRight:
+			joinType = k
+			p.advance()
+			if (k == tkLeft || k == tkRight) && p.peek().kind == tkOuter {
+				p.advance() // LEFT/RIGHT [OUTER] JOIN — OUTER is an optional noise word
+			}
+			if _, err := p.expect(tkJoin, "JOIN"); err != nil {
+				return err
+			}
+		default:
+			return nil // no (more) joins
+		}
+		if k == tkJoin {
+			p.advance()
+		}
+		jc := joinClause{typ: joinType}
+		tn, err := p.expect(tkIdent, "join table name")
+		if err != nil {
+			return err
+		}
+		jc.table = tn.text
+		if p.peek().kind == tkIdent { // optional join-table alias
+			jc.alias = p.advance().text
+		}
+		if _, err := p.expect(tkOn, "ON"); err != nil {
+			return err
+		}
+		lq, ln, err := p.parseColName()
+		if err != nil {
+			return err
+		}
+		if _, err := p.expect(tkEq, "= in JOIN ... ON (only equi-joins are supported)"); err != nil {
+			return err
+		}
+		rq, rn, err := p.parseColName()
+		if err != nil {
+			return err
+		}
+		jc.lref = colRef{qual: lq, name: ln, ord: -1}
+		jc.rref = colRef{qual: rq, name: rn, ord: -1}
+		st.joins = append(st.joins, jc)
+	}
+}
+
 func (p *parser) parseSelect() (*selectStmt, error) {
 	p.advance() // SELECT
 	st := &selectStmt{limit: -1}
@@ -221,11 +293,11 @@ func (p *parser) parseSelect() (*selectStmt, error) {
 		st.starAll = true
 	} else {
 		for {
-			id, err := p.expect(tkIdent, "column name")
+			q, name, err := p.parseColName()
 			if err != nil {
 				return nil, err
 			}
-			st.cols = append(st.cols, resultCol{col: id.text})
+			st.cols = append(st.cols, resultCol{qual: q, col: name})
 			if p.peek().kind != tkComma {
 				break
 			}
@@ -241,6 +313,12 @@ func (p *parser) parseSelect() (*selectStmt, error) {
 		return nil, err
 	}
 	st.table = tn.text
+	if p.peek().kind == tkIdent { // optional FROM alias (clause keywords are not idents)
+		st.alias = p.advance().text
+	}
+	if err := p.parseJoins(st); err != nil {
+		return nil, err
+	}
 
 	if p.peek().kind == tkWhere {
 		p.advance()
@@ -256,11 +334,12 @@ func (p *parser) parseSelect() (*selectStmt, error) {
 		if _, err := p.expect(tkBy, "BY"); err != nil {
 			return nil, err
 		}
-		oc, err := p.expect(tkIdent, "ORDER BY column")
+		q, name, err := p.parseColName()
 		if err != nil {
 			return nil, err
 		}
-		st.orderCol = oc.text
+		st.orderQual = q
+		st.orderCol = name
 		switch p.peek().kind {
 		case tkAsc:
 			p.advance()
@@ -550,7 +629,17 @@ func (p *parser) parseAtom() (expr, error) {
 		return e, nil
 	case tkIdent:
 		p.advance()
-		return &colRef{name: t.text, ord: -1}, nil
+		cr := &colRef{name: t.text, ord: -1}
+		if p.peek().kind == tkDot { // qualified: alias.col
+			p.advance()
+			c, err := p.expect(tkIdent, "column name after '.'")
+			if err != nil {
+				return nil, err
+			}
+			cr.qual = t.text
+			cr.name = c.text
+		}
+		return cr, nil
 	case tkInt:
 		p.advance()
 		n, err := strconv.ParseInt(t.text, 10, 64)

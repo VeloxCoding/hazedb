@@ -16,6 +16,7 @@ const (
 	tkString
 	tkParam // ?
 	tkComma
+	tkDot // . (qualified column: alias.col)
 	tkLParen
 	tkRParen
 	tkSemi
@@ -38,6 +39,12 @@ const (
 	tkDesc
 	tkLimit
 	tkOffset
+	tkJoin
+	tkOn
+	tkInner
+	tkLeft
+	tkRight
+	tkOuter
 	tkInsert
 	tkInto
 	tkValues
@@ -66,6 +73,12 @@ var keywords = map[string]tokenKind{
 	"desc":   tkDesc,
 	"limit":  tkLimit,
 	"offset": tkOffset,
+	"join":   tkJoin,
+	"on":     tkOn,
+	"inner":  tkInner,
+	"left":   tkLeft,
+	"right":  tkRight,
+	"outer":  tkOuter,
 	"insert": tkInsert,
 	"into":   tkInto,
 	"values": tkValues,
@@ -116,6 +129,10 @@ func tokenize(s string) ([]token, error) {
 		switch c {
 		case ',':
 			out = append(out, token{kind: tkComma, pos: i})
+			i++
+			continue
+		case '.':
+			out = append(out, token{kind: tkDot, pos: i})
 			i++
 			continue
 		case '(':

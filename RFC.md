@@ -2,7 +2,7 @@
 
 **Status:** M1–M6 implemented (store, SQL, WAL durability, UUIDv7 PK, partitioning, runtime catalog + `CREATE`/`DROP TABLE`, single-table transactions); M7–M8 open. See *Implementation status* for what is running vs designed.  
 **Module:** `github.com/VeloxCoding/hazedb`  
-**Updated:** 2026-05-31 (rev. 25 — `OFFSET m` added to `SELECT`, on every read path)
+**Updated:** 2026-06-01 (rev. 26 — two-table `INNER`/`LEFT`/`RIGHT` joins (equi-join, indexed-only) via indexed nested-loop with driver pushdown)
 
 ---
 
@@ -335,13 +335,17 @@ parseSQL(sql) → assignParamIndices → plan() → execSelect/execInsert/...
 Supported today:
 
 ```sql
-SELECT col_list FROM table [WHERE expr] [ORDER BY col [DESC]] [LIMIT n] [OFFSET m]
+SELECT col_list FROM table [alias]
+       [[INNER | LEFT [OUTER] | RIGHT [OUTER]] JOIN table2 [alias] ON a.col = b.col]
+       [WHERE expr] [ORDER BY col [DESC]] [LIMIT n] [OFFSET m]
 INSERT INTO table (cols) VALUES (vals)
 UPDATE table SET col = val [WHERE expr]
 DELETE FROM table [WHERE expr]
 ```
 
 WHERE supports: `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IS NULL`, `IS NOT NULL`, `?` params, literals (int/string/bool/null).
+
+**Joins (two-table, equi-join, indexed-only).** `[INNER|LEFT] JOIN t2 ON a.col = b.col` joins two tables on a single equality. The result row is the left table's columns concatenated with the right's; columns are addressed with `table.col` / `alias.col`, and an unqualified name must be unambiguous across the two tables. **Law: the probed (non-driving) join column must be the PK or carry an index** — a join on an unindexed column is rejected (`ErrUnindexedJoin`), never run as an O(A×B) scan. Execution is an indexed nested-loop: scan the driver, probe the other side via its PK map or secondary index (so a join is O(driver) probes). `INNER` drives whichever side keeps the probe indexed; `LEFT`/`RIGHT` (the `OUTER` keyword is optional) drive the preserved side and NULL-pad unmatched rows on the other side, so the *probed* side's join column must be indexed. `WHERE`/`ORDER BY`/`LIMIT`/`OFFSET` apply to the joined result; a single-table `WHERE` conjunct on the driving side is pushed down (and fetched via the driver's own index when it is an equality on an indexed column). The driver is materialised before probing (no cross-table lock held), so a join is **per-shard consistent, not point-in-time** — same contract as any multi-shard read. Deferred: `FULL`/`CROSS`, N-way joins, non-equi conditions.
 
 `OFFSET m` skips the first `m` matched rows (in `ORDER BY` order; without `ORDER BY`, in the same undefined scan order `LIMIT` uses) and applies on every read path — PK/index/ordered-walk/scan and the streaming reads. It is the standard fetch-and-skip: a path fetches `m+n` matches (the top-N heap keeps `m+n`) and drops the first `m`, so a large offset still walks that many matches — the usual SQL `OFFSET` cost. `LIMIT m, n` (MySQL short form) is not accepted; use `LIMIT n OFFSET m`.
 

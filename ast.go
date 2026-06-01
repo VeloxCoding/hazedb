@@ -8,11 +8,24 @@ type selectStmt struct {
 	cols      []resultCol // empty means *
 	starAll   bool
 	table     string
+	alias     string       // FROM table alias ("" = none; the table name still qualifies)
+	joins     []joinClause // v1: at most one (two-table join)
 	where     expr
 	orderCol  string // empty means no ORDER BY
+	orderQual string // ORDER BY column qualifier (table/alias), "" = unqualified
 	orderDesc bool
 	limit     int // -1 means no LIMIT
 	offset    int // 0 means no OFFSET; skips the first offset matched rows
+}
+
+// joinClause is one `[INNER|LEFT] JOIN table [alias] ON l.col = r.col`. v1
+// supports a single equi-join on one column; lref/rref are the two sides of the
+// ON equality (each a qualified column ref). typ is tkInner or tkLeft.
+type joinClause struct {
+	typ        tokenKind
+	table      string
+	alias      string
+	lref, rref colRef
 }
 
 type insertStmt struct {
@@ -42,7 +55,8 @@ type setAssign struct {
 }
 
 type resultCol struct {
-	col string
+	qual string // table/alias qualifier ("" = unqualified)
+	col  string
 }
 
 func (*selectStmt) isStmt() {}
@@ -60,6 +74,7 @@ type expr interface{ isExpr() }
 // validateExpr (-1 until bound) so evalExpr can index the row directly instead
 // of a per-row name→ordinal map lookup. ord < 0 falls back to the name lookup.
 type colRef struct {
+	qual string // table/alias qualifier ("" = unqualified); used only at resolve time
 	name string
 	ord  int
 }

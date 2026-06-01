@@ -31,7 +31,8 @@ every statement the parser accepts — but that set is a deliberate subset of SQ
 | DDL | `CREATE TABLE name (col TYPE …)` with `PRIMARY KEY` / `PARTITION KEY` constraints and `[ORDERED] INDEX [name] (col)` declarations; `DROP TABLE name` |
 | Column types | `int`, `text`/`string`, `bool`, `bytes`/`blob`, `uuid` |
 | Writes | `INSERT INTO … VALUES (…)`, `UPDATE … SET … WHERE …`, `DELETE FROM … WHERE …` |
-| `SELECT` | `*` or an explicit column list, **one** table (`FROM t`), optional `WHERE`, `ORDER BY col [ASC\|DESC]`, `LIMIT n`, `OFFSET m` |
+| `SELECT` | `*` or an explicit column list, `FROM t [alias]`, optional `WHERE`, `ORDER BY col [ASC\|DESC]`, `LIMIT n`, `OFFSET m` |
+| `JOIN` | two-table `[INNER\|LEFT [OUTER]\|RIGHT [OUTER]] JOIN t2 [alias] ON a.col = b.col` (single equi-join); the probed join column **must be the PK or indexed**; columns are `table.col` / `alias.col` |
 | `WHERE` expressions | comparisons `= != < <= > >=`, `IS [NOT] NULL`, boolean `AND` / `OR` / `NOT`, arithmetic `+ - *`, parentheses, `?` positional parameters |
 | Literals | integer, string, `true`/`false`, `null` |
 

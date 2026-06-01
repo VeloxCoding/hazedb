@@ -30,7 +30,7 @@ func (db *DB) selectEach(pl *plan, args []Value, visit func(row Row) bool) ([]st
 	tbl := pl.rt
 	colNames := pl.colNames
 
-	if pl.orderOrdinal >= 0 || pl.orderWalk || pl.pkLookup {
+	if pl.orderOrdinal >= 0 || pl.orderWalk || pl.pkLookup || pl.joinPlan != nil {
 		_, rows, err := db.execSelect(pl, args)
 		if err != nil {
 			return nil, err
