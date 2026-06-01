@@ -2,7 +2,7 @@
 
 **Status:** M1–M6 implemented (store, SQL, WAL durability, UUIDv7 PK, partitioning, runtime catalog + `CREATE`/`DROP TABLE`, single-table transactions); M7–M8 open. See *Implementation status* for what is running vs designed.  
 **Module:** `github.com/VeloxCoding/hazedb`  
-**Updated:** 2026-06-01 (rev. 26 — two-table `INNER`/`LEFT`/`RIGHT` joins (equi-join, indexed-only) via indexed nested-loop with driver pushdown)
+**Updated:** 2026-06-01 (rev. 27 — documented `FULL OUTER`/`CROSS` as deliberately unsupported; corrected stale "no joins"/"no OFFSET" non-goals)
 
 ---
 
@@ -35,12 +35,12 @@ tables are *examples* of that profile, not the scope.)
 
 | | |
 |---|---|
-| Not a PostgreSQL/SQLite replacement | No joins, no window functions, no ad-hoc query performance guarantee |
+| Not a PostgreSQL/SQLite replacement | Only two-table indexed equi-joins; no window functions, no ad-hoc query performance guarantee |
 | Not for data > RAM | WAL + checkpoints only; no page eviction |
 | Not multi-process | One Go process owns the DB |
 | Not OLAP | No aggregation engine, no columnar storage |
 | No `ALTER TABLE` in v1 | `CREATE TABLE` / `DROP TABLE` run at runtime (WAL-logged, survive restart); no in-place column add/drop/retype |
-| No JOINs in v1 | Multiple Gets in app code; not promised for v2 |
+| No `FULL OUTER` / `CROSS` / N-way joins | Two-table `INNER`/`LEFT`/`RIGHT` equi-joins only; the probed column must be indexed |
 | No migration tooling | Write your own transfer script; store your old PK as a regular column |
 
 ---
@@ -345,7 +345,9 @@ DELETE FROM table [WHERE expr]
 
 WHERE supports: `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IS NULL`, `IS NOT NULL`, `?` params, literals (int/string/bool/null).
 
-**Joins (two-table, equi-join, indexed-only).** `[INNER|LEFT] JOIN t2 ON a.col = b.col` joins two tables on a single equality. The result row is the left table's columns concatenated with the right's; columns are addressed with `table.col` / `alias.col`, and an unqualified name must be unambiguous across the two tables. **Law: the probed (non-driving) join column must be the PK or carry an index** — a join on an unindexed column is rejected (`ErrUnindexedJoin`), never run as an O(A×B) scan. Execution is an indexed nested-loop: scan the driver, probe the other side via its PK map or secondary index (so a join is O(driver) probes). `INNER` drives whichever side keeps the probe indexed; `LEFT`/`RIGHT` (the `OUTER` keyword is optional) drive the preserved side and NULL-pad unmatched rows on the other side, so the *probed* side's join column must be indexed. `WHERE`/`ORDER BY`/`LIMIT`/`OFFSET` apply to the joined result; a single-table `WHERE` conjunct on the driving side is pushed down (and fetched via the driver's own index when it is an equality on an indexed column). The driver is materialised before probing (no cross-table lock held), so a join is **per-shard consistent, not point-in-time** — same contract as any multi-shard read. Deferred: `FULL`/`CROSS`, N-way joins, non-equi conditions.
+**Joins (two-table, equi-join, indexed-only).** `[INNER|LEFT] JOIN t2 ON a.col = b.col` joins two tables on a single equality. The result row is the left table's columns concatenated with the right's; columns are addressed with `table.col` / `alias.col`, and an unqualified name must be unambiguous across the two tables. **Law: the probed (non-driving) join column must be the PK or carry an index** — a join on an unindexed column is rejected (`ErrUnindexedJoin`), never run as an O(A×B) scan. Execution is an indexed nested-loop: scan the driver, probe the other side via its PK map or secondary index (so a join is O(driver) probes). `INNER` drives whichever side keeps the probe indexed; `LEFT`/`RIGHT` (the `OUTER` keyword is optional) drive the preserved side and NULL-pad unmatched rows on the other side, so the *probed* side's join column must be indexed. `WHERE`/`ORDER BY`/`LIMIT`/`OFFSET` apply to the joined result; a single-table `WHERE` conjunct on the driving side is pushed down (and fetched via the driver's own index when it is an equality on an indexed column). The driver is materialised before probing (no cross-table lock held), so a join is **per-shard consistent, not point-in-time** — same contract as any multi-shard read.
+
+**Not supported: `FULL OUTER` and `CROSS` (deliberate, not an oversight).** A `CROSS JOIN` is the Cartesian product (every left row × every right row) with no `ON` equality — there is no join column to index, so it is the one join shape that *cannot* satisfy the indexed-only law and cannot be made `O(driver)`. It is excluded by design, not deferred. A `FULL OUTER JOIN` preserves unmatched rows from *both* sides; the indexed nested-loop drives one side and probes the other, so emitting the probed side's unmatched rows would require tracking every probe hit and a second pass over the misses — driving both sides. It is tractable but unbuilt, deferred until a real need appears. (For the SQLite-vs-hazedb sync-checking use case, neither is required — compare per-table by PK instead.) Note both *do* exist in modern SQLite — `CROSS JOIN` always, `FULL OUTER JOIN` since 3.39 (2022) — so this is hazedb's narrower surface, not a shared limitation. Also deferred: N-way (3+ table) joins, non-equi `ON` conditions, composite/covering indexes.
 
 `OFFSET m` skips the first `m` matched rows (in `ORDER BY` order; without `ORDER BY`, in the same undefined scan order `LIMIT` uses) and applies on every read path — PK/index/ordered-walk/scan and the streaming reads. It is the standard fetch-and-skip: a path fetches `m+n` matches (the top-N heap keeps `m+n`) and drops the first `m`, so a large offset still walks that many matches — the usual SQL `OFFSET` cost. `LIMIT m, n` (MySQL short form) is not accepted; use `LIMIT n OFFSET m`.
 

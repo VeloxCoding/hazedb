@@ -125,9 +125,9 @@ For the common (filtered, modest-bucket) list view none of these matter; see
 
 ## Not supported — will error or fail to parse
 
-- **No `JOIN`** — one table per query.
+- **No `FULL OUTER` / `CROSS` / N-way `JOIN`** — two-table `INNER`/`LEFT`/`RIGHT` equi-joins work (the probed column must be the PK or indexed); `CROSS` is excluded by design (a Cartesian product has no indexable join column), `FULL OUTER` and 3+ table joins are deferred.
 - **No aggregates / grouping** — `COUNT`, `SUM`, `AVG`, `GROUP BY`, `HAVING` are absent.
-- **No `DISTINCT`, no `OFFSET`, no subqueries**, no expressions or aliases in the `SELECT` column list (bare column names only).
+- **No `DISTINCT`, no subqueries**, no expressions or aliases in the `SELECT` column list (bare column names only).
 - **No `ALTER TABLE`**, and **no `IF [NOT] EXISTS`** — re-running `CREATE TABLE` on an existing table errors.
 - **No SQL transactions** — there is no `BEGIN` / `COMMIT` / `ROLLBACK` in the
   grammar. Transactions exist only as a **Go-API** feature (a `db.Tx` closure)
@@ -138,7 +138,8 @@ For the common (filtered, modest-bucket) list view none of these matter; see
 
 For the common PHP pattern — read or write a row by id, look one up by an
 indexed column (`WHERE email = ?`), or list + filter + order + limit rows in a
-single table — these functions cover everything. For relational work (joins,
+single table — plus a two-table indexed join (`INNER`/`LEFT`/`RIGHT`) — these
+functions cover everything. For relational work beyond that (multi-table joins,
 aggregation, reporting), do that in your application or in the source-of-truth
 database; hazedb is the hot-read / write-buffer layer in front of it, not the
 system of record.
@@ -151,9 +152,9 @@ question is design fit, not feasibility — see the note at the end.
 
 **Tier 1 — cheap, drop-in, no architectural impact:**
 
-- **`OFFSET`** — one parser token + a skip counter before the `LIMIT` cut;
-  `ORDER BY` + `LIMIT` are already there. (Inherent caveat: large offsets are
-  O(offset) — the skipped rows are still walked, true of every DB.)
+- **`OFFSET`** — *shipped* (rev. 25). A skip counter before the `LIMIT` cut on
+  every read path. (Inherent caveat: large offsets are O(offset) — the skipped
+  rows are still walked, true of every DB.)
 - **`DISTINCT`** — a dedup pass over the result rows. Single table, no complication.
 - **`COUNT(*)` and simple aggregates without grouping** (`SUM`/`MIN`/`MAX` over
   the matched set) — a single accumulator during the scan.
@@ -170,10 +171,12 @@ question is design fit, not feasibility — see the note at the end.
 
 **Tier 3 — genuine design effort:**
 
-- **`JOIN`** — the deliberate line. hazedb is partitioned/sharded by a single
-  table's PK; joins need a planner, a multi-table scan strategy, and careful
-  ascending lock ordering to avoid deadlock. The RFC moves **multi-table to
-  post-1.0** on purpose — deferred, not overlooked.
+- **`JOIN`** — *partly shipped* (rev. 26). Two-table `INNER`/`LEFT`/`RIGHT`
+  equi-joins run today as an indexed nested-loop, but only where the probed
+  join column is the PK or indexed (the **indexed-only law** — no O(A×B) scan).
+  Still on the deliberate line: `FULL OUTER` (would need driving both sides),
+  `CROSS` (a Cartesian product has no indexable join column — excluded by
+  design), N-way joins, and non-equi `ON` conditions.
 - **SQL `BEGIN`/`COMMIT`** — *not* "add a token." The transaction engine already
   exists (the Go `db.Tx` closure, M6). The hard part is that SQL-level
   transactions need **session state** to tie multiple statements together, and
@@ -183,10 +186,12 @@ question is design fit, not feasibility — see the note at the end.
 **Design-fit note.** Almost all of the above is technically open; the real
 question is whether it *should* land here. hazedb is the hot-read / write-buffer
 layer in front of a source-of-truth DB — its value is speed + simplicity.
-`OFFSET` / `DISTINCT` / `COUNT(*)` fit without bloat. Joins and reporting-style
-aggregation start turning it into a general SQL engine — exactly the work
-normally left to the database behind it. So Tier 3 is a deliberate "probably
-not, by design," not a "not yet."
+`OFFSET` / `DISTINCT` / `COUNT(*)` fit without bloat. The two-table indexed
+join landed for the same reason — it stays `O(driver)` and never degrades to a
+scan. Unbounded joins (`FULL OUTER`, `CROSS`, N-way) and reporting-style
+aggregation are where it starts turning into a general SQL engine — exactly the
+work normally left to the database behind it. So that part of Tier 3 stays a
+deliberate "probably not, by design," not a "not yet."
 
 ## Examples
 
