@@ -437,6 +437,14 @@ func BenchmarkDeleteByPK_SQLiteMem(b *testing.B) {
 // an untimed mergeIndexes() each iteration, so the TIMED op measures the
 // steady-state (merged) index path. Scan paths read live rows directly and need
 // no such drain. (SQLite has no async index — its loops are plain.)
+//
+// CAVEAT — wall time of the per-iteration-StopTimer benches is NOT the op cost.
+// The benches that call b.StopTimer()/b.StartTimer() each iteration (to exclude
+// the untimed merge or fresh insert) pay runtime.ReadMemStats per call, a
+// stop-the-world that profiles at ~60% of CPU and dwarfs the actual UPDATE/DELETE
+// (which is sub-µs and does not even appear in the profile). Read allocs/op (the
+// reliable signal) from these, not ns/op. Micro-benchmarking an async-index write
+// in a tight loop is inherently confounded — there is no clean single number.
 
 func newIdxScanDB(b *testing.B) *DB {
 	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: compareN})
@@ -609,3 +617,4 @@ func BenchmarkDeleteByScan_SQLiteMem(b *testing.B) {
 		del.Exec(cd)
 	}
 }
+
