@@ -411,6 +411,54 @@ func TestJoinProbeWalkDirtyOverlay(t *testing.T) {
 	}
 }
 
+// Step (driver walk): ORDER BY a driver column with an ordered index plans as a
+// driver walk and matches the materialise-then-sort path byte-for-byte across
+// ASC/DESC and LIMIT/OFFSET (walk db has ORDERED INDEX (title); ref db does not).
+func TestJoinDriverWalkCrossCheck(t *testing.T) {
+	titles := []string{"delta", "alpha", "charlie", "bravo", "echo", "foxtrot"}
+	walk, _ := seedJoin(t, "ORDERED INDEX (title)", titles...)
+	ref, _ := seedJoin(t, "INDEX (author)", titles...)
+	q := "SELECT p.title FROM posts p JOIN users u ON p.author = u.id ORDER BY p.title"
+	if pl, _ := walk.prepare(q, walk.cat.Load()); pl.joinPlan == nil || !pl.joinPlan.driverWalk {
+		t.Fatalf("walk db should use driverWalk: %+v", pl.joinPlan)
+	}
+	if pl, _ := ref.prepare(q, ref.cat.Load()); pl.joinPlan != nil && pl.joinPlan.driverWalk {
+		t.Fatal("ref db should NOT use driverWalk")
+	}
+	for _, qq := range []string{q, q + " LIMIT 3", q + " LIMIT 2 OFFSET 1", q + " DESC", q + " DESC LIMIT 3", q + " DESC LIMIT 2 OFFSET 3"} {
+		_, wr, we := walk.Query(qq)
+		_, rr, re := ref.Query(qq)
+		if we != nil || re != nil {
+			t.Fatalf("%q: walk %v ref %v", qq, we, re)
+		}
+		if join(strs(wr, 0)) != join(strs(rr, 0)) {
+			t.Fatalf("%q: walk %v != ref %v", qq, strs(wr, 0), strs(rr, 0))
+		}
+	}
+}
+
+// Driver walk over a LEFT join: the driver (preserved side) is walked in order,
+// an orphan is NULL-padded in place, and a not-yet-merged driver row merges into
+// the walk order.
+func TestJoinDriverWalkLeftAndDirty(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE users (id uuid primary key, name text)")
+	db.Exec("CREATE TABLE posts (id uuid primary key, author uuid, title text, ORDERED INDEX (title))")
+	u := NewUUIDv7()
+	db.Exec("INSERT INTO users (id, name) VALUES (?, ?)", u, "alice")
+	db.Exec("INSERT INTO posts (id, author, title) VALUES (?, ?, ?)", NewUUIDv7(), u, "beta")
+	db.Exec("INSERT INTO posts (id, author, title) VALUES (?, ?, ?)", NewUUIDv7(), NewUUIDv7(), "alpha") // orphan
+	db.mergeIndexes()
+	_, rows, err := db.Query("SELECT p.title, u.name FROM posts p LEFT JOIN users u ON p.author = u.id ORDER BY p.title")
+	if err != nil || len(rows) != 2 || rows[0][0].Str() != "alpha" || !rows[0][1].IsNull() || rows[1][0].Str() != "beta" {
+		t.Fatalf("LEFT driverWalk: %v err=%v", rows, err)
+	}
+	db.Exec("INSERT INTO posts (id, author, title) VALUES (?, ?, ?)", NewUUIDv7(), u, "aaa") // dirty, sorts first
+	if _, r2, _ := db.Query("SELECT p.title FROM posts p LEFT JOIN users u ON p.author = u.id ORDER BY p.title LIMIT 1"); len(r2) != 1 || r2[0][0].Str() != "aaa" {
+		t.Fatalf("dirty driverWalk: want aaa first, got %v", strs(r2, 0))
+	}
+}
+
 // Streaming driver: a no-WHERE no-ORDER-BY join with LIMIT must early-stop
 // without materialising the whole driver — across multiple shards/chunks
 // (chunk=256) — and stay correct: exact count at LIMIT, full count without, and

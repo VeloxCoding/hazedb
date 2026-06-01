@@ -57,6 +57,14 @@ type joinPlan struct {
 	// prefix sub-range + early-stop, no sort); >1 driver falls back to top-N.
 	probeWalk         bool
 	probeWalkOrdinals []int
+
+	// driverWalk: ORDER BY is on a DRIVER-table column carrying an ORDERED index,
+	// and the driver is a full scan (not index-fetched by a WHERE equality). The
+	// join then walks the driver in ORDER BY order, probes each, and stops at
+	// offset+limit results — no full materialise + sort. driverSortOrd is the sort
+	// column's within-driver ordinal. INNER and OUTER (drives the preserved side).
+	driverWalk    bool
+	driverSortOrd int
 }
 
 // planJoin resolves the two tables, binds every column to a global concat-row
@@ -331,6 +339,12 @@ func (db *DB) planJoin(pl *plan, st *selectStmt, cat *catalog) error {
 	if jp.typ == tkInner && jp.orderOrdinal >= 0 {
 		jp.planProbeWalk()
 	}
+	// Driver ordered walk: ORDER BY a driver column with an ordered index (INNER or
+	// OUTER). Walk the driver in order + probe + early-stop, instead of
+	// materialising the whole join and sorting. Not when probeWalk already applies.
+	if jp.orderOrdinal >= 0 && !jp.probeWalk {
+		jp.planDriverWalk()
+	}
 
 	// Pre-escape the output column names for the streaming JSON encoder, as the
 	// single-table planner does.
@@ -372,6 +386,30 @@ func (jp *joinPlan) planProbeWalk() {
 		jp.probeWalk = true
 		return
 	}
+}
+
+// planDriverWalk sets driverWalk when the ORDER BY column is a DRIVER-table column
+// carrying an ORDERED index and the driver is a full scan (not fetched through a
+// WHERE-equality index — that is already bounded). The join can then walk the
+// driver in ORDER BY order and stop at offset+limit results instead of
+// materialising the whole join and sorting.
+func (jp *joinPlan) planDriverWalk() {
+	if jp.driverIdxSrc != nil {
+		return // driver already index-fetched → bounded, materialise it
+	}
+	driverOff, driverWidth := 0, jp.nLeft
+	if !jp.driverIsLeft {
+		driverOff, driverWidth = jp.nLeft, jp.nRight
+	}
+	sortWithin := jp.orderOrdinal - driverOff
+	if sortWithin < 0 || sortWithin >= driverWidth {
+		return // ORDER BY is not on the driver table
+	}
+	if !jp.driverRT.def.orderedIndexOn(sortWithin) {
+		return // no ordered index on the driver sort column to walk
+	}
+	jp.driverSortOrd = sortWithin
+	jp.driverWalk = true
 }
 
 // bindJoinExpr walks a WHERE expression and binds each colRef to its global
@@ -552,7 +590,7 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 			}
 			return false
 		})
-	} else if !streaming {
+	} else if !streaming && !jp.driverWalk {
 		jp.driverRT.scanAll(func(r Row) bool {
 			if passDriver(r) {
 				drivers = append(drivers, r.Clone())
@@ -703,6 +741,62 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 					}
 				},
 				func(r Row) { keep(r) },
+			)
+			out = sliceOffsetLimit(out, st.offset, st.limit)
+			return colNames, projectRows(out, st.starAll, pl.projOrdinals), nil
+		}
+	}
+
+	// Driver ordered walk: ORDER BY is on a driver column with an ordered index and
+	// the driver is a full scan. Walk the driver in ORDER BY order (index ∪ dirty),
+	// probe each, emit matched (OUTER pads a miss), and stop at offset+limit results
+	// — no full materialise, no sort. Reuses mergeOrderedStreams on the driver.
+	if jp.driverWalk {
+		if si := jp.driverRT.indexFor(jp.driverSortOrd); si != nil {
+			var out []Row
+			concat := make(Row, nLeft+nRight)
+			appendJoined := func(drow Row) {
+				matched := false
+				db.probeRows(jp.probeRT, jp.probeOnOrd, jp.probeByPK, drow[jp.driverOnOrd], func(prow Row) bool {
+					matched = true
+					left, right := drow, prow
+					if !jp.driverIsLeft {
+						left, right = prow, drow
+					}
+					fillConcat(concat, left, right)
+					if passResidual(concat) {
+						row := make(Row, nLeft+nRight)
+						copy(row, concat)
+						out = append(out, row)
+					}
+					return false // collect every match for this driver
+				})
+				if !matched { // OUTER miss: pad the probed side
+					pad := false
+					switch jp.typ {
+					case tkLeft:
+						fillConcat(concat, drow, nil)
+						pad = true
+					case tkRight:
+						fillConcat(concat, nil, drow)
+						pad = true
+					}
+					if pad && passResidual(concat) {
+						row := make(Row, nLeft+nRight)
+						copy(row, concat)
+						out = append(out, row)
+					}
+				}
+			}
+			dc, dirtySet := jp.driverRT.buildDirtyCands(passDriver, func(r Row) indexKey { return keyOf(r[jp.driverSortOrd]) })
+			done := func() bool { return eff >= 0 && len(out) >= eff }
+			mergeOrderedStreams(si.snapshot(), dc, dirtySet, st.orderDesc, done,
+				func(pk UUID) {
+					if r, ok := jp.driverRT.getByPK(pk); ok && passDriver(r) {
+						appendJoined(r)
+					}
+				},
+				func(r Row) { appendJoined(r) },
 			)
 			out = sliceOffsetLimit(out, st.offset, st.limit)
 			return colNames, projectRows(out, st.starAll, pl.projOrdinals), nil

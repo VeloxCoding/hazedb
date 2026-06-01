@@ -72,6 +72,9 @@ func joinSQLite(b *testing.B) *sql.DB {
 		// — the fair counterpart to hazedb's ORDERED INDEX (author, title). SQLite's
 		// planner picks the best index per query (PK for point, this for the feed).
 		mustExec("CREATE INDEX idx_posts_author_title ON posts(author, title)")
+		// Plain (title) so SQLite can serve a global ORDER BY title LIMIT by walking
+		// the index — the fair counterpart to hazedb's ORDERED INDEX (title) driver walk.
+		mustExec("CREATE INDEX idx_posts_title ON posts(title)")
 		for i := 0; i < joinUsers; i++ {
 			mustExec("INSERT INTO users (id, name) VALUES (?, ?)", key16(i+1), fmt.Sprintf("user%04d", i))
 		}
@@ -127,6 +130,48 @@ func joinHazedbComposite(b *testing.B) *DB {
 		joinHzCompDB = db
 	})
 	return joinHzCompDB
+}
+
+var (
+	joinHzTitleOnce sync.Once
+	joinHzTitleDB   *DB
+)
+
+// Same dataset as joinHazedb but posts carries ORDERED INDEX (title), so a global
+// ORDER BY p.title (no WHERE) plans as a driver walk: walk posts in title order,
+// probe each by PK, stop at offset+limit — no materialise + sort.
+func joinHazedbTitleIdx(b *testing.B) *DB {
+	joinHzTitleOnce.Do(func() {
+		db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1})
+		if err != nil {
+			b.Fatal(err)
+		}
+		db.Exec("CREATE TABLE users (id uuid primary key, name text, INDEX (name))")
+		db.Exec("CREATE TABLE posts (id uuid primary key, author uuid, title text, ORDERED INDEX (title))")
+		for i := 0; i < joinUsers; i++ {
+			db.Exec("INSERT INTO users (id, name) VALUES (?, ?)", tid(i+1), fmt.Sprintf("user%04d", i))
+		}
+		for j := 0; j < joinPosts; j++ {
+			db.Exec("INSERT INTO posts (id, author, title) VALUES (?, ?, ?)",
+				tid(1_000_000+j), tid((j%joinUsers)+1), fmt.Sprintf("t%06d", j))
+		}
+		db.mergeIndexes()
+		joinHzTitleDB = db
+	})
+	return joinHzTitleDB
+}
+
+// Global ORDER BY with an ordered index on the sort column — the driver walk.
+func BenchmarkJoinOrderedNoWhere_HazedbTitleIdx(b *testing.B) {
+	db := joinHazedbTitleIdx(b)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, rows, err := db.QueryValues("SELECT p.title, u.name FROM posts p JOIN users u ON p.author = u.id ORDER BY p.title LIMIT 10 OFFSET 20")
+		if err != nil || len(rows) != 10 {
+			b.Fatalf("rows=%d err=%v", len(rows), err)
+		}
+	}
 }
 
 // The exact query, hazedb with a composite (author, title) index — probe walk.
