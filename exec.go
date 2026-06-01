@@ -1888,6 +1888,29 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		}
 		var pks []UUID
 		cand.emit(func(pk UUID) bool { pks = append(pks, pk); return false })
+		// Fast path — one candidate (the common unique/steady-state index update)
+		// + single-column SET: update in place, no full-row clone (the bulk of the
+		// cost), mirroring the PK single-column path.
+		if len(pks) == 1 && len(pl.updateOrdinals) == 1 {
+			ord := pl.updateOrdinals[0]
+			computeOne := func(r Row) (Value, error) {
+				v, cerr := compute(r)
+				if cerr != nil {
+					return Value{}, cerr
+				}
+				return v[0], nil
+			}
+			var journal func(Row) error
+			if db.wal != nil {
+				journal = func(nr Row) error {
+					body := encodeUpdateMutation(db.scratch.get(), tbl.tableID, nr[tbl.def.pkOrdinal], pl.updateOrdinals, nr)
+					werr := db.wal.writeRecord(recMutation, body)
+					db.scratch.put(body)
+					return werr
+				}
+			}
+			return tbl.updateOneByCandidate(pks[0], ord, match, computeOne, journal)
+		}
 		return tbl.updateByCandidates(pks, match, pl.updateOrdinals, compute, encode, journalAll)
 	}
 	return tbl.updateWhereAll(match, pl.updateOrdinals, compute, encode, journalAll)

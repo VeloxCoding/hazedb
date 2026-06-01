@@ -607,6 +607,43 @@ func (t *table) updateByCandidates(pks []UUID, match func(Row) bool, ords []int,
 	return len(pending), nil
 }
 
+// updateOneByCandidate applies a single-column update to ONE index candidate
+// in place (no full-row clone — the big cost updateByCandidates pays) under its
+// shard lock, after re-checking match (the full WHERE: the candidate may be a
+// stale index hit or an unrelated dirty PK). Mirrors updateByPKOneJournaled with
+// a WHERE gate; journal-before-apply with revert on WAL failure. Returns 1 if
+// updated, 0 if the candidate is gone or no longer matches.
+func (t *table) updateOneByCandidate(pk UUID, ord int, match func(Row) bool, computeOne func(Row) (Value, error), journal func(Row) error) (int, error) {
+	s := t.shardOf(pk)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rowID, ok := s.pk[pk]
+	if !ok {
+		return 0, nil
+	}
+	r := s.rows[rowID]
+	if r == nil || !match(r) {
+		return 0, nil
+	}
+	val, err := computeOne(r)
+	if err != nil {
+		return 0, err
+	}
+	if journal == nil {
+		r[ord] = val
+		t.markDirtyLocked(s, pk)
+		return 1, nil
+	}
+	old := r[ord]
+	r[ord] = val
+	if err := journal(r); err != nil {
+		r[ord] = old
+		return 0, err
+	}
+	t.markDirtyLocked(s, pk)
+	return 1, nil
+}
+
 // deleteByPK removes the row at pk. Returns false if absent.
 // Tombstones in place (rows[rowID] = nil) so rowIDs stay stable.
 func (t *table) deleteByPK(pk UUID) bool {
