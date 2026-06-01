@@ -46,8 +46,8 @@ func TestCompositeKeyOrdering(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
 	schemas := [][]ValueKind{
 		{KindInt, KindString, KindUUID},
-		{KindString, KindString},      // adjacent strings: boundary/escape stress
-		{KindInt, KindInt},            // signed ordering across two columns
+		{KindString, KindString}, // adjacent strings: boundary/escape stress
+		{KindInt, KindInt},       // signed ordering across two columns
 		{KindBool, KindString, KindInt},
 		{KindUUID, KindInt},
 	}

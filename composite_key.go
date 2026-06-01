@@ -13,14 +13,14 @@ import "encoding/binary"
 // Per-column encoding, each chosen so memcmp == the scalar index's own ordering
 // for that kind (see indexKey.less):
 //   - int  : sign bit flipped, then 8 bytes big-endian. Flipping bit 63 maps the
-//            signed range onto unsigned byte order (negatives sort below
-//            non-negatives), matching less's int64 compare.
+//     signed range onto unsigned byte order (negatives sort below
+//     non-negatives), matching less's int64 compare.
 //   - bool : one byte, 0 or 1.
 //   - uuid : 16 bytes big-endian — byte order already equals UUID value order.
 //   - string/bytes : content with 0x00 escaped to 0x00 0xFF, then a 0x00 0x00
-//            terminator. The terminator (0x00) sorts below any escaped data byte
-//            (a real 0x00 becomes 0x00 0xFF, any other byte is itself ≥ 0x01), so
-//            "a" < "ab" and one column's bytes can never bleed into the next.
+//     terminator. The terminator (0x00) sorts below any escaped data byte
+//     (a real 0x00 becomes 0x00 0xFF, any other byte is itself ≥ 0x01), so
+//     "a" < "ab" and one column's bytes can never bleed into the next.
 //
 // Precondition: every component is non-NULL. A composite index only indexes rows
 // where all component columns are non-NULL (mirrors the scalar "NULL is never
