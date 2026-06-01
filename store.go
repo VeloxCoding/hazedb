@@ -81,6 +81,33 @@ func (t *table) markDirtyLocked(s *tableShard, pk UUID) {
 	}
 }
 
+// ordIsIndexed reports whether column ordinal ord is part of any secondary index
+// (any component of a composite index counts).
+func (t *table) ordIsIndexed(ord int) bool {
+	for _, ix := range t.indexes {
+		for _, ixOrd := range ix.ordinals {
+			if ord == ixOrd {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// updateTouchesIndex reports whether an UPDATE of these column ordinals changes
+// any indexed column. When it does not, every index entry stays valid: the row
+// needs no merge and no place in the read overlay, so the UPDATE paths skip
+// markDirtyLocked — keeping non-indexed updates out of the dirty overlay (which
+// would otherwise grow with every update and slow the next indexed lookup).
+func (t *table) updateTouchesIndex(ords []int) bool {
+	for _, ord := range ords {
+		if t.ordIsIndexed(ord) {
+			return true
+		}
+	}
+	return false
+}
+
 func newTable(def *resolvedTable, sizeHint int) *table {
 	n := shardCount()
 	t := &table{
@@ -549,9 +576,12 @@ func (t *table) updateWhereAll(match func(Row) bool, ords []int, compute func(Ro
 		}
 	}
 	pkOrd := t.def.pkOrdinal
+	touch := t.updateTouchesIndex(ords)
 	for _, p := range pending {
 		p.s.rows[p.j] = p.nr
-		t.markDirtyLocked(p.s, p.nr[pkOrd].UUID())
+		if touch {
+			t.markDirtyLocked(p.s, p.nr[pkOrd].UUID())
+		}
 	}
 	return len(pending), nil
 }
@@ -600,9 +630,12 @@ func (t *table) updateByCandidates(pks []UUID, match func(Row) bool, ords []int,
 		}
 	}
 	pkOrd := t.def.pkOrdinal
+	touch := t.updateTouchesIndex(ords)
 	for _, p := range pending {
 		p.s.rows[p.j] = p.nr
-		t.markDirtyLocked(p.s, p.nr[pkOrd].UUID())
+		if touch {
+			t.markDirtyLocked(p.s, p.nr[pkOrd].UUID())
+		}
 	}
 	return len(pending), nil
 }
@@ -629,9 +662,12 @@ func (t *table) updateOneByCandidate(pk UUID, ord int, match func(Row) bool, com
 	if err != nil {
 		return 0, err
 	}
+	touch := t.ordIsIndexed(ord)
 	if journal == nil {
 		r[ord] = val
-		t.markDirtyLocked(s, pk)
+		if touch {
+			t.markDirtyLocked(s, pk)
+		}
 		return 1, nil
 	}
 	old := r[ord]
@@ -640,7 +676,9 @@ func (t *table) updateOneByCandidate(pk UUID, ord int, match func(Row) bool, com
 		r[ord] = old
 		return 0, err
 	}
-	t.markDirtyLocked(s, pk)
+	if touch {
+		t.markDirtyLocked(s, pk)
+	}
 	return 1, nil
 }
 

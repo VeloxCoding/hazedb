@@ -100,6 +100,46 @@ func TestUpdateDeleteByIndexDirtyOverlay(t *testing.T) {
 	}
 }
 
+// An UPDATE that changes only a NON-indexed column leaves every index entry
+// valid, so it must not enter the dirty overlay (which would slow later indexed
+// lookups). An UPDATE of the indexed column itself must still dirty + be findable
+// by its new value.
+func TestUpdateNonIndexedColumnSkipsDirty(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE u (id uuid primary key, name text, score int, INDEX (name))")
+	for i := 0; i < 5; i++ {
+		db.Exec("INSERT INTO u (id, name, score) VALUES (?, ?, ?)", NewUUIDv7(), "n"+strconv.Itoa(i), 0)
+	}
+	db.mergeIndexes()
+	tbl := db.cat.Load().byName["u"].table
+	if d := tbl.dirtyCount.Load(); d != 0 {
+		t.Fatalf("dirty after merge = %d, want 0", d)
+	}
+	// Non-indexed column: must not dirty the overlay, row still found with new value.
+	if n, _ := db.Exec("UPDATE u SET score = ? WHERE name = ?", 42, "n2"); n != 1 {
+		t.Fatalf("update non-indexed: n=%d want 1", n)
+	}
+	if d := tbl.dirtyCount.Load(); d != 0 {
+		t.Fatalf("non-indexed update marked dirty (%d) — must stay out of the overlay", d)
+	}
+	if _, rows, _ := db.Query("SELECT score FROM u WHERE name = ?", "n2"); len(rows) != 1 || rows[0][0].Int() != 42 {
+		t.Fatalf("indexed read after non-indexed update wrong: %v", rows)
+	}
+	// Indexed column: must dirty and be findable by the NEW value (not the old).
+	if n, _ := db.Exec("UPDATE u SET name = ? WHERE name = ?", "renamed", "n3"); n != 1 {
+		t.Fatalf("update indexed: n=%d want 1", n)
+	}
+	if d := tbl.dirtyCount.Load(); d == 0 {
+		t.Fatal("indexed-column update should mark dirty")
+	}
+	if _, rows, _ := db.Query("SELECT score FROM u WHERE name = ?", "renamed"); len(rows) != 1 {
+		t.Fatalf("row not findable by new indexed value: %v", rows)
+	}
+	if _, rows, _ := db.Query("SELECT id FROM u WHERE name = ?", "n3"); len(rows) != 0 {
+		t.Fatal("row still findable by OLD indexed value after rename")
+	}
+}
+
 // When the dirty overlay outgrows the table (merger not keeping up), the hybrid
 // candidate walk costs more than a scan, so idxLookup falls through to the scan
 // path (dirtyTooDenseForScan). That fallback must still touch exactly the right
