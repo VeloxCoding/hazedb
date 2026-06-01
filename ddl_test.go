@@ -290,6 +290,20 @@ func resolvedTableByName(t *testing.T, db *DB, name string) *resolvedTable {
 	return rt.table.def
 }
 
+// sameResolvedIndex reports whether ri has the given name and exact ordinal
+// list (resolvedIndex now carries a slice, so it is no longer == comparable).
+func sameResolvedIndex(ri resolvedIndex, name string, ords ...int) bool {
+	if ri.name != name || len(ri.ordinals) != len(ords) {
+		return false
+	}
+	for i := range ords {
+		if ri.ordinals[i] != ords[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // S1: an index declaration parses, resolves to the right column ordinal +
 // uniqueness, gets an auto-derived name when unnamed, and does not disturb the
 // existing full-scan read path.
@@ -302,10 +316,10 @@ func TestCreateTableWithIndex(t *testing.T) {
 	if len(rt.indexes) != 2 {
 		t.Fatalf("want 2 indexes, got %d", len(rt.indexes))
 	}
-	if rt.indexes[0] != (resolvedIndex{name: "idx_email", ordinal: 2}) {
+	if !sameResolvedIndex(rt.indexes[0], "idx_email", 2) {
 		t.Errorf("email index resolved wrong: %+v", rt.indexes[0])
 	}
-	if rt.indexes[1] != (resolvedIndex{name: "by_name", ordinal: 1}) {
+	if !sameResolvedIndex(rt.indexes[1], "by_name", 1) {
 		t.Errorf("name index resolved wrong: %+v", rt.indexes[1])
 	}
 	// Reads still work (full scan; index behaviour lands in S2+).
@@ -352,7 +366,7 @@ func TestIndexSurvivesRestart(t *testing.T) {
 	}
 	defer db2.Close()
 	rt := resolvedTableByName(t, db2, "users")
-	if len(rt.indexes) != 1 || rt.indexes[0] != (resolvedIndex{name: "idx_email", ordinal: 1}) {
+	if len(rt.indexes) != 1 || !sameResolvedIndex(rt.indexes[0], "idx_email", 1) {
 		t.Fatalf("index lost or changed after restart: %+v", rt.indexes)
 	}
 }

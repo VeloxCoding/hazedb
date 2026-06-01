@@ -108,6 +108,30 @@ func (db *DB) selectEach(pl *plan, args []Value, visit func(row Row) bool) ([]st
 		return colNames, nil
 	}
 
+	// Composite prefix lookup: stream each candidate's live row, like idxLookup.
+	if pl.compLookup {
+		cand, ok, err := db.compositeCandidates(pl, &ctx)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return colNames, nil
+		}
+		cand.emit(func(pk UUID) bool {
+			s := tbl.shardOf(pk)
+			s.mu.RLock()
+			stop := false
+			if rowID, ok := s.pk[pk]; ok {
+				if r := s.rows[rowID]; r != nil {
+					stop = consume(r)
+				}
+			}
+			s.mu.RUnlock()
+			return stop
+		})
+		return colNames, nil
+	}
+
 	// Scan: scanAll / scanPartition call the callback under each shard's read
 	// lock, so consume runs on live rows. (A pinned partition scans only its
 	// rows; otherwise every shard.)

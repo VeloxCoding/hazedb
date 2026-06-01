@@ -147,10 +147,14 @@ func (p *parser) parseCreate() (*createStmt, error) {
 
 // parseIndexClause parses a table-level index declaration:
 //
-//	[ORDERED] INDEX [name] (col)
+//	[ORDERED] INDEX [name] (col [, col...])
 //
 // ORDERED makes it a sorted index (equality + ranges + ORDER BY); the default
-// is a hash index (equality only). Single-column only in v1; a composite errors.
+// is a hash index (equality only). A composite (multi-column) index must be
+// ORDERED: the hash form would only serve exact whole-tuple equality (no better
+// than the bucket intersection the planner already does), while the ordered form
+// serves prefix equality + ORDER BY on the trailing column — the reason
+// composite exists here.
 func (p *parser) parseIndexClause() (IndexDef, error) {
 	var ix IndexDef
 	for { // optional modifiers before INDEX
@@ -170,16 +174,22 @@ func (p *parser) parseIndexClause() (IndexDef, error) {
 	if _, err := p.expect(tkLParen, "("); err != nil {
 		return ix, err
 	}
-	cn, err := p.expect(tkIdent, "index column")
-	if err != nil {
-		return ix, err
-	}
-	ix.Column = cn.text
-	if p.peek().kind == tkComma {
-		return ix, fmt.Errorf("%w: composite index not supported in v1 at %d", ErrParse, p.peek().pos)
+	for {
+		cn, err := p.expect(tkIdent, "index column")
+		if err != nil {
+			return ix, err
+		}
+		ix.Columns = append(ix.Columns, cn.text)
+		if p.peek().kind != tkComma {
+			break
+		}
+		p.advance() // consume the comma; another column follows
 	}
 	if _, err := p.expect(tkRParen, ")"); err != nil {
 		return ix, err
+	}
+	if len(ix.Columns) > 1 && !ix.Ordered {
+		return ix, fmt.Errorf("%w: composite index must be ORDERED (hash composite unsupported)", ErrParse)
 	}
 	return ix, nil
 }

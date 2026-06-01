@@ -112,6 +112,18 @@ type plan struct {
 	// sorting. orderOrdinal names the column.
 	orderWalk bool
 
+	// compLookup / compWalk select a composite ordered index whose leading
+	// columns are pinned by equality (WHERE a = ? [AND b = ?]). compOrdinals is
+	// the chosen index's full ordinal list (locates the *secIndex at exec time);
+	// compPrefixSrcs yields the pinned leading-column values, in order, encoded
+	// into a key prefix. compLookup resolves candidate PKs via that prefix;
+	// compWalk additionally walks the prefix sub-range in ORDER BY order (the
+	// trailing column) and stops at LIMIT — no sort.
+	compLookup     bool
+	compWalk       bool
+	compOrdinals   []int
+	compPrefixSrcs []expr
+
 	// joinPlan is non-nil for a two-table join; execSelect dispatches to execJoin.
 	// projOrdinals / colNames / orderOrdinal are then bound to global concat-row
 	// ordinals (see join.go).
@@ -215,18 +227,25 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 				collectEqConjuncts(s.where, eqs)
 				for i := range rt.indexes {
 					ri := &rt.indexes[i]
-					if src, has := eqs[ri.ordinal]; has {
-						pl.idxCols = append(pl.idxCols, ri.ordinal)
+					if len(ri.ordinals) != 1 {
+						continue // composite indexes are handled by planComposite below
+					}
+					ord := ri.ordinals[0]
+					if src, has := eqs[ord]; has {
+						pl.idxCols = append(pl.idxCols, ord)
 						pl.idxSrcs = append(pl.idxSrcs, src)
 					}
 				}
 				pl.idxLookup = len(pl.idxCols) > 0
+				if !pl.idxLookup {
+					rt.planComposite(pl, eqs, pl.orderOrdinal)
+				}
 			}
 		}
 		// ORDER BY on an ordered-indexed column, with no equality index chosen
 		// (applies with or without a WHERE): walk the sorted index in order
 		// instead of scanning + sorting.
-		if s.orderCol != "" && !pl.idxLookup && rt.orderedIndexOn(pl.orderOrdinal) {
+		if s.orderCol != "" && !pl.idxLookup && !pl.compLookup && !pl.compWalk && rt.orderedIndexOn(pl.orderOrdinal) {
 			pl.orderWalk = true
 		}
 	case *insertStmt:
@@ -314,10 +333,65 @@ func detectPKEq(e expr, rt *resolvedTable) (bool, expr) {
 	return detectColEq(e, rt, rt.pkOrdinal)
 }
 
+// planComposite selects a composite ordered index for a SELECT whose WHERE pins
+// a contiguous leading prefix of its columns by equality (eqs maps a pinned
+// column ordinal to the expr yielding its value). It records the index's ordinals
+// + the prefix value-sources, then chooses compWalk when the ORDER BY is on the
+// first unpinned column (already sorted within the prefix — no sort) or
+// compLookup otherwise. The leading column must be pinned (k ≥ 1). First usable
+// index wins.
+func (rt *resolvedTable) planComposite(pl *plan, eqs map[int]expr, orderOrdinal int) {
+	for i := range rt.indexes {
+		ri := &rt.indexes[i]
+		if len(ri.ordinals) < 2 || !ri.ordered {
+			continue
+		}
+		// Correctness guard: a composite index excludes any row with a NULL in any
+		// component, so it can only serve a query completely when every component
+		// is NOT NULL — else a (a=X, b=NULL) row matches WHERE a=? yet is absent
+		// from the index. Nullable-component composites fall back to scan.
+		if rt.anyNullable(ri.ordinals) {
+			continue
+		}
+		k := 0
+		for k < len(ri.ordinals) {
+			if _, has := eqs[ri.ordinals[k]]; !has {
+				break
+			}
+			k++
+		}
+		if k == 0 {
+			continue // leading column not pinned by equality
+		}
+		srcs := make([]expr, k)
+		for j := 0; j < k; j++ {
+			srcs[j] = eqs[ri.ordinals[j]]
+		}
+		pl.compOrdinals = ri.ordinals
+		pl.compPrefixSrcs = srcs
+		if orderOrdinal >= 0 && k < len(ri.ordinals) && ri.ordinals[k] == orderOrdinal {
+			pl.compWalk = true // ORDER BY on the trailing column: walk in order, no sort
+		} else {
+			pl.compLookup = true
+		}
+		return
+	}
+}
+
+// anyNullable reports whether any of the columns at ords is declared nullable.
+func (rt *resolvedTable) anyNullable(ords []int) bool {
+	for _, o := range ords {
+		if rt.def.Columns[o].Nullable {
+			return true
+		}
+	}
+	return false
+}
+
 // orderedIndexOn reports whether column ord has an ORDERED secondary index.
 func (rt *resolvedTable) orderedIndexOn(ord int) bool {
 	for i := range rt.indexes {
-		if rt.indexes[i].ordinal == ord && rt.indexes[i].ordered {
+		if rt.indexes[i].singleOn(ord) && rt.indexes[i].ordered {
 			return true
 		}
 	}
@@ -750,19 +824,28 @@ func (db *DB) idxCandidates(pl *plan, ctx *evalCtx) (cand idxCandidateSet, ok bo
 }
 
 func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
-	st := pl.st.(*selectStmt)
-	tbl := pl.rt
-	colNames := pl.colNames
-	if st.limit == 0 {
-		return colNames, nil, nil
+	if pl.st.(*selectStmt).limit == 0 {
+		return pl.colNames, nil, nil
 	}
 	cand, ok, err := db.idxCandidates(pl, ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 	if !ok {
-		return colNames, nil, nil
+		return pl.colNames, nil, nil
 	}
+	return db.execCandidates(pl, ctx, cand)
+}
+
+// execCandidates materializes a SELECT from a resolved candidate set (index hits
+// ∪ dirty overlay): it evaluates the full WHERE on each candidate's live row and,
+// with an ORDER BY, sorts before LIMIT (a top-N heap when LIMITed); otherwise it
+// projects and stops at LIMIT. Shared by the single-column index path and the
+// composite prefix-lookup path. Callers handle the LIMIT 0 early-out.
+func (db *DB) execCandidates(pl *plan, ctx *evalCtx, cand idxCandidateSet) ([]string, []Row, error) {
+	st := pl.st.(*selectStmt)
+	tbl := pl.rt
+	colNames := pl.colNames
 
 	// ORDER BY: gather every matching live row, sort by the order column, then
 	// LIMIT. The candidate set is the index-narrowed (filtered) subset — the
@@ -888,6 +971,90 @@ func (db *DB) execSelectIdxOne(pl *plan, args []Value) ([]string, Row, error) {
 	return colNames, nil, nil
 }
 
+// compositeCandidates resolves the candidate set for a composite prefix lookup:
+// the PKs whose composite key starts with the encoded pinned prefix, UNION the
+// dirty overlay. ok=false means provably empty (a NULL in the prefix, a missing
+// index, or no hit and no dirty). The caller evaluates the full WHERE on every
+// candidate, so a stale entry or an over-broad prefix yields no wrong row.
+func (db *DB) compositeCandidates(pl *plan, ctx *evalCtx) (idxCandidateSet, bool, error) {
+	tbl := pl.rt
+	si := tbl.indexByOrdinals(pl.compOrdinals)
+	if si == nil {
+		return idxCandidateSet{}, false, nil
+	}
+	prefix := make([]Value, len(pl.compPrefixSrcs))
+	for i, src := range pl.compPrefixSrcs {
+		v, err := evalExpr(src, ctx)
+		if err != nil {
+			return idxCandidateSet{}, false, err
+		}
+		if v.IsNull() {
+			return idxCandidateSet{}, false, nil
+		}
+		prefix[i] = v
+	}
+	pks := si.prefixLookup(encodeCompositeKey(prefix))
+	dirty := tbl.dirtyPKs()
+	if len(pks) == 0 && len(dirty) == 0 {
+		return idxCandidateSet{}, false, nil
+	}
+	return idxCandidateSet{pks: pks, dirty: dirty}, true, nil
+}
+
+// execSelectCompositeLookup runs a SELECT whose WHERE pins a leading prefix of a
+// composite index by equality. It resolves candidates through the prefix and
+// reuses the shared candidate machinery (full-WHERE residual + ORDER BY sort).
+func (db *DB) execSelectCompositeLookup(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
+	if pl.st.(*selectStmt).limit == 0 {
+		return pl.colNames, nil, nil
+	}
+	cand, ok, err := db.compositeCandidates(pl, ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !ok {
+		return pl.colNames, nil, nil
+	}
+	return db.execCandidates(pl, ctx, cand)
+}
+
+// execSelectCompositeWalk serves WHERE <leading prefix> = ? ORDER BY <next col>
+// via a composite ordered index: it walks the pinned-prefix sub-range of the
+// sorted index — already ordered by the trailing column — and stops at LIMIT, so
+// no sort runs. The walk reuses orderedWalk with a composite dirty key (the
+// encoded tuple) so dirty rows merge into the same key space as the index
+// entries. Every component is NOT NULL (planComposite's guard), so a matching
+// row always has a fully-encodable key.
+func (db *DB) execSelectCompositeWalk(pl *plan, args []Value) ([]string, []Row, error) {
+	tbl := pl.rt
+	si := tbl.indexByOrdinals(pl.compOrdinals)
+	if si == nil {
+		return pl.colNames, nil, nil
+	}
+	ctx := evalCtx{cols: tbl.def.colByName, args: args}
+	prefix := make([]Value, len(pl.compPrefixSrcs))
+	for i, src := range pl.compPrefixSrcs {
+		v, err := evalExpr(src, &ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		if v.IsNull() {
+			return pl.colNames, nil, nil
+		}
+		prefix[i] = v
+	}
+	snap := si.snapshotPrefix(encodeCompositeKey(prefix))
+	ords := si.ordinals
+	dirtyKey := func(r Row) indexKey {
+		cells := make([]Value, len(ords))
+		for i, o := range ords {
+			cells[i] = r[o]
+		}
+		return encodeCompositeKey(cells)
+	}
+	return db.orderedWalk(pl, args, snap, dirtyKey)
+}
+
 // execSelectOrderedWalk serves an ORDER BY on an ordered-indexed column by
 // walking the sorted index in order, merged with the dirty overlay (rows
 // mutated since the last merge), applying any residual WHERE, and stopping at
@@ -896,14 +1063,27 @@ func (db *DB) execSelectIdxOne(pl *plan, args []Value) ([]string, Row, error) {
 // and the row is fetched only when selected. Dirty PKs are excluded from the
 // index walk (the entry may be stale) and supplied from their live rows.
 func (db *DB) execSelectOrderedWalk(pl *plan, args []Value) ([]string, []Row, error) {
+	si := pl.rt.indexFor(pl.orderOrdinal)
+	if si == nil {
+		return pl.colNames, nil, nil
+	}
+	ord := pl.orderOrdinal
+	return db.orderedWalk(pl, args, si.snapshot(), func(r Row) indexKey { return keyOf(r[ord]) })
+}
+
+// orderedWalk merges a sorted index slice (snap, ascending key order) with the
+// dirty overlay and emits rows in ORDER BY order, stopping at LIMIT — touching
+// ~LIMIT rows, not the whole set. dirtyKey maps a dirty row to its sort key in
+// snap's key space (single-column: keyOf(orderOrdinal); composite: the encoded
+// tuple), so both streams merge on one comparator. A non-dirty snap entry is
+// fresh, so its key drives the ordering and the row is fetched only when
+// selected; dirty PKs are excluded from the snap walk (their entry may be stale)
+// and supplied from their live rows.
+func (db *DB) orderedWalk(pl *plan, args []Value, snap []ordEntry, dirtyKey func(Row) indexKey) ([]string, []Row, error) {
 	st := pl.st.(*selectStmt)
 	tbl := pl.rt
 	colNames := pl.colNames
 	if st.limit == 0 {
-		return colNames, nil, nil
-	}
-	si := tbl.indexFor(pl.orderOrdinal)
-	if si == nil {
 		return colNames, nil, nil
 	}
 	ctx := evalCtx{cols: tbl.def.colByName, args: args}
@@ -922,7 +1102,6 @@ func (db *DB) execSelectOrderedWalk(pl *plan, args []Value) ([]string, []Row, er
 		return projectClone(r, pl.projOrdinals)
 	}
 
-	snap := si.snapshot()
 	dirty := tbl.dirtyPKs()
 	dirtySet := make(map[UUID]struct{}, len(dirty))
 	type dcand struct {
@@ -936,7 +1115,7 @@ func (db *DB) execSelectOrderedWalk(pl *plan, args []Value) ([]string, []Row, er
 		}
 		dirtySet[pk] = struct{}{}
 		if r, ok := tbl.getByPK(pk); ok && matches(r) {
-			dc = append(dc, dcand{keyOf(r[pl.orderOrdinal]), r})
+			dc = append(dc, dcand{dirtyKey(r), r})
 		}
 	}
 	sort.Slice(dc, func(i, j int) bool { return dc[i].key.less(dc[j].key) })
@@ -1103,6 +1282,17 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 	// each by PK and project. No scan.
 	if pl.idxLookup {
 		return db.execSelectIdx(pl, &ctx)
+	}
+
+	// Composite ordered walk: WHERE pins a prefix, ORDER BY the trailing column —
+	// walk the prefix sub-range in order, no sort.
+	if pl.compWalk {
+		return db.execSelectCompositeWalk(pl, args)
+	}
+
+	// Composite prefix lookup: WHERE pins a leading prefix of a composite index.
+	if pl.compLookup {
+		return db.execSelectCompositeLookup(pl, &ctx)
 	}
 
 	// Ordered-index ORDER BY: walk the sorted index (merged with the dirty

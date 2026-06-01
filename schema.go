@@ -3,6 +3,7 @@ package hazedb
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -52,15 +53,15 @@ type ColumnDef struct {
 	Nullable     bool
 }
 
-// IndexDef declares a secondary index on one non-PK column. Maintained
+// IndexDef declares a secondary index on one or more non-PK columns. Maintained
 // asynchronously and read through a hybrid path; see docs/secondary-indexes.md.
-// Single-column only in v1 (composite is v1.1+).
+// A composite (multi-column) index must be Ordered (see parseIndexClause).
 type IndexDef struct {
-	Name   string // optional; auto-derived as "idx_<col>" when empty
-	Column string
+	Name    string // optional; auto-derived as "idx_<col>[_<col>...]" when empty
+	Columns []string
 	// Ordered makes this a sorted index (serves equality + ranges + ORDER BY)
 	// instead of the default hash index (equality only). A column has one or the
-	// other, not both.
+	// other, not both. Composite indexes are always Ordered.
 	Ordered bool
 }
 
@@ -77,12 +78,21 @@ type Schema struct {
 	Tables []TableDef
 }
 
-// resolvedIndex is the validated form of an IndexDef: the indexed column's
-// ordinal and index kind, resolved once at schema time.
+// resolvedIndex is the validated form of an IndexDef: the indexed columns'
+// ordinals (one for a single-column index, more for a composite) and index kind,
+// resolved once at schema time.
 type resolvedIndex struct {
-	name    string
-	ordinal int
-	ordered bool
+	name     string
+	ordinals []int
+	ordered  bool
+}
+
+// singleOn reports whether this is a single-column index on ordinal ord. The
+// single-column read paths (indexFor, orderedIndexOn, the equality-lookup
+// planner) match only these, so a composite index stays invisible to them until
+// the planner learns to use it.
+func (ri *resolvedIndex) singleOn(ord int) bool {
+	return len(ri.ordinals) == 1 && ri.ordinals[0] == ord
 }
 
 // resolvedTable is the internal, validated form of a TableDef. Holds
@@ -98,7 +108,7 @@ type resolvedTable struct {
 // indexOfColumn returns the resolved index on column ordinal ord, or nil.
 func (rt *resolvedTable) indexOfColumn(ord int) *resolvedIndex {
 	for i := range rt.indexes {
-		if rt.indexes[i].ordinal == ord {
+		if rt.indexes[i].singleOn(ord) {
 			return &rt.indexes[i]
 		}
 	}
@@ -159,29 +169,45 @@ func resolveSchema(s Schema) (map[string]*resolvedTable, error) {
 		if rt.partitioned() && len(t.Indexes) > 0 {
 			return nil, fmt.Errorf("schema: table %q secondary indexes on partitioned tables are not supported yet", t.Name)
 		}
-		seenIdxCol := make(map[int]bool, len(t.Indexes))
+		seenIdxSig := make(map[string]bool, len(t.Indexes))
 		seenIdxName := make(map[string]bool, len(t.Indexes))
 		for _, ix := range t.Indexes {
-			ord, ok := rt.colByName[ix.Column]
-			if !ok {
-				return nil, fmt.Errorf("schema: table %q INDEX on unknown column %q", t.Name, ix.Column)
+			if len(ix.Columns) == 0 {
+				return nil, fmt.Errorf("schema: table %q has an index with no columns", t.Name)
 			}
-			if ord == rt.pkOrdinal {
-				return nil, fmt.Errorf("schema: table %q INDEX on PK column %q is redundant", t.Name, ix.Column)
+			ords := make([]int, 0, len(ix.Columns))
+			seenCol := make(map[int]bool, len(ix.Columns))
+			for _, col := range ix.Columns {
+				ord, ok := rt.colByName[col]
+				if !ok {
+					return nil, fmt.Errorf("schema: table %q INDEX on unknown column %q", t.Name, col)
+				}
+				if ord == rt.pkOrdinal {
+					return nil, fmt.Errorf("schema: table %q INDEX on PK column %q is redundant", t.Name, col)
+				}
+				if seenCol[ord] {
+					return nil, fmt.Errorf("schema: table %q INDEX repeats column %q", t.Name, col)
+				}
+				seenCol[ord] = true
+				ords = append(ords, ord)
 			}
-			if seenIdxCol[ord] {
-				return nil, fmt.Errorf("schema: table %q has multiple indexes on column %q", t.Name, ix.Column)
+			// Dedup by the ordered column signature, not per-column: INDEX(a) and
+			// ORDERED INDEX(a,b) may coexist, but two indexes on the same column
+			// list may not.
+			sig := fmt.Sprint(ords)
+			if seenIdxSig[sig] {
+				return nil, fmt.Errorf("schema: table %q has multiple indexes on columns %v", t.Name, ix.Columns)
 			}
-			seenIdxCol[ord] = true
+			seenIdxSig[sig] = true
 			name := ix.Name
 			if name == "" {
-				name = "idx_" + ix.Column
+				name = "idx_" + strings.Join(ix.Columns, "_")
 			}
 			if seenIdxName[name] {
 				return nil, fmt.Errorf("schema: table %q duplicate index name %q", t.Name, name)
 			}
 			seenIdxName[name] = true
-			rt.indexes = append(rt.indexes, resolvedIndex{name: name, ordinal: ord, ordered: ix.Ordered})
+			rt.indexes = append(rt.indexes, resolvedIndex{name: name, ordinals: ords, ordered: ix.Ordered})
 		}
 		out[t.Name] = rt
 	}

@@ -134,7 +134,8 @@ func (db *DB) dropTable(name string) error {
 // CREATE: tableID:2 | name(len:2+bytes) | numCols:2 | per col: name(len:2+bytes) | type:1 | flags:1
 //   flags bit 0 = PK, 1 = PartitionKey, 2 = Immutable, 3 = Nullable
 //   then (optional, omitted by pre-index records): numIndexes:2 |
-//        per index: name(len:2+bytes) | col(len:2+bytes) | flags:1 (bit 1 = Ordered; bit 0 reserved)
+//        per index: name(len:2+bytes) | numCols:2 | per col: col(len:2+bytes) |
+//        flags:1 (bit 1 = Ordered; bit 0 reserved)
 // DROP:   name(len:2+bytes)
 
 func encodeCreateTable(buf []byte, tableID uint16, td TableDef) []byte {
@@ -165,8 +166,11 @@ func encodeCreateTable(buf []byte, tableID uint16, td TableDef) []byte {
 	for _, ix := range td.Indexes {
 		buf = appendU16LE(buf, uint16(len(ix.Name)))
 		buf = append(buf, ix.Name...)
-		buf = appendU16LE(buf, uint16(len(ix.Column)))
-		buf = append(buf, ix.Column...)
+		buf = appendU16LE(buf, uint16(len(ix.Columns)))
+		for _, col := range ix.Columns {
+			buf = appendU16LE(buf, uint16(len(col)))
+			buf = append(buf, col...)
+		}
 		var flags byte
 		if ix.Ordered {
 			flags |= 2
@@ -226,17 +230,26 @@ func decodeCreateTable(b []byte) (uint16, TableDef, error) {
 			return 0, td, err
 		}
 		off += n
-		col, n, err := getLenStr(b[off:])
-		if err != nil {
-			return 0, td, err
+		if off+2 > len(b) {
+			return 0, td, fmt.Errorf("%w: create-table index numcols", ErrWALCorrupt)
 		}
-		off += n
+		ncol := int(binary.LittleEndian.Uint16(b[off : off+2]))
+		off += 2
+		cols := make([]string, 0, ncol)
+		for j := 0; j < ncol; j++ {
+			col, n, err := getLenStr(b[off:])
+			if err != nil {
+				return 0, td, err
+			}
+			off += n
+			cols = append(cols, col)
+		}
 		if off >= len(b) {
 			return 0, td, fmt.Errorf("%w: create-table index flags", ErrWALCorrupt)
 		}
 		flags := b[off]
 		off++
-		td.Indexes = append(td.Indexes, IndexDef{Name: name, Column: col, Ordered: flags&2 != 0})
+		td.Indexes = append(td.Indexes, IndexDef{Name: name, Columns: cols, Ordered: flags&2 != 0})
 	}
 	return tableID, td, nil
 }

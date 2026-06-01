@@ -3,6 +3,7 @@ package hazedb
 import (
 	"bytes"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -85,21 +86,40 @@ func uuidLess(a, b UUID) bool { return bytes.Compare(a[:], b[:]) < 0 }
 // PK->current key, so a change can drop the stale forward entry without the
 // caller supplying the old value. Guarded by mu.
 type secIndex struct {
-	ordinal int
-	ordered bool // sorted index (equality + ranges + ORDER BY); see O2
-	mu      sync.RWMutex
-	fwd     map[indexKey][]UUID // hash mode: value -> PKs
-	rev     map[UUID]indexKey   // pk -> current key (both modes)
-	sorted  []ordEntry          // ordered mode: rev sorted by key, rebuilt on merge
+	ordinals []int // one column for a single-column index, more for a composite
+	ordered  bool  // sorted index (equality + ranges + ORDER BY); see O2
+	mu       sync.RWMutex
+	fwd      map[indexKey][]UUID // hash mode: value -> PKs
+	rev      map[UUID]indexKey   // pk -> current key (both modes)
+	sorted   []ordEntry          // ordered mode: rev sorted by key, rebuilt on merge
 }
 
 func newSecIndex(ri resolvedIndex) *secIndex {
 	return &secIndex{
-		ordinal: ri.ordinal,
-		ordered: ri.ordered,
-		fwd:     make(map[indexKey][]UUID),
-		rev:     make(map[UUID]indexKey),
+		ordinals: ri.ordinals,
+		ordered:  ri.ordered,
+		fwd:      make(map[indexKey][]UUID),
+		rev:      make(map[UUID]indexKey),
 	}
+}
+
+// keyFromCells builds the index key from the indexed cells (one per ordinal, in
+// declaration order). indexable=false when any cell is NULL — a NULL is never
+// indexed, so the row drops out of this index entirely. Single-column reuses the
+// scalar keyOf (no allocation, unchanged hot path); composite encodes the tuple.
+func (si *secIndex) keyFromCells(cells []Value) (indexKey, bool) {
+	if len(si.ordinals) == 1 {
+		if cells[0].Kind == KindNull {
+			return indexKey{}, false
+		}
+		return keyOf(cells[0]), true
+	}
+	for i := range cells {
+		if cells[i].Kind == KindNull {
+			return indexKey{}, false
+		}
+	}
+	return encodeCompositeKey(cells), true
 }
 
 // apply records pk's current indexed key. indexable=false means the row is gone
@@ -202,6 +222,59 @@ func (si *secIndex) lookup(k indexKey) []UUID {
 	return out
 }
 
+// prefixLookup returns the PKs whose composite key starts with prefix.s (the
+// encoded leading columns of a composite index — e.g. (a = ?) on an (a, b)
+// index), in sorted-key order. The sorted view groups all keys sharing a byte
+// prefix contiguously, so a binary search to the lower bound then a forward walk
+// while the prefix matches enumerates them. Ordered indexes only. Like lookup,
+// it reads the merged view only; the caller unions the dirty overlay.
+func (si *secIndex) prefixLookup(prefix indexKey) []UUID {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
+	lo := sort.Search(len(si.sorted), func(i int) bool { return si.sorted[i].key.s >= prefix.s })
+	var out []UUID
+	for i := lo; i < len(si.sorted); i++ {
+		if !strings.HasPrefix(si.sorted[i].key.s, prefix.s) {
+			break // past the prefix run
+		}
+		out = append(out, si.sorted[i].pk)
+	}
+	return out
+}
+
+// snapshotPrefix returns the contiguous slice of the sorted view whose keys
+// start with prefix.s — the (a = ?) sub-range of a composite (a, b) index,
+// already ordered by the trailing column(s). The returned header is a stable,
+// immutable view (rebuildSorted never mutates in place), walkable without mu.
+func (si *secIndex) snapshotPrefix(prefix indexKey) []ordEntry {
+	si.mu.RLock()
+	s := si.sorted
+	si.mu.RUnlock()
+	lo := sort.Search(len(s), func(i int) bool { return s[i].key.s >= prefix.s })
+	// Upper bound by binary search too — a linear scan to the end of the prefix
+	// run would be O(bucket), defeating the walk's "touch ~LIMIT rows" goal. ub is
+	// the least string strictly greater than every string with this prefix.
+	hi := len(s)
+	if ub := prefixUpperBound(prefix.s); ub != "" {
+		hi = sort.Search(len(s), func(i int) bool { return s[i].key.s >= ub })
+	}
+	return s[lo:hi]
+}
+
+// prefixUpperBound returns the least string strictly greater than every string
+// starting with p (p with its last non-0xFF byte incremented, trailing 0xFF
+// bytes dropped). "" means p is all-0xFF (no finite upper bound — walk to end).
+func prefixUpperBound(p string) string {
+	b := []byte(p)
+	for i := len(b) - 1; i >= 0; i-- {
+		if b[i] != 0xFF {
+			b[i]++
+			return string(b[:i+1])
+		}
+	}
+	return ""
+}
+
 // intersectPKs returns the PKs present in both a and b. It builds a set from
 // the smaller slice and probes it with the larger, so the cost is O(|a|+|b|)
 // with no row fetches. Index buckets hold each PK once, so no de-duplication is
@@ -240,7 +313,29 @@ func (si *secIndex) snapshot() []ordEntry {
 // indexFor returns the table's secondary index on column ord, or nil.
 func (t *table) indexFor(ord int) *secIndex {
 	for _, si := range t.indexes {
-		if si.ordinal == ord {
+		if len(si.ordinals) == 1 && si.ordinals[0] == ord {
+			return si
+		}
+	}
+	return nil
+}
+
+// indexByOrdinals returns the secondary index whose columns are exactly ords, in
+// order, or nil. Locates a composite index chosen at plan time (stored as its
+// ordinal list on the plan).
+func (t *table) indexByOrdinals(ords []int) *secIndex {
+	for _, si := range t.indexes {
+		if len(si.ordinals) != len(ords) {
+			continue
+		}
+		match := true
+		for i := range ords {
+			if si.ordinals[i] != ords[i] {
+				match = false
+				break
+			}
+		}
+		if match {
 			return si
 		}
 	}
@@ -332,9 +427,16 @@ func (t *table) mergeIndexes() {
 	// (getByPK copies every column, incl. any large BYTES payload). ords[k] is
 	// the column ordinal of t.indexes[k], so the projected row lines up 1:1 with
 	// the index list.
-	ords := make([]int, len(t.indexes))
+	// Flatten every index's component ordinals into one projection list and
+	// remember each index's slice within it, so one getByPKProjectInto fetches all
+	// the cells every index needs (single-column contributes one ordinal,
+	// composite several). spans[k] selects index k's cells from the projected row.
+	var ords []int
+	type span struct{ off, n int }
+	spans := make([]span, len(t.indexes))
 	for k, si := range t.indexes {
-		ords[k] = si.ordinal
+		spans[k] = span{off: len(ords), n: len(si.ordinals)}
+		ords = append(ords, si.ordinals...)
 	}
 	var scratch []Value
 	type pending struct {
@@ -362,8 +464,9 @@ func (t *table) mergeIndexes() {
 					si.apply(pk, indexKey{}, false)
 					continue
 				}
-				v := pr[k]
-				si.apply(pk, keyOf(v), v.Kind != KindNull)
+				cells := pr[spans[k].off : spans[k].off+spans[k].n]
+				key, indexable := si.keyFromCells(cells)
+				si.apply(pk, key, indexable)
 			}
 		}
 		drops = append(drops, pending{s, n})
@@ -413,11 +516,22 @@ func (t *table) rebuildIndexes() {
 		si.mu.Unlock()
 	}
 	pkOrd := t.def.pkOrdinal
+	var comp []Value // reused composite-component scratch (single-column stays alloc-free)
 	t.scanAll(func(r Row) bool {
 		pk := r[pkOrd].UUID()
 		for _, si := range t.indexes {
-			if v := r[si.ordinal]; v.Kind != KindNull {
-				si.apply(pk, keyOf(v), true)
+			if len(si.ordinals) == 1 {
+				if v := r[si.ordinals[0]]; v.Kind != KindNull {
+					si.apply(pk, keyOf(v), true)
+				}
+				continue
+			}
+			comp = comp[:0]
+			for _, ord := range si.ordinals {
+				comp = append(comp, r[ord])
+			}
+			if key, ok := si.keyFromCells(comp); ok {
+				si.apply(pk, key, true)
 			}
 		}
 		return true

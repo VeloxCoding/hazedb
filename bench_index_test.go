@@ -190,6 +190,37 @@ func benchIndexOrderBy(b *testing.B, perAuthor int) {
 func BenchmarkIndexOrderBy_50(b *testing.B)   { benchIndexOrderBy(b, 50) }
 func BenchmarkIndexOrderBy_5000(b *testing.B) { benchIndexOrderBy(b, 5000) }
 
+// Same query/data as benchIndexOrderBy, but served by ORDERED INDEX (author,
+// day): the composite walk reads the (author = ?) sub-range already ordered by
+// day and stops at LIMIT — touching ~LIMIT rows, not the whole bucket. The
+// per-author delta vs BenchmarkIndexOrderBy_* is the step-3b win (no gather +
+// sort).
+func benchCompositeWalk(b *testing.B, perAuthor int) {
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: perAuthor * 2})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec("CREATE TABLE posts (id uuid primary key, author text, day int, ORDERED INDEX (author, day))")
+	for _, author := range []string{"A", "B"} { // B is noise in another prefix
+		for i := 0; i < perAuthor; i++ {
+			db.Exec("INSERT INTO posts (id, author, day) VALUES (?, ?, ?)", NewUUIDv7(), author, i)
+		}
+	}
+	db.mergeIndexes()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, rows, err := db.Query("SELECT id, author, day FROM posts WHERE author = ? ORDER BY day DESC LIMIT 20", "A")
+		if err != nil || len(rows) != 20 {
+			b.Fatalf("rows=%d err=%v", len(rows), err)
+		}
+	}
+}
+
+func BenchmarkCompositeWalk_50(b *testing.B)   { benchCompositeWalk(b, 50) }
+func BenchmarkCompositeWalk_5000(b *testing.B) { benchCompositeWalk(b, 5000) }
+
 // Global ORDER BY on an ordered index: walk the sorted view + take LIMIT, no
 // scan + sort. Compare to a hash index, which would scan all + top-N heap.
 func BenchmarkOrderedWalk_50k(b *testing.B) {
