@@ -784,6 +784,28 @@ func (t *table) getMatchProject(pk UUID, pred func(Row) bool, ords []int, starAl
 	return projectClone(r, ords), true
 }
 
+// getMatchProjectInto is the scan-into form of getMatchProject: on a WHERE pass
+// it appends the projection (or the whole row for SELECT *) into dst rather than
+// allocating a fresh Row, so a projection without BYTES columns makes no
+// allocation. The QueryRowByIndex fast path. Non-partitioned.
+func (t *table) getMatchProjectInto(pk UUID, pred func(Row) bool, ords []int, starAll bool, dst []Value) ([]Value, bool) {
+	s := t.shardOf(pk)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rowID, ok := s.pk[pk]
+	if !ok {
+		return dst[:0], false
+	}
+	r := s.rows[rowID]
+	if r == nil || !pred(r) {
+		return dst[:0], false
+	}
+	if starAll {
+		return appendRowClone(dst[:0], r), true
+	}
+	return appendProjectClone(dst[:0], r, ords), true
+}
+
 // execSelectIdx runs a SELECT whose WHERE pins one or more secondary-indexed
 // columns by equality. It resolves candidate PKs through the index(es)
 // (intersecting buckets for an AND of equalities) plus the dirty overlay, then

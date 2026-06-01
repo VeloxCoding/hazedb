@@ -102,3 +102,76 @@ func (s *Stmt) QueryRowByPK(pk UUID, dst []Value) (out []Value, found bool, err 
 	out, found = pl.rt.getByPKProjectInto(pk, ords, dst)
 	return out, found, nil
 }
+
+// QueryRowByIndex is the QueryRowByPK fast path for a single secondary-index
+// equality: the statement must be a SELECT pinning exactly one indexed column
+// (WHERE <indexed> = ?), with no ORDER BY and no OFFSET. key is the typed value
+// for that one parameter (no interface boxing); the first matching row's
+// projection is written into dst, grown only if too small — reuse it across
+// calls. found reports whether a row matched.
+//
+// In steady state it allocates only the index-bucket copy (~one small slice);
+// the projection scan and the empty dirty overlay add none. The full WHERE is
+// re-checked on each live candidate (staleness + any residual), so a statement
+// needing a second parameter returns an error rather than a wrong row.
+func (s *Stmt) QueryRowByIndex(key Value, dst []Value) (out []Value, found bool, err error) {
+	pl, err := s.bound()
+	if err != nil {
+		return dst[:0], false, err
+	}
+	st, ok := pl.st.(*selectStmt)
+	if !ok || !pl.idxLookup || len(pl.idxCols) != 1 || pl.orderOrdinal >= 0 || st.offset != 0 {
+		return dst[:0], false, fmt.Errorf("hazedb: QueryRowByIndex requires a single-indexed-equality SELECT (WHERE <indexed> = ?), no ORDER BY or OFFSET")
+	}
+	if st.limit == 0 {
+		return dst[:0], false, nil
+	}
+	tbl := pl.rt
+	ctx := evalCtx{cols: tbl.def.colByName, args: []Value{key}}
+	keyVal, err := evalExpr(pl.idxSrcs[0], &ctx)
+	if err != nil {
+		return dst[:0], false, err
+	}
+	if keyVal.IsNull() {
+		return dst[:0], false, nil
+	}
+	si := tbl.indexFor(pl.idxCols[0])
+	if si == nil {
+		return dst[:0], false, nil
+	}
+	ords := pl.projOrdinals
+	if st.starAll {
+		ords = nil
+	}
+	var predErr error
+	pred := func(r Row) bool {
+		ctx.row = r
+		v, e := evalExpr(st.where, &ctx)
+		if e != nil {
+			predErr = e
+			return false
+		}
+		return truthy(v)
+	}
+	// Index bucket first (option b: a safe copy under the index RLock, released
+	// before the shard lock — no lock nesting), then the dirty overlay for a
+	// not-yet-merged match (nil in steady state). First live row that passes the
+	// full WHERE wins.
+	for _, pk := range si.lookup(keyOf(keyVal)) {
+		if out, found = tbl.getMatchProjectInto(pk, pred, ords, st.starAll, dst); found {
+			return out, true, nil
+		}
+		if predErr != nil {
+			return dst[:0], false, predErr
+		}
+	}
+	for _, pk := range tbl.dirtyPKs() {
+		if out, found = tbl.getMatchProjectInto(pk, pred, ords, st.starAll, dst); found {
+			return out, true, nil
+		}
+		if predErr != nil {
+			return dst[:0], false, predErr
+		}
+	}
+	return dst[:0], false, nil
+}

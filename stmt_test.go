@@ -100,6 +100,47 @@ func TestStmtQueryRowByPK(t *testing.T) {
 	}
 }
 
+// QueryRowByIndex matches Query, finds a not-yet-merged row via the dirty
+// overlay, rejects a non-indexed plan, and allocates only the index-bucket copy.
+func TestStmtQueryRowByIndex(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE users (id uuid primary key, name text, age int, INDEX (name))")
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "alice", 30)
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(2), "bob", 25)
+	db.mergeIndexes()
+	st, err := db.Prepare("SELECT id, age FROM users WHERE name = ? LIMIT 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, found, err := st.QueryRowByIndex(Str("alice"), make([]Value, 0, 4))
+	if err != nil || !found || out[1].Int() != 30 {
+		t.Fatalf("got out=%v found=%v err=%v", out, found, err)
+	}
+	if _, found, _ := st.QueryRowByIndex(Str("nobody"), out); found {
+		t.Fatal("expected not-found for absent value")
+	}
+
+	// A row only in the dirty overlay (not yet merged) must still be found.
+	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(3), "carol", 40)
+	if out, found, _ = st.QueryRowByIndex(Str("carol"), out); !found || out[1].Int() != 40 {
+		t.Fatalf("dirty-overlay fetch: out=%v found=%v", out, found)
+	}
+
+	// Non-indexed WHERE is a misuse → error, not a wrong answer.
+	noIdx, _ := db.Prepare("SELECT name FROM users WHERE age = ?")
+	if _, _, err := noIdx.QueryRowByIndex(Int(30), nil); err == nil {
+		t.Fatal("QueryRowByIndex on non-indexed SELECT: want error")
+	}
+
+	// Near-zero: only the index-bucket copy for a byte-free projection.
+	db.mergeIndexes() // drain the overlay so steady state holds
+	avg := testing.AllocsPerRun(200, func() { out, _, _ = st.QueryRowByIndex(Str("alice"), out) })
+	if avg > 1 {
+		t.Fatalf("QueryRowByIndex allocated %v/op, want <= 1", avg)
+	}
+}
+
 // BYTES cells must be cloned out, so mutating a returned slice can't corrupt
 // stored data.
 func TestStmtQueryRowByPKClonesBytes(t *testing.T) {
