@@ -24,6 +24,24 @@ scalar** (`$id`, the fast path); optional. Between these functions you reach
 every statement the parser accepts — but that set is a deliberate subset of SQL
 (below).
 
+### One-row fetch returns the first match only
+
+`hazedb_fetch()` returns **one** row even if the `WHERE` matches several — the
+first one, then it stops. This is a client-API convention, not an engine limit:
+
+- The engine never limits a query to one row. `SELECT … WHERE x = ?` without
+  `LIMIT` matches *all* x rows (the equivalent of stepping a SQLite cursor to
+  `SQLITE_DONE`).
+- "Fetch = one row" lives in the driver, and every stack agrees: PHP PDO
+  `fetch()` vs `fetchAll()`, Python `fetchone()` vs `fetchall()`, Go
+  `database/sql` `QueryRow()` vs `Query()`.
+
+hazedb follows the **Go `QueryRow` convention**: take the first row, discard the
+rest — *not* PDO's cursor model where a second `fetch()` returns the next row.
+The Go API `Stmt.QueryRowByPK` / `QueryRowByIndex` is the same: first match wins.
+So `LIMIT 1` here is an efficiency/clarity hint (stop early), never required for
+the one-row semantics — `hazedb_fetch` already stops at the first match.
+
 ## Supported SQL
 
 | area | accepted |
