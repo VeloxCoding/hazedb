@@ -1108,34 +1108,48 @@ func (db *DB) execSelectCompositeLookup(pl *plan, ctx *evalCtx) ([]string, []Row
 // encoded tuple) so dirty rows merge into the same key space as the index
 // entries. Every component is NOT NULL (planComposite's guard), so a matching
 // row always has a fully-encodable key.
-func (db *DB) execSelectCompositeWalk(pl *plan, args []Value) ([]string, []Row, error) {
+// compositeWalkArgs resolves the (snap, dirtyKey, residual) inputs orderedWalk
+// needs for a composite prefix walk. ok=false means provably empty (missing
+// index or a NULL in the pinned prefix). Shared by the materializing and
+// streaming composite-walk entry points so both compute the walk identically.
+func (db *DB) compositeWalkArgs(pl *plan, args []Value) (snap []ordEntry, dirtyKey func(Row) indexKey, residual []expr, ok bool, err error) {
 	tbl := pl.rt
 	si := tbl.indexByOrdinals(pl.compOrdinals)
 	if si == nil {
-		return pl.colNames, nil, nil
+		return nil, nil, nil, false, nil
 	}
 	ctx := evalCtx{cols: tbl.def.colByName, args: args}
 	prefix := make([]Value, len(pl.compPrefixSrcs))
 	for i, src := range pl.compPrefixSrcs {
 		v, err := evalExpr(src, &ctx)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, false, err
 		}
 		if v.IsNull() {
-			return pl.colNames, nil, nil
+			return nil, nil, nil, false, nil
 		}
 		prefix[i] = v
 	}
-	snap := si.snapshotPrefix(encodeCompositeKey(prefix))
 	ords := si.ordinals
-	dirtyKey := func(r Row) indexKey {
+	dirtyKey = func(r Row) indexKey {
 		cells := make([]Value, len(ords))
 		for i, o := range ords {
 			cells[i] = r[o]
 		}
 		return encodeCompositeKey(cells)
 	}
-	return db.orderedWalk(pl, args, snap, dirtyKey, pl.compResidual)
+	return si.snapshotPrefix(encodeCompositeKey(prefix)), dirtyKey, pl.compResidual, true, nil
+}
+
+func (db *DB) execSelectCompositeWalk(pl *plan, args []Value) ([]string, []Row, error) {
+	snap, dirtyKey, residual, ok, err := db.compositeWalkArgs(pl, args)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !ok {
+		return pl.colNames, nil, nil
+	}
+	return db.orderedWalk(pl, args, snap, dirtyKey, residual)
 }
 
 // execSelectOrderedWalk serves an ORDER BY on an ordered-indexed column by
@@ -1228,17 +1242,27 @@ func mergeOrderedStreams(snap []ordEntry, dc []dcand, dirtySet map[UUID]struct{}
 	}
 }
 
-func (db *DB) execSelectOrderedWalk(pl *plan, args []Value) ([]string, []Row, error) {
+// orderedWalkArgs resolves the (snap, dirtyKey, residual) inputs orderedWalk
+// needs for a single-column ordered walk. ok=false means a missing index. The
+// index sits on the ORDER BY column, not the WHERE columns, so the snap
+// guarantees nothing about the WHERE: the whole WHERE is residual. Shared by the
+// materializing and streaming entry points.
+func (db *DB) orderedWalkArgs(pl *plan) (snap []ordEntry, dirtyKey func(Row) indexKey, residual []expr, ok bool) {
 	si := pl.rt.indexFor(pl.orderOrdinal)
 	if si == nil {
-		return pl.colNames, nil, nil
+		return nil, nil, nil, false
 	}
 	ord := pl.orderOrdinal
-	// The single-column index sits on the ORDER BY column, not the WHERE columns,
-	// so the snap guarantees nothing about the WHERE: the whole WHERE is residual.
-	var residual []expr
 	collectConjuncts(pl.st.(*selectStmt).where, &residual)
-	return db.orderedWalk(pl, args, si.snapshot(), func(r Row) indexKey { return keyOf(r[ord]) }, residual)
+	return si.snapshot(), func(r Row) indexKey { return keyOf(r[ord]) }, residual, true
+}
+
+func (db *DB) execSelectOrderedWalk(pl *plan, args []Value) ([]string, []Row, error) {
+	snap, dirtyKey, residual, ok := db.orderedWalkArgs(pl)
+	if !ok {
+		return pl.colNames, nil, nil
+	}
+	return db.orderedWalk(pl, args, snap, dirtyKey, residual)
 }
 
 // orderedWalk merges a sorted index slice (snap, ascending key order) with the
@@ -1319,6 +1343,110 @@ func (db *DB) orderedWalk(pl *plan, args []Value, snap []ordEntry, dirtyKey func
 	}
 	mergeOrderedStreams(snap, dc, dirtySet, st.orderDesc, done, emitIdx, emitDirty)
 	return colNames, sliceOffsetLimit(out, st.offset, st.limit), nil
+}
+
+// orderedWalkEach is the streaming form of orderedWalk: it drives the SAME
+// snap+dirty merge in the SAME ORDER BY order (mergeOrderedStreams + the same
+// residual/dirty-shadow semantics), but instead of materializing a []Row with a
+// per-row clone it visits each selected row in place. Index rows are visited
+// under their shard RLock (valid only for that call, per the streaming
+// memory-safety contract); dirty rows are visited from their owned clone. OFFSET
+// and LIMIT are applied as rows are visited — a stream cannot post-slice. visit
+// returns false to stop early. Ordered walks only exist on non-partitioned
+// tables (ordered indexes are barred on partitioned ones), so the live row is
+// reached via the per-shard pk map, as the idxLookup stream does.
+func (db *DB) orderedWalkEach(pl *plan, args []Value, snap []ordEntry, dirtyKey func(Row) indexKey, residual []expr, visit func(row Row) bool) error {
+	st := pl.st.(*selectStmt)
+	tbl := pl.rt
+	if st.limit == 0 {
+		return nil
+	}
+	ctx := evalCtx{cols: tbl.def.colByName, args: args}
+	matches := func(r Row) bool { // full WHERE — filters dirty candidates
+		if st.where == nil {
+			return true
+		}
+		ctx.row = r
+		v, err := evalExpr(st.where, &ctx)
+		return err == nil && truthy(v)
+	}
+	passResidual := func(r Row) bool { // only the conjuncts the snap doesn't guarantee
+		for _, p := range residual {
+			ctx.row = r
+			v, err := evalExpr(p, &ctx)
+			if err != nil || !truthy(v) {
+				return false
+			}
+		}
+		return true
+	}
+	dc, dirtySet := tbl.buildDirtyCands(matches, dirtyKey)
+
+	var scratch Row
+	if !st.starAll {
+		scratch = make(Row, len(pl.projOrdinals))
+	}
+	skipped, n, stop := 0, 0, false
+	// deliver applies OFFSET (skip the first offset qualified rows) and LIMIT to
+	// one qualified row, projecting into the reused scratch (Value headers only,
+	// valid for this call) and visiting it. It sets stop on early-exit or once
+	// LIMIT is reached; mergeOrderedStreams' done() then halts the walk.
+	deliver := func(r Row) {
+		if skipped < st.offset {
+			skipped++
+			return
+		}
+		row := r
+		if !st.starAll {
+			for j, ord := range pl.projOrdinals {
+				scratch[j] = r[ord]
+			}
+			row = scratch
+		}
+		if !visit(row) {
+			stop = true
+			return
+		}
+		n++
+		if st.limit >= 0 && n >= st.limit {
+			stop = true
+		}
+	}
+	emitIdx := func(pk UUID) { // fresh index entry: visit the live row under its shard lock
+		s := tbl.shardOf(pk)
+		s.mu.RLock()
+		if rowID, ok := s.pk[pk]; ok {
+			if r := s.rows[rowID]; r != nil && (len(residual) == 0 || passResidual(r)) {
+				deliver(r)
+			}
+		}
+		s.mu.RUnlock()
+	}
+	emitDirty := func(row Row) { deliver(row) } // owned clone, already matched
+	mergeOrderedStreams(snap, dc, dirtySet, st.orderDesc, func() bool { return stop }, emitIdx, emitDirty)
+	return nil
+}
+
+// execSelectOrderedWalkEach / execSelectCompositeWalkEach are the streaming
+// counterparts of execSelectOrderedWalk / execSelectCompositeWalk: same walk
+// inputs, but visiting rows instead of returning a []Row.
+func (db *DB) execSelectOrderedWalkEach(pl *plan, args []Value, visit func(row Row) bool) error {
+	snap, dirtyKey, residual, ok := db.orderedWalkArgs(pl)
+	if !ok {
+		return nil
+	}
+	return db.orderedWalkEach(pl, args, snap, dirtyKey, residual, visit)
+}
+
+func (db *DB) execSelectCompositeWalkEach(pl *plan, args []Value, visit func(row Row) bool) error {
+	snap, dirtyKey, residual, ok, err := db.compositeWalkArgs(pl, args)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	return db.orderedWalkEach(pl, args, snap, dirtyKey, residual, visit)
 }
 
 // fetchBound is the number of in-order matches a LIMIT/OFFSET query collects

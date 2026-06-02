@@ -96,6 +96,73 @@ func TestQueryStreamMatchesMaterialized(t *testing.T) {
 	}
 }
 
+// Ordered-index walks must stream byte-identically to the materialized Query
+// oracle — both the single-column orderWalk and the composite-prefix compWalk,
+// with DESC / LIMIT / OFFSET, before and after the merge (dirty overlay vs
+// index). This pins the streaming orderedWalkEach against orderedWalk.
+func TestQueryStreamOrderedMatchesMaterialized(t *testing.T) {
+	db := openEmpty(t)
+	if _, err := db.Exec("CREATE TABLE posts (id uuid primary key, author text, day int, title text, ORDERED INDEX (day), ORDERED INDEX (author, day))"); err != nil {
+		t.Fatal(err)
+	}
+	seed := []struct {
+		author string
+		day    int
+		title  string
+	}{
+		{"A", 3, "a3"}, {"B", 1, "b1"}, {"A", 1, "a1"}, {"B", 5, "b5"},
+		{"A", 5, "a5"}, {"A", 2, "a2"}, {"B", 2, "b2"}, {"A", 5, "a5b"}, // a5/a5b tie on day
+	}
+	for _, r := range seed {
+		if _, err := db.Exec("INSERT INTO posts (id, author, day, title) VALUES (?, ?, ?, ?)",
+			NewUUIDv7(), r.author, r.day, r.title); err != nil {
+			t.Fatal(err)
+		}
+	}
+	queries := []string{
+		"SELECT id, day FROM posts ORDER BY day ASC",                                             // orderWalk
+		"SELECT id, day FROM posts ORDER BY day DESC LIMIT 3",                                    // orderWalk + LIMIT
+		"SELECT id, day FROM posts ORDER BY day ASC LIMIT 3 OFFSET 2",                            // orderWalk + LIMIT/OFFSET
+		"SELECT id, author, day FROM posts WHERE author = 'A' ORDER BY day DESC",                 // compWalk
+		"SELECT id, author, day FROM posts WHERE author = 'A' ORDER BY day DESC LIMIT 2",         // compWalk + LIMIT
+		"SELECT id, author, day FROM posts WHERE author = 'B' ORDER BY day ASC LIMIT 2 OFFSET 1", // compWalk + LIMIT/OFFSET
+		"SELECT * FROM posts WHERE author = 'A' ORDER BY day DESC",                               // compWalk, SELECT *
+	}
+
+	for _, phase := range []string{"overlay", "merged"} {
+		if phase == "merged" {
+			db.mergeIndexes()
+		}
+		for _, sql := range queries {
+			wantCols, wantRows, err := db.Query(sql)
+			if err != nil {
+				t.Fatalf("[%s] Query(%q): %v", phase, sql, err)
+			}
+			wantJSON, _ := RowsToJSONObjects(wantCols, wantRows)
+
+			_, gotJSON, err := db.QueryJSON(sql)
+			if err != nil {
+				t.Fatalf("[%s] QueryJSON(%q): %v", phase, sql, err)
+			}
+			if string(gotJSON) != string(wantJSON) {
+				t.Fatalf("[%s] QueryJSON(%q):\n got %s\nwant %s", phase, sql, gotJSON, wantJSON)
+			}
+
+			var each []Row
+			if err := db.QueryEach(sql, nil, func(cols []string, row Row) bool {
+				each = append(each, row.Clone())
+				return true
+			}); err != nil {
+				t.Fatalf("[%s] QueryEach(%q): %v", phase, sql, err)
+			}
+			eachJSON, _ := RowsToJSONObjects(wantCols, each)
+			if string(eachJSON) != string(wantJSON) {
+				t.Fatalf("[%s] QueryEach(%q):\n got %s\nwant %s", phase, sql, eachJSON, wantJSON)
+			}
+		}
+	}
+}
+
 // QueryEach must stop when the callback returns false (early-out before LIMIT).
 func TestQueryEachEarlyStop(t *testing.T) {
 	db := seedStreamTable(t)

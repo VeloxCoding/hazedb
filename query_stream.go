@@ -30,7 +30,19 @@ func (db *DB) selectEach(pl *plan, args []Value, visit func(row Row) bool) ([]st
 	tbl := pl.rt
 	colNames := pl.colNames
 
-	if pl.orderOrdinal >= 0 || pl.orderWalk || pl.pkLookup || pl.joinPlan != nil {
+	// Ordered-index walks stream in ORDER BY order without materializing a []Row:
+	// the merge visits each selected row in place (index rows under their shard
+	// lock), so the per-row clone the materialized path builds is avoided.
+	if pl.compWalk {
+		return colNames, db.execSelectCompositeWalkEach(pl, args, visit)
+	}
+	if pl.orderWalk {
+		return colNames, db.execSelectOrderedWalkEach(pl, args, visit)
+	}
+	// A real sort (ORDER BY not backed by an ordered index), a PK point read, or a
+	// join must buffer to sort or is trivially one row — nothing to stream, so
+	// materialize and replay.
+	if pl.orderOrdinal >= 0 || pl.pkLookup || pl.joinPlan != nil {
 		_, rows, err := db.execSelect(pl, args)
 		if err != nil {
 			return nil, err

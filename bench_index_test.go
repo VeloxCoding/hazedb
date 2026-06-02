@@ -323,6 +323,35 @@ func BenchmarkOrderedWalk_50k(b *testing.B) {
 	}
 }
 
+// Ordered fetchall via the streaming JSON path (the PHP hazedb_fetchall route):
+// WHERE author = ? ORDER BY day DESC LIMIT 100 on an ORDERED INDEX. Today
+// selectEach falls back to execSelect+orderedWalk, which materializes a []Row
+// with a per-row clone before the JSON encoder re-walks it — those clones are
+// the alloc target a streaming orderedWalk removes. The allocs/op here is the
+// before-number for that change.
+func BenchmarkOrderedJSON_LIMIT100(b *testing.B) {
+	const perAuthor = 2000
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: perAuthor * 2})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec("CREATE TABLE posts (id uuid primary key, author text, day int, ORDERED INDEX (author, day))")
+	for i := 0; i < perAuthor; i++ {
+		db.Exec("INSERT INTO posts (id, author, day) VALUES (?, ?, ?)", NewUUIDv7(), "A", i)
+	}
+	db.mergeIndexes()
+	buf := make([]byte, 0, 16<<10)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, body, err := db.QueryJSONInto(buf[:0], "SELECT id, author, day FROM posts WHERE author = ? ORDER BY day DESC LIMIT 100", Str("A"))
+		if err != nil || len(body) == 0 {
+			b.Fatalf("body=%d err=%v", len(body), err)
+		}
+	}
+}
+
 // Two non-unique indexes intersected: WHERE name = ? AND city = ?. ~1/6 of 50k
 // rows are "Peter" (~8300) spread over 8 cities, so ~1040 Peters per city. The
 // intersection fetches only that ~1040, not the whole ~8300 "Peter" bucket a
