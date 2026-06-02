@@ -133,6 +133,20 @@ func TestStmtQueryRowByIndex(t *testing.T) {
 		t.Fatal("QueryRowByIndex on non-indexed SELECT: want error")
 	}
 
+	// LIMIT 1 is mandatory — it keeps the single-row intent explicit. A statement
+	// without it is a misuse → error.
+	noLimit, _ := db.Prepare("SELECT id, age FROM users WHERE name = ?")
+	if _, _, err := noLimit.QueryRowByIndex(Str("alice"), nil); err == nil {
+		t.Fatal("QueryRowByIndex without LIMIT 1: want error")
+	}
+
+	// ORDER BY is rejected — there is no ordering on this path (use the ordered
+	// walk for newest/highest), so a misuse must error rather than mislead.
+	ordered, _ := db.Prepare("SELECT id, age FROM users WHERE name = ? ORDER BY age LIMIT 1")
+	if _, _, err := ordered.QueryRowByIndex(Str("alice"), nil); err == nil {
+		t.Fatal("QueryRowByIndex with ORDER BY: want error")
+	}
+
 	// Near-zero: only the index-bucket copy for a byte-free projection.
 	db.mergeIndexes() // drain the overlay so steady state holds
 	avg := testing.AllocsPerRun(200, func() { out, _, _ = st.QueryRowByIndex(Str("alice"), out) })

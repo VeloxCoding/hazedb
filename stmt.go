@@ -103,28 +103,34 @@ func (s *Stmt) QueryRowByPK(pk UUID, dst []Value) (out []Value, found bool, err 
 	return out, found, nil
 }
 
-// QueryRowByIndex is the QueryRowByPK fast path for a single secondary-index
-// equality: the statement must be a SELECT pinning exactly one indexed column
-// (WHERE <indexed> = ?), with no ORDER BY and no OFFSET. key is the typed value
-// for that one parameter (no interface boxing); the first matching row's
-// projection is written into dst, grown only if too small — reuse it across
-// calls. found reports whether a row matched.
+// QueryRowByIndex is the point-lookup fast path for a single secondary-index
+// equality: the statement must pin exactly one indexed column with an explicit
+// single-row cap — WHERE <indexed> = ? LIMIT 1 — and no ORDER BY or OFFSET. It
+// returns the first live row that passes the full WHERE and stops. The match is
+// ordering-undefined by design: this serves unique-key lookups (fetch the
+// account row for an email at login) and existence checks (does this email
+// already exist?), where "any one match" is the answer.
 //
-// In steady state it allocates only the index-bucket copy (~one small slice);
-// the projection scan and the empty dirty overlay add none. The full WHERE is
-// re-checked on each live candidate (staleness + any residual), so a statement
-// needing a second parameter returns an error rather than a wrong row.
+// It cannot return the newest/highest row — there is no ordering on this path.
+// For that, write ORDER BY <ordered-indexed col> DESC LIMIT 1, which compiles to
+// the ordered-index walk and is rejected here (orderOrdinal >= 0). The mandatory
+// LIMIT 1 keeps that distinction explicit at the call site.
+//
+// key is the typed value for the one parameter (no interface boxing); the
+// matching row's projection is written into dst, grown only if too small — reuse
+// it across calls. found reports whether a row matched. In steady state it
+// allocates only the index-bucket copy (~one small slice); the projection scan
+// and the empty dirty overlay add none. The full WHERE is re-checked on each
+// live candidate (staleness + any residual), so a statement needing a second
+// parameter returns an error rather than a wrong row.
 func (s *Stmt) QueryRowByIndex(key Value, dst []Value) (out []Value, found bool, err error) {
 	pl, err := s.bound()
 	if err != nil {
 		return dst[:0], false, err
 	}
 	st, ok := pl.st.(*selectStmt)
-	if !ok || !pl.idxLookup || len(pl.idxCols) != 1 || pl.orderOrdinal >= 0 || st.offset != 0 {
-		return dst[:0], false, fmt.Errorf("hazedb: QueryRowByIndex requires a single-indexed-equality SELECT (WHERE <indexed> = ?), no ORDER BY or OFFSET")
-	}
-	if st.limit == 0 {
-		return dst[:0], false, nil
+	if !ok || !pl.idxLookup || len(pl.idxCols) != 1 || pl.orderOrdinal >= 0 || st.offset != 0 || st.limit != 1 {
+		return dst[:0], false, fmt.Errorf("hazedb: QueryRowByIndex requires a single-indexed-equality point lookup (WHERE <indexed> = ? LIMIT 1), no ORDER BY or OFFSET")
 	}
 	tbl := pl.rt
 	ctx := evalCtx{cols: tbl.def.colByName, args: []Value{key}}
