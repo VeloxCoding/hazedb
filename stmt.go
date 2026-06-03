@@ -91,15 +91,13 @@ func (s *Stmt) QueryRowByPK(pk UUID, dst []Value) (out []Value, found bool, err 
 	if err != nil {
 		return dst[:0], false, err
 	}
-	st, ok := pl.st.(*selectStmt)
-	if !ok || !pl.pkLookup {
+	// pkLookup is set only on a SELECT plan, and projOrdinals is already nil for
+	// SELECT * (the planner only fills it for an explicit projection) — so neither
+	// a type assertion nor a starAll branch is needed on this hot path.
+	if !pl.pkLookup {
 		return dst[:0], false, fmt.Errorf("hazedb: QueryRowByPK requires a PK-pinned SELECT (WHERE id = ?)")
 	}
-	ords := pl.projOrdinals
-	if st.starAll {
-		ords = nil
-	}
-	out, found = pl.rt.getByPKProjectInto(pk, ords, dst)
+	out, found = pl.rt.getByPKProjectInto(pk, pl.projOrdinals, dst)
 	return out, found, nil
 }
 
@@ -145,10 +143,7 @@ func (s *Stmt) QueryRowByIndex(key Value, dst []Value) (out []Value, found bool,
 	if si == nil {
 		return dst[:0], false, nil
 	}
-	ords := pl.projOrdinals
-	if st.starAll {
-		ords = nil
-	}
+	ords := pl.projOrdinals // already nil for SELECT * — no starAll branch needed
 	var predErr error
 	pred := func(r Row) bool {
 		ctx.row = r
