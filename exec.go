@@ -784,26 +784,36 @@ func (t *table) getMatchProject(pk UUID, pred func(Row) bool, ords []int, starAl
 	return projectClone(r, ords), true
 }
 
-// getMatchProjectInto is the scan-into form of getMatchProject: on a WHERE pass
-// it appends the projection (or the whole row for SELECT *) into dst rather than
-// allocating a fresh Row, so a projection without BYTES columns makes no
-// allocation. The QueryRowByIndex fast path. Non-partitioned.
+// getMatchProjectInto is the scan-into form of getMatchProject: it writes the
+// projection (or the whole row for SELECT *) into dst, reset to empty first, so a
+// projection without BYTES columns makes no allocation. The single-row
+// QueryRowByIndex fast path. Non-partitioned.
 func (t *table) getMatchProjectInto(pk UUID, pred func(Row) bool, ords []int, starAll bool, dst []Value) ([]Value, bool) {
+	return t.appendMatchProject(pk, pred, ords, starAll, dst[:0])
+}
+
+// appendMatchProject is getMatchProjectInto without the reset: on a WHERE pass it
+// APPENDS the projection (or the whole row for SELECT *) to dst and returns the
+// grown slice; on a miss it returns dst unchanged. This lets a multi-row result
+// pack every row's cells into one backing buffer — each Row a capped view of its
+// own span — so the set costs one allocation instead of one per row. A projection
+// without BYTES columns appends no allocation of its own. Non-partitioned.
+func (t *table) appendMatchProject(pk UUID, pred func(Row) bool, ords []int, starAll bool, dst []Value) ([]Value, bool) {
 	s := t.shardOf(pk)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rowID, ok := s.pk[pk]
 	if !ok {
-		return dst[:0], false
+		return dst, false
 	}
 	r := s.rows[rowID]
 	if r == nil || !pred(r) {
-		return dst[:0], false
+		return dst, false
 	}
 	if starAll {
-		return appendRowClone(dst[:0], r), true
+		return appendRowClone(dst, r), true
 	}
-	return appendProjectClone(dst[:0], r, ords), true
+	return appendProjectClone(dst, r, ords), true
 }
 
 // execSelectIdx runs a SELECT whose WHERE pins one or more secondary-indexed
@@ -977,21 +987,31 @@ func (db *DB) execCandidates(pl *plan, ctx *evalCtx, cand idxCandidateSet) ([]st
 		return colNames, projectRows(kept, st.starAll, pl.projOrdinals), nil
 	}
 
-	// No ORDER BY: project and stop once offset+limit rows are collected. Presize
-	// from the candidate count so a multi-row indexed read does not regrow.
+	// No ORDER BY: project and stop once offset+limit rows are collected. Pack
+	// every result row's cells into ONE growing backing buffer; each Row is a
+	// capped view of its own span (the full-slice expression bounds its capacity),
+	// so the set owns its cells with one allocation instead of one per row, while a
+	// caller still cannot append past its row into the next. packed is presized
+	// from the candidate count × cells-per-row so a within-hint bucket never
+	// regrows. A later regrow is still correct: earlier Row views keep pointing at
+	// their (still-live) prior backing.
 	eff := fetchBound(st.limit, st.offset)
-	out := make([]Row, 0, cand.capHint(eff))
+	hint := cand.capHint(eff)
+	out := make([]Row, 0, hint)
+	packed := make([]Value, 0, hint*len(colNames))
 	pred := func(r Row) bool {
 		ctx.row = r
 		v, err := evalExpr(st.where, ctx)
 		return err == nil && truthy(v)
 	}
 	cand.emit(func(pk UUID) bool {
-		r, ok := tbl.getMatchProject(pk, pred, pl.projOrdinals, st.starAll)
+		start := len(packed)
+		var ok bool
+		packed, ok = tbl.appendMatchProject(pk, pred, pl.projOrdinals, st.starAll, packed)
 		if !ok {
 			return false
 		}
-		out = append(out, r)
+		out = append(out, Row(packed[start:len(packed):len(packed)]))
 		return eff >= 0 && len(out) >= eff
 	})
 	return colNames, sliceOffsetLimit(out, st.offset, st.limit), nil

@@ -296,6 +296,60 @@ func TestIndexNonUniqueBucket(t *testing.T) {
 	}
 }
 
+// The multi-row indexed result packs every row's cells into one backing buffer,
+// each Row a capped view of its span. The owned-result contract must still hold:
+// mutating one returned row — overwriting a cell, appending past its end (the
+// full-slice cap must force a realloc, not a write into the next row's span), or
+// mutating a BYTES payload — must not disturb a sibling row or storage.
+func TestIndexMultiRowResultIsOwned(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE t (id uuid primary key, owner text, data bytes, INDEX (owner))")
+	for i := 0; i < 5; i++ {
+		db.Exec("INSERT INTO t (id, owner, data) VALUES (?, ?, ?)", NewUUIDv7(), "A", []byte{byte(i), 0xff})
+	}
+	db.mergeIndexes()
+
+	_, rows, err := db.Query("SELECT id, owner, data FROM t WHERE owner = ?", "A")
+	if err != nil || len(rows) != 5 {
+		t.Fatalf("rows=%d err=%v", len(rows), err)
+	}
+	sameBytes := func(a, b []byte) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for i := range a {
+			if a[i] != b[i] {
+				return false
+			}
+		}
+		return true
+	}
+	// Snapshot a sibling before stomping rows[0].
+	wantOwner := rows[1][1].Str()
+	wantData := append([]byte(nil), rows[1][2].Bytes()...)
+
+	rows[0][1] = Str("STOMPED")         // overwrite a cell in this row's span
+	rows[0] = append(rows[0], Int(123)) // append past the capped end → must realloc
+	rows[0][2].Bytes()[0] = 0x77        // mutate the (cloned) BYTES payload
+
+	if got := rows[1][1].Str(); got != wantOwner {
+		t.Fatalf("sibling owner corrupted: got %q want %q", got, wantOwner)
+	}
+	if got := rows[1][2].Bytes(); !sameBytes(got, wantData) {
+		t.Fatalf("sibling data corrupted: got %v want %v", got, wantData)
+	}
+	// Storage is unaliased: a re-query carries none of the mutations.
+	_, again, _ := db.Query("SELECT owner, data FROM t WHERE owner = ?", "A")
+	for _, r := range again {
+		if r[0].Str() != "A" {
+			t.Fatalf("storage owner mutated: %q", r[0].Str())
+		}
+		if r[1].Bytes()[1] != 0xff {
+			t.Fatalf("storage data mutated: %v", r[1].Bytes())
+		}
+	}
+}
+
 // S7: two indexes on one table. Each plans its own lookup; an update to one
 // indexed column moves only that index; a delete drops the row from both.
 func TestIndexMultiplePerTable(t *testing.T) {
