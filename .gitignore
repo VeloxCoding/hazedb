@@ -16,4 +16,5 @@
 /freeze_experiment_test.go
 /kv_experiment_test.go
 /kv_hazedb_experiment_test.go
+/fetch_squeeze_experiment_test.go
 /kv_experiment.md
