@@ -965,13 +965,12 @@ func (db *DB) execCandidates(pl *plan, ctx *evalCtx, cand idxCandidateSet) ([]st
 		// row under the shard lock). st.limit == 0 already returned above.
 		if st.limit >= 0 {
 			// Keep offset+limit rows so the offset can be dropped after sorting.
-			top := &topN{ord: pl.orderOrdinal, desc: st.orderDesc, capN: fetchBound(st.limit, st.offset)}
+			top := &topN{ord: pl.orderOrdinal, desc: st.orderDesc, capN: fetchBound(st.limit, st.offset), proj: projOrNil(st.starAll, pl.projOrdinals)}
 			cand.emit(func(pk UUID) bool {
 				tbl.offerLiveRow(pk, pred, top)
 				return false
 			})
-			kept := sliceOffsetLimit(top.sorted(), st.offset, st.limit)
-			return colNames, projectRows(kept, st.starAll, pl.projOrdinals), nil
+			return colNames, sliceOffsetLimit(top.sorted(), st.offset, st.limit), nil
 		}
 		// ORDER BY without LIMIT: gather every match, then sort (OFFSET drops the
 		// leading rows).
@@ -1695,7 +1694,7 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 			return colNames, nil, nil
 		}
 		// Keep offset+limit rows so the offset can be dropped after sorting.
-		top := topN{ord: pl.orderOrdinal, desc: st.orderDesc, capN: fetchBound(st.limit, st.offset)}
+		top := topN{ord: pl.orderOrdinal, desc: st.orderDesc, capN: fetchBound(st.limit, st.offset), proj: projOrNil(st.starAll, pl.projOrdinals)}
 		scan(func(r Row) bool {
 			if !match(r) {
 				return true
@@ -1703,8 +1702,7 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 			top.offer(r)
 			return true
 		})
-		kept := sliceOffsetLimit(top.sorted(), st.offset, st.limit)
-		return colNames, projectRows(kept, st.starAll, pl.projOrdinals), nil
+		return colNames, sliceOffsetLimit(top.sorted(), st.offset, st.limit), nil
 	}
 
 	// ORDER BY without LIMIT, or no-ORDER-BY/no-LIMIT full scan: gather all
@@ -1757,19 +1755,31 @@ func projectRows(matched []Row, starAll bool, ords []int) []Row {
 }
 
 // topN keeps the best capN rows by column ord (ascending, or descending when
-// desc), cloning a row only when it makes the cut. Backed by a binary heap
-// whose root is the most-evictable kept row, so a candidate that cannot beat
-// the root is dropped without cloning.
+// desc), materialising a row only when it makes the cut. Backed by a binary heap
+// whose root is the most-evictable kept row, so a candidate that cannot beat the
+// root is dropped without copying. Each kept entry stores the row already
+// PROJECTED to the output columns (proj) plus the sort key captured before
+// projection — so the heap holds output-width rows, not the full (possibly
+// joined) input row, and no second projection pass is needed. proj nil keeps the
+// whole row (SELECT *).
 type topN struct {
 	ord  int
 	desc bool
 	capN int
-	h    []Row
+	proj []int
+	h    []topEntry
 }
 
-// evictable reports whether a ranks below b under the ORDER BY (a drops first).
-func (t *topN) evictable(a, b Row) bool {
-	c, ok := a[t.ord].Compare(b[t.ord])
+// topEntry is one kept row plus its sort key, captured before projection so the
+// projected row need not contain the order column.
+type topEntry struct {
+	key Value
+	row Row
+}
+
+// evictable reports whether key a ranks below b under the ORDER BY (a drops first).
+func (t *topN) evictable(a, b Value) bool {
+	c, ok := a.Compare(b)
 	if !ok {
 		return false
 	}
@@ -1779,12 +1789,27 @@ func (t *topN) evictable(a, b Row) bool {
 	return c > 0 // ASC keeps the smallest, so the larger drops first
 }
 
+// take materialises the kept form of r: the projected output columns (deep
+// copied, so it never aliases reused scratch or arena storage), or a full clone
+// when proj is nil (SELECT *).
+func (t *topN) take(r Row) Row {
+	if t.proj == nil {
+		return r.Clone()
+	}
+	pr := make(Row, len(t.proj))
+	for j, ord := range t.proj {
+		pr[j] = cloneValue(r[ord])
+	}
+	return pr
+}
+
 func (t *topN) offer(r Row) {
+	key := cloneValue(r[t.ord]) // capture before projection; cloned so reused scratch can't mutate it
 	if len(t.h) < t.capN {
-		t.h = append(t.h, r.Clone())
+		t.h = append(t.h, topEntry{key, t.take(r)})
 		for i := len(t.h) - 1; i > 0; {
 			p := (i - 1) / 2
-			if !t.evictable(t.h[i], t.h[p]) {
+			if !t.evictable(t.h[i].key, t.h[p].key) {
 				break
 			}
 			t.h[i], t.h[p] = t.h[p], t.h[i]
@@ -1792,16 +1817,16 @@ func (t *topN) offer(r Row) {
 		}
 		return
 	}
-	if !t.evictable(t.h[0], r) { // r can't beat the current worst
+	if !t.evictable(t.h[0].key, key) { // r can't beat the current worst
 		return
 	}
-	t.h[0] = r.Clone()
+	t.h[0] = topEntry{key, t.take(r)}
 	for i, n := 0, len(t.h); ; {
 		worst, l, rr := i, 2*i+1, 2*i+2
-		if l < n && t.evictable(t.h[l], t.h[worst]) {
+		if l < n && t.evictable(t.h[l].key, t.h[worst].key) {
 			worst = l
 		}
-		if rr < n && t.evictable(t.h[rr], t.h[worst]) {
+		if rr < n && t.evictable(t.h[rr].key, t.h[worst].key) {
 			worst = rr
 		}
 		if worst == i {
@@ -1812,10 +1837,32 @@ func (t *topN) offer(r Row) {
 	}
 }
 
-// sorted returns the kept rows in ORDER BY order.
+// sorted returns the kept rows in ORDER BY order (already projected). It sorts by
+// the captured key, stably, so ties keep heap order (arbitrary but deterministic).
 func (t *topN) sorted() []Row {
-	sortRowsByCol(t.h, t.ord, t.desc)
-	return t.h
+	sort.SliceStable(t.h, func(i, j int) bool {
+		c, ok := t.h[i].key.Compare(t.h[j].key)
+		if !ok {
+			return false
+		}
+		if t.desc {
+			return c > 0
+		}
+		return c < 0
+	})
+	out := make([]Row, len(t.h))
+	for i := range t.h {
+		out[i] = t.h[i].row
+	}
+	return out
+}
+
+// projOrNil is the projection ordinals, or nil for SELECT * (keep all columns).
+func projOrNil(starAll bool, ords []int) []int {
+	if starAll {
+		return nil
+	}
+	return ords
 }
 
 // buildInsertRow materialises the full row for an INSERT plan: evaluates each

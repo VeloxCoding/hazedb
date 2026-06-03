@@ -925,17 +925,16 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 	// cloned into the heap only when it places — O(offset+limit) clones instead of
 	// O(matched) full joined rows. Never stops early: a later row may outrank the heap.
 	if ordered && st.limit >= 0 {
-		top := topN{ord: jp.orderOrdinal, desc: st.orderDesc, capN: eff}
+		top := topN{ord: jp.orderOrdinal, desc: st.orderDesc, capN: eff, proj: projOrNil(st.starAll, pl.projOrdinals)}
 		scratch := make(Row, nLeft+nRight)
 		drive(func(left, right Row) bool {
 			fillConcat(scratch, left, right)
 			if passResidual(scratch) {
-				top.offer(scratch) // clones scratch only if it enters the heap
+				top.offer(scratch) // projects into the heap only if it enters
 			}
 			return false
 		})
-		kept := sliceOffsetLimit(top.sorted(), st.offset, st.limit)
-		return colNames, projectRows(kept, st.starAll, pl.projOrdinals), nil
+		return colNames, sliceOffsetLimit(top.sorted(), st.offset, st.limit), nil
 	}
 
 	// No ORDER BY (stop once offset+limit rows are collected), or ORDER BY without
