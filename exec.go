@@ -1591,6 +1591,11 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 		partPinned = true
 	}
 
+	// One predicate for the whole scan: a compiled fast path for simple WHERE
+	// shapes (col = ?, ranges, AND/OR/NOT, IS NULL), else an evalExpr fallback.
+	// Built once, not per row.
+	match := rowMatcher(st.where, &ctx)
+
 	// No ORDER BY means LIMIT can be applied during the scan. Copy only rows
 	// that will be returned, while the shard read lock is still held.
 	if pl.orderOrdinal < 0 && st.limit >= 0 {
@@ -1622,12 +1627,8 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 				if r == nil {
 					continue
 				}
-				if st.where != nil {
-					ctx.row = r
-					v, err := evalExpr(st.where, &ctx)
-					if err != nil || !truthy(v) {
-						continue
-					}
+				if !match(r) {
+					continue
 				}
 				if packed == nil {
 					packed = make([]Value, 0, capHint*width)
@@ -1654,12 +1655,8 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 				if r == nil {
 					continue
 				}
-				if st.where != nil {
-					ctx.row = r
-					v, err := evalExpr(st.where, &ctx)
-					if err != nil || !truthy(v) {
-						continue
-					}
+				if !match(r) {
+					continue
 				}
 				if packed == nil {
 					packed = make([]Value, 0, capHint*width)
@@ -1700,12 +1697,8 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 		// Keep offset+limit rows so the offset can be dropped after sorting.
 		top := topN{ord: pl.orderOrdinal, desc: st.orderDesc, capN: fetchBound(st.limit, st.offset)}
 		scan(func(r Row) bool {
-			if st.where != nil {
-				ctx.row = r
-				v, err := evalExpr(st.where, &ctx)
-				if err != nil || !truthy(v) {
-					return true
-				}
+			if !match(r) {
+				return true
 			}
 			top.offer(r)
 			return true
@@ -1718,12 +1711,8 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 	// matches (clone under the lock), then sort if ordered.
 	var matched []Row
 	scan(func(r Row) bool {
-		if st.where != nil {
-			ctx.row = r
-			v, err := evalExpr(st.where, &ctx)
-			if err != nil || !truthy(v) {
-				return true
-			}
+		if !match(r) {
+			return true
 		}
 		matched = append(matched, r.Clone())
 		return true
