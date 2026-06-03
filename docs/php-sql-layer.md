@@ -235,6 +235,26 @@ order and stops at `LIMIT`. The headline `posts p JOIN users u ON p.author = u.i
 WHERE u.name = ? ORDER BY p.title LIMIT 10 OFFSET 20` runs in ~4.9 µs — ~4× the
 single-column top-N plan, and faster than the same query on SQLite `:memory:`.
 
+The same matters when you **filter and order on the *driving* table** — the
+list-view shape `posts p LEFT JOIN users u ON p.author = u.id WHERE p.author = ?
+ORDER BY p.title LIMIT 10`. A composite `ORDERED INDEX (author, title)` on `posts`
+walks that author's posts already sorted by title and probes `users` for **only
+the `LIMIT` rows** — ~6.5 µs / 116 allocs, *faster than the same query on SQLite*
+(~8.5 µs, which needs its own `(author, title)` index to avoid a sort). A plain
+single-column `INDEX (author)` cannot walk in title order, so it falls back to
+fetch-every-matching-post → sort → probe-every-post: ~27 µs / 291 allocs at 100
+posts/author, growing with the matched set. **Rule of thumb: for a join that
+filters one column and orders by another on the same table, index the pair as
+`ORDERED (filtercol, ordercol)` — not the filter column alone.**
+
+With **no `WHERE` at all** — a global feed like `posts p JOIN users u ON
+p.author = u.id ORDER BY p.title LIMIT 10` — a single-column `ORDERED INDEX
+(title)` on the driver is enough: the join walks the whole driver already sorted
+by title and stops at `LIMIT` (~6 µs / 110 allocs, faster than SQLite's ~9 µs).
+Without an ordered index on the sort column it must join, materialise, and sort
+*every* row — ~2.4 ms / 40k allocs at 20k posts. **Any join with a global
+`ORDER BY col LIMIT n` wants an `ORDERED INDEX (col)` on the driving table.**
+
 **Rules:** composite must be `ORDERED` (a hash composite only serves exact
 whole-tuple equality — no better than bucket intersection — and is rejected);
 all components must be `NOT NULL` (else a NULL-component row matching the prefix
