@@ -11,3 +11,9 @@
 *.prof
 *.out
 /bin/
+
+# Local throwaway experiments (freeze / KV ceiling measurements)
+/freeze_experiment_test.go
+/kv_experiment_test.go
+/kv_hazedb_experiment_test.go
+/kv_experiment.md
