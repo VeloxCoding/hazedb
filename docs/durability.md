@@ -66,24 +66,21 @@ recovery** (`Open` → `replayWAL` in
 
 ---
 
-## 1. The gaps today
+## 1. Where things stand
 
-Verified in the code, 2026-05-30:
+Of the three gaps in the original proposal (verified 2026-05-30), two are now
+**closed** by the as-built work above; one remains open:
 
-- **No memory budget.** Nothing tracks how many bytes the dataset occupies; there
-  is no cap, no admission control, no eviction. A sustained insert load grows RAM
-  until the OS OOM-kills the process.
-- **No snapshot / checkpoint.** `recCheckpoint` is reserved in the WAL framing
-  ([wal.go](../wal.go)) but unimplemented; production WAL rotation does not exist.
-  The WAL is append-only forever.
-- **Recovery replays the entire history.** `Open` calls `replayWAL` from byte
-  zero on every boot. This is correct and crash-tolerant, but its cost is
-  O(all mutations ever written), not O(current dataset). A small dataset under
-  heavy update/delete churn still accrues an unbounded WAL and an unbounded
-  restart time.
-
-Recovery *works* — the missing pieces are the two that **bound resources**: RAM
-(budget) and log/restart-time (a compacted on-disk copy).
+- **WAL growth — closed.** Segment rotation (~5s) plus the SQLite mirror, which
+  drains each sealed segment and then **deletes** it, bound the WAL to ~the
+  undrained tail. The log no longer grows forever. (`recCheckpoint` was never
+  needed: SQLite is the compacted store, so there is no in-WAL checkpoint to take.)
+- **Recovery cost — closed.** Boot loads current state from SQLite — O(current
+  dataset) — and replays only the undrained tail, not the entire history.
+- **Memory budget — still open.** Nothing tracks how many bytes the dataset
+  occupies; there is no cap, no admission control, no eviction. A sustained insert
+  load grows RAM until the OS OOM-kills the process. This is the one remaining
+  piece (§3).
 
 ## 2. The model and its invariant
 
@@ -95,27 +92,29 @@ Three layers with one strict rule:
   in-memory engine        ← hot serving copy (sharded arenas, secondary indexes)
         ↓ (mutations)
        WAL                 ← durability buffer: fsynced every ~0.5–1s
-        ↓ (batched drain, ~every 60s)
+        ↓ (drain per ~5s segment rotation)
   SQLite file (disk)       ← system of record: current state, compacted, portable
 ```
 
-> **Invariant: the in-memory engine is only ever loaded *from SQLite*. The WAL
-> only ever feeds *SQLite*.**
+> **Invariant: in-memory state = SQLite (the drained current state) + the
+> undrained WAL tail.** The bulk loads from SQLite; the small tail past the drain
+> cursor replays directly into memory.
 
-The WAL never replays directly into memory. That collapses the design to exactly
-two code paths:
+The ~5s drain cadence bounds how much tail any boot ever replays. Two code paths
+carry the design:
 
-- **apply mutations → SQLite** (the drainer; also used during recovery), and
-- **load SQLite → memory** (every boot).
+- **apply sealed segments → SQLite** (the drainer; bulk compaction), and
+- **load SQLite → memory, then replay the undrained tail → memory** (every boot).
 
-The existing in-memory `replayWAL` path is retired: the in-memory layer no longer
-needs to understand the WAL format — it bulk-loads rows from SQLite and rebuilds
-its secondary indexes (`rebuildAllIndexes`, [secindex.go](../secindex.go)).
+The bulk comes from SQLite via `loadTableRows` ([recover_sqlite.go](../recover_sqlite.go));
+the in-memory layer still understands the WAL format for the **tail** replay,
+applying typed mutations through `rt.insert` (WAL-free — the tail rows are not
+re-journaled). Secondary indexes are rebuilt after the load.
 
 Mental model: **in-memory = hot serving copy, SQLite = system of record on disk,
-WAL = the buffer batching writes into SQLite.**
+WAL = the buffer batching writes into SQLite and covering the not-yet-drained tail.**
 
-## 3. Memory budget — bounds RAM (independent, build first)
+## 3. Memory budget — bounds RAM (the one remaining piece)
 
 SQLite bounds *disk and recovery*; it says nothing about RAM. The live set must
 still fit in memory, so a byte budget is a separate, prior requirement.
@@ -135,11 +134,19 @@ and the boot-load time, de-risking everything downstream.
 
 ### Cadence
 
-- **WAL fsync every ~0.5–1s** (the existing `WALSync` ticker). This is the
-  durability window — see §5.
-- **SQLite drain every ~60s**, applied as **one transaction**.
+- **WAL fsync every ~0.5–1s** (the `WALPeriodic` ticker). This is the durability
+  window — see §5.
+- **SQLite drain once per segment rotation (~5s)**, one transaction per sealed
+  segment. (The original ~60s single-batch cadence was dropped for per-segment
+  draining — see *As built*: a drainer that touches only sealed segments needs no
+  age gate and never races the open segment.)
 
-### Coalesce by dirty-set, do not replay history
+### Coalesce by dirty-set, do not replay history — *future lever, not as-built*
+
+The as-built drain replays each segment **faithfully** (one SQLite txn per
+segment, INSERT/UPDATE/DELETE in WAL order). The coalescing scheme below is the
+next throughput lever **if** the drain ever binds (it does not today: ~203k
+rows/s pure-Go, draining ~5s of writes per ~5s rotation with wide margin).
 
 Do not apply ten updates to one row as ten SQLite writes. Reuse the merger's
 per-shard `dirty []UUID`: each interval, take the set of changed PKs, read their
@@ -194,23 +201,29 @@ independent of the drain cadence.
 
 Both reduce to:
 
-> **Every boot:** replay any WAL tail into SQLite (one transaction, commit), then
-> load SQLite into memory. Only then rotate/clear the consumed WAL.
+> **Every boot:** load current state from SQLite into memory, then replay the
+> undrained WAL tail (segments past the drain cursor) directly into memory.
 
-1. After a crash, on-disk SQLite is up to ~1 interval stale.
-2. **Replay the WAL tail into SQLite inside one transaction, commit** → SQLite is
-   at the crash point (minus the ≤1s the WAL had not fsynced).
-3. **Load SQLite into the in-memory shards**, rebuild secondary indexes.
-4. Rotate/clear the consumed WAL.
+1. After a crash, on-disk SQLite holds everything up to the last drained segment;
+   the undrained tail segments are still on disk (the drainer deletes a segment
+   only after its SQLite transaction commits).
+2. **Load SQLite → in-memory shards** ([recover_sqlite.go](../recover_sqlite.go)),
+   reconciling runtime-created tables via `_hz_tables`.
+3. **Replay the undrained tail segments → memory** through the apply path
+   (`rt.insert`; WAL-free, not re-journaled). State is now at the crash point,
+   minus the ≤1s the WAL had not fsynced.
+4. Rebuild secondary indexes; begin serving.
 
-The single-transaction wrap in step 2 makes recovery itself crash-safe: if the
-process dies mid-replay, SQLite rolls back to the last drain state, the WAL tail
-is still intact (step 4 has not run), and the next boot replays the whole tail
-again from the same starting point — all-or-nothing, re-runnable.
+Recovery is re-runnable by construction: it only *reads* SQLite + the tail and
+*writes* memory — it never mutates SQLite or deletes a segment, so a crash
+mid-boot just restarts from the same SQLite state and the same tail. The drain's
+crash-safety is separate: each segment drains in one SQLite transaction and is
+deleted only after commit, so a crash mid-drain rolls that segment back and the
+next drain re-applies it.
 
 Clean shutdown flushes a final drain, so the tail is empty and boot is a straight
-load. Crash leaves ≤1 interval of tail. **Same path either way** — no separate
-"clean boot" vs "crash boot" logic.
+SQLite load. Crash leaves a few tail segments. **Same path either way** — no
+separate "clean boot" vs "crash boot" logic.
 
 ## 7. What this costs
 
@@ -232,19 +245,25 @@ In exchange: no snapshot serializer to write, native compaction (SQLite stores
 current state, not history), a portable copy-one-file backup, an inspectable DB,
 and SQLite's battle-tested crash recovery instead of hand-rolled correctness.
 
-## 8. Open decisions (deferred)
+## 8. Open decisions
 
-- **SQLite driver:** cgo (`mattn`) vs pure-Go (`modernc`) — measure both against
-  the §4 drain rate before choosing.
+Decided (shipped):
+
+- **SQLite driver:** pure-Go `modernc.org/sqlite` shipped (~203k rows/s drain —
+  ample margin at the ~5s cadence). cgo `mattn/go-sqlite3` (~528k/s measured)
+  stays a drop-in swap if the drain ever binds.
+- **Drain trigger:** per segment rotation (~5s). Sealing the segment *is* the
+  trigger — not a separate interval, WAL-size, or dirty-count threshold.
+
+Still open:
+
 - **One SQLite file vs one per shard.** Per-shard files would let the drain run
   concurrently (one writer each, no cross-shard lock) and sidestep SQLite's
-  single-writer limit entirely, at the cost of N files and a fan-in load. Decide
-  after measuring whether a single-file drain keeps up (§4 says it does, with
-  margin).
-- **Drain trigger:** fixed interval vs WAL-size threshold vs dirty-count
-  threshold (or a combination). The merger's `dirtyCount` is already a cheap
-  signal.
+  single-writer limit, at the cost of N files and a fan-in load. Single-file keeps
+  up with margin (§4), so this stays deferred until measurement says otherwise.
 - **Snapshot-free alternative retained for comparison:** a custom in-memory
-  snapshot + WAL-truncate remains viable if the SQLite dependency is judged too
-  heavy. The decision table is dependency-appetite + portable-file value vs.
-  novel code; this note assumes the SQLite route.
+  snapshot + WAL-truncate remains viable if the SQLite dependency is ever judged
+  too heavy — notably a **WAL-only deployment with no `SQLitePath`**, where today
+  the segments are not drained or reclaimed (the one mode that still grows the log
+  and replays the full history on boot). Dependency-appetite + portable-file value
+  vs. novel code; this note assumes the SQLite route.
