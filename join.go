@@ -631,19 +631,13 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 	if len(jp.driverPreds) > 0 {
 		scratch = make(Row, nLeft+nRight)
 	}
+	driverMatch := conjunctsMatcher(jp.driverPreds, &ctx)
 	passDriver := func(r Row) bool {
 		if len(jp.driverPreds) == 0 {
 			return true
 		}
 		copy(scratch[driverOff:driverOff+driverWidth], r)
-		ctx.row = scratch
-		for _, p := range jp.driverPreds {
-			v, err := evalExpr(p, &ctx)
-			if err != nil || !truthy(v) {
-				return false
-			}
-		}
-		return true
+		return driverMatch(scratch) // driverPreds are bound to concat ordinals
 	}
 	// A scanned driver with no ORDER BY can STREAM: drive() pulls it chunk by chunk
 	// and stops at offset+limit instead of materialising the whole table up front
@@ -682,16 +676,7 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 	// passResidual applies the WHERE conjuncts NOT already pushed into the driver
 	// (probe-side / cross-table / constant). Driver conjuncts ran in passDriver, so
 	// re-checking the full WHERE here would be wasted work.
-	passResidual := func(concat Row) bool {
-		for _, p := range jp.residualPreds {
-			ctx.row = concat
-			v, err := evalExpr(p, &ctx)
-			if err != nil || !truthy(v) {
-				return false
-			}
-		}
-		return true
-	}
+	passResidual := conjunctsMatcher(jp.residualPreds, &ctx)
 	// fillConcat writes [left.. right..] into dst; a nil side is NULL-padded (an
 	// outer-join miss). dst is caller-owned — reused as scratch on the top-N path,
 	// freshly allocated on the gather path.

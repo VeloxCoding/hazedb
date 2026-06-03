@@ -59,23 +59,20 @@ func (db *DB) selectEach(pl *plan, args []Value, visit func(row Row) bool) ([]st
 	}
 
 	ctx := evalCtx{cols: tbl.def.colByName, args: args}
+	match := rowMatcher(st.where, &ctx)
 	var scratch Row
 	if !st.starAll {
 		scratch = make(Row, len(pl.projOrdinals))
 	}
 	n := 0
 	skipped := 0
-	// consume reads a LIVE row under its shard lock: WHERE-filter, skip the first
-	// OFFSET matches, project into the reused scratch (Value headers only — no
-	// clone, valid for this call only), hand to visit, apply LIMIT. A WHERE-eval
-	// error skips the row, as in the materialized scan. Returns true to STOP.
+	// consume reads a LIVE row under its shard lock: WHERE-filter via the compiled
+	// matcher, skip the first OFFSET matches, project into the reused scratch
+	// (Value headers only — no clone, valid for this call only), hand to visit,
+	// apply LIMIT. Returns true to STOP.
 	consume := func(r Row) bool {
-		if st.where != nil {
-			ctx.row = r
-			v, err := evalExpr(st.where, &ctx)
-			if err != nil || !truthy(v) {
-				return false
-			}
+		if !match(r) {
+			return false
 		}
 		if skipped < st.offset { // skip the first offset matched rows
 			skipped++

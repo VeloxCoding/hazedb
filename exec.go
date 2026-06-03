@@ -955,11 +955,7 @@ func (db *DB) execCandidates(pl *plan, ctx *evalCtx, cand idxCandidateSet) ([]st
 	// it is cheap. (Sorting a near-whole-table subset is the caller's call; that
 	// is no longer a list view.)
 	if pl.orderOrdinal >= 0 {
-		pred := func(r Row) bool {
-			ctx.row = r
-			v, err := evalExpr(st.where, ctx)
-			return err == nil && truthy(v)
-		}
+		pred := rowMatcher(st.where, ctx)
 		// ORDER BY + LIMIT: a top-N heap clones only ~limit rows, so the cost
 		// tracks the LIMIT, not the matched-set size (offer reads/clones the live
 		// row under the shard lock). st.limit == 0 already returned above.
@@ -998,11 +994,7 @@ func (db *DB) execCandidates(pl *plan, ctx *evalCtx, cand idxCandidateSet) ([]st
 	hint := cand.capHint(eff)
 	out := make([]Row, 0, hint)
 	packed := make([]Value, 0, hint*len(colNames))
-	pred := func(r Row) bool {
-		ctx.row = r
-		v, err := evalExpr(st.where, ctx)
-		return err == nil && truthy(v)
-	}
+	pred := rowMatcher(st.where, ctx)
 	cand.emit(func(pk UUID) bool {
 		start := len(packed)
 		var ok bool
@@ -1052,11 +1044,7 @@ func (db *DB) execSelectIdxOne(pl *plan, args []Value) ([]string, Row, error) {
 			break
 		}
 	}
-	pred := func(r Row) bool {
-		ctx.row = r
-		v, err := evalExpr(st.where, &ctx)
-		return err == nil && truthy(v)
-	}
+	pred := rowMatcher(st.where, &ctx)
 	try := func(pk UUID) (Row, bool) {
 		return tbl.getMatchProject(pk, pred, pl.projOrdinals, st.starAll)
 	}
@@ -1307,24 +1295,8 @@ func (db *DB) orderedWalk(pl *plan, args []Value, snap []ordEntry, dirtyKey func
 		return colNames, nil, nil
 	}
 	ctx := evalCtx{cols: tbl.def.colByName, args: args}
-	matches := func(r Row) bool { // full WHERE — filters dirty candidates
-		if st.where == nil {
-			return true
-		}
-		ctx.row = r
-		v, err := evalExpr(st.where, &ctx)
-		return err == nil && truthy(v)
-	}
-	passResidual := func(r Row) bool { // only the conjuncts the snap doesn't guarantee
-		for _, p := range residual {
-			ctx.row = r
-			v, err := evalExpr(p, &ctx)
-			if err != nil || !truthy(v) {
-				return false
-			}
-		}
-		return true
-	}
+	matches := rowMatcher(st.where, &ctx)            // full WHERE — filters dirty candidates
+	passResidual := conjunctsMatcher(residual, &ctx) // conjuncts the snap doesn't guarantee
 	dc, dirtySet := tbl.buildDirtyCands(matches, dirtyKey)
 
 	eff := fetchBound(st.limit, st.offset) // collect offset+limit, drop offset at the end
@@ -1381,24 +1353,8 @@ func (db *DB) orderedWalkEach(pl *plan, args []Value, snap []ordEntry, dirtyKey 
 		return nil
 	}
 	ctx := evalCtx{cols: tbl.def.colByName, args: args}
-	matches := func(r Row) bool { // full WHERE — filters dirty candidates
-		if st.where == nil {
-			return true
-		}
-		ctx.row = r
-		v, err := evalExpr(st.where, &ctx)
-		return err == nil && truthy(v)
-	}
-	passResidual := func(r Row) bool { // only the conjuncts the snap doesn't guarantee
-		for _, p := range residual {
-			ctx.row = r
-			v, err := evalExpr(p, &ctx)
-			if err != nil || !truthy(v) {
-				return false
-			}
-		}
-		return true
-	}
+	matches := rowMatcher(st.where, &ctx)            // full WHERE — filters dirty candidates
+	passResidual := conjunctsMatcher(residual, &ctx) // conjuncts the snap doesn't guarantee
 	dc, dirtySet := tbl.buildDirtyCands(matches, dirtyKey)
 
 	var scratch Row
@@ -2008,17 +1964,7 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		return 0, nil
 	}
 
-	match := func(r Row) bool {
-		if st.where == nil {
-			return true
-		}
-		ctx.row = r
-		v, err := evalExpr(st.where, ctx)
-		if err != nil {
-			return false
-		}
-		return truthy(v)
-	}
+	match := rowMatcher(st.where, ctx)
 
 	// SET right-hand sides evaluate into a reused buffer. evalSet validates
 	// each result against its column. For constant SETs (no column ref) we
@@ -2187,17 +2133,7 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 	// Multi-shard predicate path: deleteWhereAll collects matched PKs under all
 	// shard locks, journals the batch as ONE TXN envelope, then tombstones — so
 	// the statement is atomic. encode/journalAll are nil for a memory-only DB.
-	match := func(r Row) bool {
-		if st.where == nil {
-			return true
-		}
-		ctx.row = r
-		v, err := evalExpr(st.where, ctx)
-		if err != nil {
-			return false
-		}
-		return truthy(v)
-	}
+	match := rowMatcher(st.where, ctx)
 	var encode func(Value) []byte
 	var journalAll func([][]byte) error
 	if db.wal != nil {

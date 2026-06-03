@@ -111,3 +111,29 @@ func rowMatcher(where expr, ctx *evalCtx) func(Row) bool {
 		return err == nil && truthy(v)
 	}
 }
+
+// conjunctsMatcher returns a predicate for the AND of conj — the residual WHERE
+// conjuncts an index/prefix walk does not already guarantee. Each conjunct is
+// compiled independently (compiled fast path or evalExpr fallback), so a mix is
+// fine; the row passes only if every conjunct does. Empty conj matches every row.
+// Built once, not per row.
+func conjunctsMatcher(conj []expr, ctx *evalCtx) func(Row) bool {
+	switch len(conj) {
+	case 0:
+		return func(Row) bool { return true }
+	case 1:
+		return rowMatcher(conj[0], ctx)
+	}
+	ms := make([]func(Row) bool, len(conj))
+	for i, c := range conj {
+		ms[i] = rowMatcher(c, ctx)
+	}
+	return func(row Row) bool {
+		for _, m := range ms {
+			if !m(row) {
+				return false
+			}
+		}
+		return true
+	}
+}
