@@ -323,6 +323,31 @@ func BenchmarkOrderedWalk_50k(b *testing.B) {
 	}
 }
 
+// Non-indexed scan returning MANY rows, no LIMIT (SELECT name FROM t WHERE grp =
+// ?, ~1000 of 20k rows match). The no-ORDER-BY gather projects each match into one
+// packed buffer instead of cloning the full row and re-projecting — so allocs are
+// flat in the match count, not 2 per matched row.
+func BenchmarkScanManyNoLimit(b *testing.B) {
+	const n, groups = 20000, 20
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: n})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec("CREATE TABLE t (id uuid primary key, grp int, name text, payload text)")
+	for i := 0; i < n; i++ {
+		db.Exec("INSERT INTO t (id, grp, name, payload) VALUES (?, ?, ?, ?)",
+			NewUUIDv7(), int64(i%groups), "n"+strconv.Itoa(i), "some-payload-text-here")
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, rows, err := db.Query("SELECT name FROM t WHERE grp = ?", 7); err != nil || len(rows) != n/groups {
+			b.Fatalf("rows=%d err=%v", len(rows), err)
+		}
+	}
+}
+
 // Ordered fetchall via the streaming JSON path (the PHP hazedb_fetchall route):
 // WHERE author = ? ORDER BY day DESC LIMIT 100 on an ORDERED INDEX. Today
 // selectEach falls back to execSelect+orderedWalk, which materializes a []Row

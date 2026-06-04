@@ -1551,18 +1551,24 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 	// Built once, not per row.
 	match := rowMatcher(st.where, &ctx)
 
-	// No ORDER BY means LIMIT can be applied during the scan. Copy only rows
-	// that will be returned, while the shard read lock is still held.
-	if pl.orderOrdinal < 0 && st.limit >= 0 {
+	// No ORDER BY: project straight into one packed buffer during the scan (each
+	// result Row is a capped view of its span) — no full-row clone, no second
+	// projection pass. Works with or without a LIMIT: with one the scan stops at
+	// offset+limit; without one (eff < 0) it gathers every match, still projecting
+	// in place rather than cloning whole rows.
+	if pl.orderOrdinal < 0 {
 		if st.limit == 0 {
 			return colNames, nil, nil
 		}
 		// Collect offset+limit rows during the scan, then drop the offset. Cap the
 		// prealloc: a huge bound over a small result must not allocate a giant
-		// slice up front; append grows past the hint only if that many match.
+		// slice up front, and a no-LIMIT scan starts empty and grows; append grows
+		// past the hint only if that many match.
 		eff := fetchBound(st.limit, st.offset)
 		capHint := eff
-		if capHint > 1024 {
+		if capHint < 0 {
+			capHint = 0 // no LIMIT — grow from empty
+		} else if capHint > 1024 {
 			capHint = 1024
 		}
 		out := make([]Row, 0, capHint)
@@ -1595,7 +1601,7 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 					packed = appendProjectClone(packed, r, pl.projOrdinals)
 				}
 				out = append(out, Row(packed[start:len(packed):len(packed)]))
-				if len(out) >= eff {
+				if eff >= 0 && len(out) >= eff {
 					break
 				}
 			}
@@ -1623,7 +1629,7 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 					packed = appendProjectClone(packed, r, pl.projOrdinals)
 				}
 				out = append(out, Row(packed[start:len(packed):len(packed)]))
-				if len(out) >= eff {
+				if eff >= 0 && len(out) >= eff {
 					stop = true
 					break
 				}
@@ -1661,8 +1667,9 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 		return colNames, sliceOffsetLimit(top.sorted(), st.offset, st.limit), nil
 	}
 
-	// ORDER BY without LIMIT, or no-ORDER-BY/no-LIMIT full scan: gather all
-	// matches (clone under the lock), then sort if ordered.
+	// ORDER BY without LIMIT: gather all matches (full clone under the lock, so the
+	// order column is present for the sort), sort, then project. No-ORDER-BY scans
+	// took the packed path above.
 	var matched []Row
 	scan(func(r Row) bool {
 		if !match(r) {
