@@ -2079,9 +2079,11 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 			v, err := evalExpr(st.where, ctx)
 			return err == nil && truthy(v)
 		}
-		// Fast path — one candidate (the common unique/steady-state index update)
-		// + single-column SET: update in place, no full-row clone (the bulk of the
-		// cost), mirroring the PK single-column path.
+		// Fast path — exactly one resolved candidate + single-column SET: update in
+		// place, no full-row clone (the bulk of the cost), mirroring the PK
+		// single-column path. This does NOT require a unique index; it activates
+		// whenever the candidate set happens to hold a single row (the full WHERE is
+		// still re-checked on it below).
 		if len(pks) == 1 && len(pl.updateOrdinals) == 1 {
 			ord := pl.updateOrdinals[0]
 			computeOne := func(r Row) (Value, error) {
