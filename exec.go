@@ -1971,8 +1971,6 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		return 0, nil
 	}
 
-	match := rowMatcher(st.where, ctx)
-
 	// SET right-hand sides evaluate into a reused buffer. evalSet validates
 	// each result against its column. For constant SETs (no column ref) we
 	// evaluate once up front and hand back the same buffer for every row
@@ -2062,8 +2060,25 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		if !ok {
 			return 0, nil
 		}
-		var pks []UUID
-		cand.emit(func(pk UUID) bool { pks = append(pks, pk); return false })
+		// Use the index bucket directly when there is no dirty overlay; only
+		// materialise + dedup the candidate set when dirty candidates may overlap it.
+		pks := cand.pks
+		if len(cand.dirty) > 0 {
+			pks = nil
+			cand.emit(func(pk UUID) bool { pks = append(pks, pk); return false })
+		}
+		// Re-check the full WHERE on each candidate with a direct predicate. The
+		// candidate set is narrow, so the compiled scan matcher is not worth its
+		// ctx-capturing closure — which (returned from rowMatcher) would force
+		// execPlan's argument buffer onto the heap for every indexed write.
+		match := func(r Row) bool {
+			if st.where == nil {
+				return true
+			}
+			ctx.row = r
+			v, err := evalExpr(st.where, ctx)
+			return err == nil && truthy(v)
+		}
 		// Fast path — one candidate (the common unique/steady-state index update)
 		// + single-column SET: update in place, no full-row clone (the bulk of the
 		// cost), mirroring the PK single-column path.
@@ -2089,6 +2104,13 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		}
 		return tbl.updateByCandidates(pks, match, pl.updateOrdinals, compute, encode, journalAll)
 	}
+	// Full-scan fallback: the compiled matcher pays off over many rows. Copy the
+	// args into an owned slice so the matcher's captured ctx does not drag
+	// execPlan's fixed argument buffer onto the heap (which would penalise every
+	// PK/indexed write that never reaches this path).
+	matchArgs := make([]Value, len(args))
+	copy(matchArgs, args)
+	match := rowMatcher(st.where, &evalCtx{cols: tbl.def.colByName, args: matchArgs})
 	return tbl.updateWhereAll(match, pl.updateOrdinals, compute, encode, journalAll)
 }
 
@@ -2140,7 +2162,6 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 	// Multi-shard predicate path: deleteWhereAll collects matched PKs under all
 	// shard locks, journals the batch as ONE TXN envelope, then tombstones — so
 	// the statement is atomic. encode/journalAll are nil for a memory-only DB.
-	match := rowMatcher(st.where, ctx)
 	var encode func(Value) []byte
 	var journalAll func([][]byte) error
 	if db.wal != nil {
@@ -2161,9 +2182,27 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 		if !ok {
 			return 0, nil
 		}
-		var pks []UUID
-		cand.emit(func(pk UUID) bool { pks = append(pks, pk); return false })
+		pks := cand.pks
+		if len(cand.dirty) > 0 {
+			pks = nil
+			cand.emit(func(pk UUID) bool { pks = append(pks, pk); return false })
+		}
+		// Direct WHERE re-check (see execUpdate: a narrow candidate set does not
+		// warrant the ctx-capturing compiled matcher that escapes the arg buffer).
+		match := func(r Row) bool {
+			if st.where == nil {
+				return true
+			}
+			ctx.row = r
+			v, err := evalExpr(st.where, ctx)
+			return err == nil && truthy(v)
+		}
 		return tbl.deleteByCandidates(pks, match, encode, journalAll)
 	}
+	// Full-scan fallback: compiled matcher over an owned args copy, so the captured
+	// ctx does not drag execPlan's argument buffer onto the heap (see execUpdate).
+	matchArgs := make([]Value, len(args))
+	copy(matchArgs, args)
+	match := rowMatcher(st.where, &evalCtx{cols: tbl.def.colByName, args: matchArgs})
 	return tbl.deleteWhereAll(match, encode, journalAll)
 }
