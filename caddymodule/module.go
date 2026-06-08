@@ -1,8 +1,9 @@
 // Package caddymodule exposes hazedb as a Caddy HTTP handler.
 //
 // The core hazedb package stays stdlib-only (plus goccy/go-json); this adapter
-// owns the transport: it opens a *DB, serves POST /query and POST /exec over an
-// internal mux, and registers the *DB under a name in the core registry so an
+// owns the transport: it opens a *DB, serves GET /get (typed PK read), POST
+// /query and POST /exec over an internal mux, and registers the *DB under a
+// name in the core registry so an
 // in-process consumer (the FrankenPHP/PHP extension) reaches the very same
 // instance. Per the gateway boundary in the RFC, request-context cross-cutting
 // concerns (auth, per-tenant routing, rate limits) belong here, never in core.
@@ -100,6 +101,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}
 
 	h.mux = http.NewServeMux()
+	h.mux.HandleFunc("/get", h.handleGet)
 	h.mux.HandleFunc("/query", h.handleQuery)
 	h.mux.HandleFunc("/exec", h.handleExec)
 
@@ -208,6 +210,69 @@ func (h *Handler) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, hazedb.ExecResultJSON(n))
+}
+
+// handleGet is the typed PK read: GET /get?table=T&id=UUID[&cols=a,b]. The read
+// counterpart to POST /query — no request body to decode, the `id = ?` lookup
+// takes hazedb's one-shard O(1) PK fast path, cached plan reused per SQL string.
+// POST stays for writes (/exec) and ad-hoc SQL (/query). `table`/`cols` come
+// from the URL, so both are validated as identifiers before string-building SQL.
+func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, hazedb.ErrorJSON("use GET"))
+		return
+	}
+	q := r.URL.Query()
+	table, id, cols := q.Get("table"), q.Get("id"), q.Get("cols")
+	if !isIdent(table) || id == "" {
+		writeJSON(w, http.StatusBadRequest, hazedb.ErrorJSON("table (identifier) and id are required"))
+		return
+	}
+	sel := "*"
+	if cols != "" {
+		if !isColList(cols) {
+			writeJSON(w, http.StatusBadRequest, hazedb.ErrorJSON("cols must be a comma-separated identifier list"))
+			return
+		}
+		sel = cols
+	}
+	colsOut, row, err := h.db.QueryRow("SELECT "+sel+" FROM "+table+" WHERE id = ?", id)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, hazedb.ErrorJSON(err.Error()))
+		return
+	}
+	if row == nil {
+		writeJSON(w, http.StatusOK, []byte("null")) // not found → JSON null
+		return
+	}
+	body, _ := hazedb.RowToJSONObject(colsOut, row)
+	writeJSON(w, http.StatusOK, body)
+}
+
+// isIdent reports whether s is a bare SQL identifier ([A-Za-z_][A-Za-z0-9_]*).
+func isIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, c := range s {
+		switch {
+		case c == '_', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		case i > 0 && c >= '0' && c <= '9':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// isColList reports whether s is a comma-separated list of bare identifiers.
+func isColList(s string) bool {
+	for _, p := range strings.Split(s, ",") {
+		if !isIdent(strings.TrimSpace(p)) {
+			return false
+		}
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, status int, body []byte) {

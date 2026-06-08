@@ -148,6 +148,31 @@ func BenchmarkHop_Full_PK_Copy(b *testing.B) {
 	}
 }
 
+// BenchmarkHop_Full_GET models the Caddy GET /get read path: the id string is
+// passed straight to QueryRow (no QueryArgs — a GET read takes the scalar from
+// the URL), then the single row is encoded as a flat JSON object. The read
+// counterpart to BenchmarkHop_Full_PK_*, which use Query + RowsToJSON (the
+// list/POST shape). This is the path to drive allocs/CPU down on.
+func BenchmarkHop_Full_GET(b *testing.B) {
+	const N = 10000
+	db := newBenchDB(b, N)
+	ids := make([]string, N)
+	for i := range ids {
+		ids[i] = tid(i).String()
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		cols, row, err := db.QueryRow(hopSelectPK, ids[i%N])
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := RowToJSONObject(cols, row); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // Proposed shape: SQL passed as a view (no per-call copy), rest identical.
 func BenchmarkHop_Full_PK_View(b *testing.B) {
 	const N = 10000

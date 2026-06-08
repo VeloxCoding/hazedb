@@ -63,6 +63,13 @@ func RowsToJSONObjects(cols []string, rows []Row) ([]byte, error) {
 	return append(b, ']'), nil
 }
 
+// RowToJSONObject renders ONE row as a single JSON object {"col":val,...} — the
+// shape a PK / single-row read returns (vs RowsToJSONObjects' array). Never
+// errors (kept for API symmetry).
+func RowToJSONObject(cols []string, row Row) ([]byte, error) {
+	return appendRowJSONObject(make([]byte, 0, 2+len(cols)*24), cols, row), nil
+}
+
 // appendRowJSONObject appends one row as a {"col":val,...} object. Shared by
 // RowsToJSONObjects and the streaming QueryJSON, so the object shape has one
 // definition. The row may alias live arena storage (QueryJSON encodes under the
