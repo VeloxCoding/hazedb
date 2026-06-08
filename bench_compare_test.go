@@ -432,19 +432,20 @@ func BenchmarkDeleteByPK_SQLiteMem(b *testing.B) {
 // are the *ByPK benchmarks above. compareN rows; email/code unique per row.
 //
 // Note on hazedb's async index: an index lookup unions the dirty overlay, so a
-// tight WRITE loop on an indexed column would grow that overlay and inflate the
-// next lookup. The by-index UPDATE/DELETE below therefore drain the overlay with
-// an untimed mergeIndexes() each iteration, so the TIMED op measures the
-// steady-state (merged) index path. Scan paths read live rows directly and need
-// no such drain. (SQLite has no async index — its loops are plain.)
+// tight WRITE loop that touches an indexed column grows that overlay and inflates
+// the next lookup. Only a write to the indexed column itself accrues the overlay:
+// the by-index UPDATE sets age (un-indexed) and so needs no drain, but the
+// by-index DELETE inserts a fresh email-indexed row each iteration and therefore
+// drains with an untimed mergeIndexes(). Scan paths read live rows directly and
+// need no drain. (SQLite has no async index — its loops are plain.)
 //
 // CAVEAT — wall time of the per-iteration-StopTimer benches is NOT the op cost.
 // The benches that call b.StopTimer()/b.StartTimer() each iteration (to exclude
-// the untimed merge or fresh insert) pay runtime.ReadMemStats per call, a
-// stop-the-world that profiles at ~60% of CPU and dwarfs the actual UPDATE/DELETE
-// (which is sub-µs and does not even appear in the profile). Read allocs/op (the
-// reliable signal) from these, not ns/op. Micro-benchmarking an async-index write
-// in a tight loop is inherently confounded — there is no clean single number.
+// an untimed fresh insert / merge) pay runtime.ReadMemStats per call, a
+// stop-the-world that dwarfs the actual sub-µs op. Read allocs/op (the reliable
+// signal) from those, not ns/op. This applies to the DELETE-by-index/scan benches
+// (fresh insert each iteration); UpdateByIndex no longer uses that pattern, so
+// its ns/op is now a real number.
 
 func newIdxScanDB(b *testing.B) *DB {
 	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: compareN})
@@ -525,10 +526,12 @@ func BenchmarkUpdateByIndex_FASTSQL_Mem(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
+		// SET targets age, which is NOT indexed, so the write accrues no index
+		// overlay — the loop stays steady-state with no per-iteration drain. (No
+		// StopTimer/mergeIndexes here: that pattern's untimed ReadMemStats would
+		// dwarf this sub-µs op; it is only needed by the DELETE benches below,
+		// which insert a fresh indexed row each iteration.)
 		db.Exec("UPDATE t SET age = ? WHERE email = ?", (i%100)+1, "e"+strconv.Itoa(i%compareN))
-		b.StopTimer()
-		db.mergeIndexes() // drain the overlay so the next lookup is steady-state
-		b.StartTimer()
 	}
 }
 func BenchmarkUpdateByIndex_SQLiteMem(b *testing.B) {

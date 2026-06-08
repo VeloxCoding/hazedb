@@ -57,6 +57,23 @@ func setupIdx(tb testing.TB, n int) (*hazedb.DB, []string) {
 	return db, names
 }
 
+// BenchmarkUpdateByIdx is a CLEAN update-by-indexed-column loop (no
+// StopTimer/mergeIndexes dance): UPDATE u SET age=? WHERE name=? — name indexed,
+// age not, so no dirty overlay accrues and a tight loop stays steady-state.
+// Isolates the real per-update cost of the indexed write path.
+func BenchmarkUpdateByIdx(b *testing.B) {
+	db, names := setupIdx(b, 10000)
+	defer db.Close()
+	n := len(names)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := db.Exec("UPDATE u SET age = ? WHERE name = ?", int64(i%100), names[i%n]); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // TestIdxFused checks the fused index path returns the same flat object.
 func TestIdxFused(t *testing.T) {
 	db, names := setupIdx(t, 100)
