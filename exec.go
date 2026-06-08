@@ -816,6 +816,30 @@ func (t *table) appendMatchProject(pk UUID, pred func(Row) bool, ords []int, sta
 	return appendProjectClone(dst, r, ords), true
 }
 
+// appendMatchJSON is appendMatchProject's encode-under-lock form: it fetches
+// pk's live row, checks pred (the full WHERE) under the shard read lock, and on
+// a pass appends the row as a flat JSON object into dst straight from the live
+// row — no Row clone. Used by the index → JSON read path; non-partitioned, as
+// secondary indexes are. Appends nothing on a miss, so a caller probing several
+// index candidates can pass the same dst each time.
+func (t *table) appendMatchJSON(pk UUID, pred func(Row) bool, cols []string, ords []int, starAll bool, dst []byte) ([]byte, bool) {
+	s := t.shardOf(pk)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rowID, ok := s.pk[pk]
+	if !ok {
+		return dst, false
+	}
+	r := s.rows[rowID]
+	if r == nil || !pred(r) {
+		return dst, false
+	}
+	if starAll {
+		return appendRowJSONObject(dst, cols, r), true
+	}
+	return appendRowJSONObjectProject(dst, cols, r, ords), true
+}
+
 // execSelectIdx runs a SELECT whose WHERE pins one or more secondary-indexed
 // columns by equality. It resolves candidate PKs through the index(es)
 // (intersecting buckets for an AND of equalities) plus the dirty overlay, then

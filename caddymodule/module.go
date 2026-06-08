@@ -216,17 +216,19 @@ func (h *Handler) handleExec(w http.ResponseWriter, r *http.Request) {
 // handleGet is the typed PK read: GET /get?table=T&id=UUID[&cols=a,b]. The read
 // counterpart to POST /query — no request body to decode, the `id = ?` lookup
 // takes hazedb's one-shard O(1) PK fast path, cached plan reused per SQL string.
-// POST stays for writes (/exec) and ad-hoc SQL (/query). `table`/`cols` come
-// from the URL, so both are validated as identifiers before string-building SQL.
+// Alternatively ?col=<c>&val=<v> reads by an equality on a non-PK column,
+// served by the index fast path when c is indexed. POST stays for writes
+// (/exec) and ad-hoc SQL (/query). table/cols/col come from the URL, so each is
+// validated as an identifier before string-building SQL.
 func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, hazedb.ErrorJSON("use GET"))
 		return
 	}
 	q := r.URL.Query()
-	table, id, cols := q.Get("table"), q.Get("id"), q.Get("cols")
-	if !isIdent(table) || id == "" {
-		writeJSON(w, http.StatusBadRequest, hazedb.ErrorJSON("table (identifier) and id are required"))
+	table, cols := q.Get("table"), q.Get("cols")
+	if !isIdent(table) {
+		writeJSON(w, http.StatusBadRequest, hazedb.ErrorJSON("table (identifier) is required"))
 		return
 	}
 	sel := "*"
@@ -237,13 +239,29 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 		}
 		sel = cols
 	}
-	uid, err := hazedb.ParseUUID(id)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, hazedb.ErrorJSON("id must be a UUID"))
+
+	bp := getBufPool.Get().(*[]byte)
+	var out []byte
+	var found bool
+	var err error
+	switch {
+	case q.Get("id") != "":
+		// PK fast path: ?id=<uuid> → fused alloc-free read.
+		var uid hazedb.UUID
+		if uid, err = hazedb.ParseUUID(q.Get("id")); err != nil {
+			getBufPool.Put(bp)
+			writeJSON(w, http.StatusBadRequest, hazedb.ErrorJSON("id must be a UUID"))
+			return
+		}
+		out, found, err = h.db.QueryRowJSONByPK((*bp)[:0], "SELECT "+sel+" FROM "+table+" WHERE id = ?", uid)
+	case isIdent(q.Get("col")):
+		// Indexed-column equality: ?col=<c>&val=<v> → WHERE c = ? LIMIT 1, fused.
+		out, found, err = h.db.QueryRowJSONByIndex((*bp)[:0], "SELECT "+sel+" FROM "+table+" WHERE "+q.Get("col")+" = ? LIMIT 1", hazedb.Str(q.Get("val")))
+	default:
+		getBufPool.Put(bp)
+		writeJSON(w, http.StatusBadRequest, hazedb.ErrorJSON("provide id=<uuid> (PK) or col=<column>&val=<value>"))
 		return
 	}
-	bp := getBufPool.Get().(*[]byte)
-	out, found, err := h.db.QueryRowJSONByPK((*bp)[:0], "SELECT "+sel+" FROM "+table+" WHERE id = ?", uid)
 	if err != nil {
 		getBufPool.Put(bp)
 		writeJSON(w, http.StatusBadRequest, hazedb.ErrorJSON(err.Error()))
@@ -251,7 +269,7 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 	if !found {
 		getBufPool.Put(bp)
-		writeJSON(w, http.StatusOK, []byte("null")) // not found → JSON null
+		writeJSON(w, http.StatusOK, []byte("null"))
 		return
 	}
 	*bp = out // keep the grown backing for the next call on this worker

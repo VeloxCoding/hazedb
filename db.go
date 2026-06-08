@@ -405,6 +405,65 @@ func (db *DB) QueryRowJSONByPK(dst []byte, sql string, id UUID) (out []byte, fou
 	return out, found, nil
 }
 
+// QueryRowJSONByIndex is QueryRowJSONByPK for a single-indexed-equality point
+// lookup: WHERE <indexed> = ? LIMIT 1 (no ORDER BY / OFFSET). It resolves the
+// candidates through the secondary index, re-checks the full WHERE on each live
+// candidate, and appends the first match as a flat JSON object into dst UNDER
+// the shard read lock (no Row clone). key is the typed lookup value (no arg
+// boxing); dst is caller-owned and reused, so a steady-state hit allocates only
+// the index-bucket copy. Returns the grown buffer and whether a row matched.
+func (db *DB) QueryRowJSONByIndex(dst []byte, sql string, key Value) (out []byte, found bool, err error) {
+	pl, err := db.prepare(sql, db.cat.Load())
+	if err != nil {
+		return dst, false, err
+	}
+	st, ok := pl.st.(*selectStmt)
+	if !ok || !pl.idxLookup || len(pl.idxCols) != 1 || pl.orderOrdinal >= 0 || st.offset != 0 || st.limit != 1 {
+		return dst, false, fmt.Errorf("hazedb: QueryRowJSONByIndex requires a single-indexed-equality point lookup (WHERE <indexed> = ? LIMIT 1), no ORDER BY or OFFSET")
+	}
+	tbl := pl.rt
+	ctx := evalCtx{cols: tbl.def.colByName, args: []Value{key}}
+	keyVal, err := evalExpr(pl.idxSrcs[0], &ctx)
+	if err != nil {
+		return dst, false, err
+	}
+	if keyVal.IsNull() {
+		return dst, false, nil
+	}
+	si := tbl.indexFor(pl.idxCols[0])
+	if si == nil {
+		return dst, false, nil
+	}
+	var predErr error
+	pred := func(r Row) bool {
+		ctx.row = r
+		v, e := evalExpr(st.where, &ctx)
+		if e != nil {
+			predErr = e
+			return false
+		}
+		return truthy(v)
+	}
+	base := len(dst)
+	for _, pk := range si.lookup(keyOf(keyVal)) {
+		if out, found = tbl.appendMatchJSON(pk, pred, pl.colNames, pl.projOrdinals, st.starAll, dst[:base]); found {
+			return out, true, nil
+		}
+		if predErr != nil {
+			return dst[:base], false, predErr
+		}
+	}
+	for _, pk := range tbl.dirtyPKs() {
+		if out, found = tbl.appendMatchJSON(pk, pred, pl.colNames, pl.projOrdinals, st.starAll, dst[:base]); found {
+			return out, true, nil
+		}
+		if predErr != nil {
+			return dst[:base], false, predErr
+		}
+	}
+	return dst[:base], false, nil
+}
+
 // QueryRowValues is QueryRow with pre-typed args (see QueryValues).
 func (db *DB) QueryRowValues(sql string, args ...Value) ([]string, Row, error) {
 	pl, err := db.prepare(sql, db.cat.Load())

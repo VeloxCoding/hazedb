@@ -35,6 +35,62 @@ func setup(tb testing.TB, n int) (*hazedb.DB, []string) {
 	return db, ids
 }
 
+const selIdx = "SELECT name, age FROM u WHERE name = ? LIMIT 1"
+
+func setupIdx(tb testing.TB, n int) (*hazedb.DB, []string) {
+	tb.Helper()
+	db, err := hazedb.Open(hazedb.Options{})
+	if err != nil {
+		tb.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE TABLE u (id uuid primary key, name text, age int, INDEX (name))"); err != nil {
+		tb.Fatal(err)
+	}
+	names := make([]string, n)
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("00000000-0000-7000-8000-%012x", i)
+		names[i] = fmt.Sprintf("n%d", i)
+		if _, err := db.Exec("INSERT INTO u (id,name,age) VALUES (?,?,?)", id, names[i], i%100); err != nil {
+			tb.Fatal(err)
+		}
+	}
+	return db, names
+}
+
+// TestIdxFused checks the fused index path returns the same flat object.
+func TestIdxFused(t *testing.T) {
+	db, names := setupIdx(t, 100)
+	defer db.Close()
+	out, found, err := db.QueryRowJSONByIndex(nil, selIdx, hazedb.Str(names[42]))
+	if err != nil || !found {
+		t.Fatalf("found=%v err=%v", found, err)
+	}
+	if want := `{"name":"n42","age":42}`; string(out) != want {
+		t.Fatalf("got %s want %s", out, want)
+	}
+	if _, found, _ := db.QueryRowJSONByIndex(nil, selIdx, hazedb.Str("nope")); found {
+		t.Fatal("expected not-found for absent value")
+	}
+}
+
+// BenchmarkGET_IdxFused = the optimised index GET path: QueryRowJSONByIndex with
+// a typed key encodes under the lock into a reused buffer.
+func BenchmarkGET_IdxFused(b *testing.B) {
+	db, names := setupIdx(b, 10000)
+	defer db.Close()
+	n := len(names)
+	buf := make([]byte, 0, 256)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var err error
+		buf, _, err = db.QueryRowJSONByIndex(buf[:0], selIdx, hazedb.Str(names[i%n]))
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // TestGETFused checks the fused path returns the same flat object the handler
 // produces, and reports not-found for an absent id.
 func TestGETFused(t *testing.T) {
