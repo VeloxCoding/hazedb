@@ -313,7 +313,7 @@ func (sc *rowScratch) rowToAssoc(row hazedb.Row) *C.zend_array {
 		case hazedb.KindUUID:
 			sc.kinds = append(sc.kinds, 4)
 			sc.lvals = append(sc.lvals, 0)
-			sc.valbuf = append(sc.valbuf, v.UUID().String()...)
+			sc.valbuf = v.UUID().AppendString(sc.valbuf) // 0-alloc: no temp String
 		case hazedb.KindBytes:
 			sc.kinds = append(sc.kinds, 4)
 			sc.lvals = append(sc.lvals, 0)

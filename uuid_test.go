@@ -126,3 +126,37 @@ func BenchmarkNewUUIDv7Parallel(b *testing.B) {
 		}
 	})
 }
+
+// TestUUIDAppendStringMatchesString pins AppendString to the same bytes as String.
+func TestUUIDAppendStringMatchesString(t *testing.T) {
+	for i := 0; i < 1000; i++ {
+		u := NewUUIDv7()
+		if got := string(u.AppendString(nil)); got != u.String() {
+			t.Fatalf("AppendString=%q String=%q", got, u.String())
+		}
+	}
+	// non-empty prefix is preserved
+	if got := string(NewUUIDv7().AppendString([]byte("x="))); got[:2] != "x=" || len(got) != 38 {
+		t.Fatalf("prefix not preserved: %q", got)
+	}
+}
+
+func BenchmarkUUIDString(b *testing.B) {
+	u := NewUUIDv7()
+	b.ReportAllocs()
+	var s string
+	for i := 0; i < b.N; i++ {
+		s = u.String()
+	}
+	_ = s
+}
+
+func BenchmarkUUIDAppendString(b *testing.B) {
+	u := NewUUIDv7()
+	buf := make([]byte, 0, 36)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		buf = u.AppendString(buf[:0])
+	}
+	_ = buf
+}

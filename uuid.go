@@ -29,16 +29,32 @@ func (u UUID) IsV7() bool { return u.Version() == 7 && u[8]&0xC0 == 0x80 }
 // String renders the canonical 8-4-4-4-12 lowercase hex form.
 func (u UUID) String() string {
 	var b [36]byte
-	hex.Encode(b[0:8], u[0:4])
-	b[8] = '-'
-	hex.Encode(b[9:13], u[4:6])
-	b[13] = '-'
-	hex.Encode(b[14:18], u[6:8])
-	b[18] = '-'
-	hex.Encode(b[19:23], u[8:10])
-	b[23] = '-'
-	hex.Encode(b[24:36], u[10:16])
+	u.writeHyphenated(&b)
 	return string(b[:])
+}
+
+// AppendString appends u's canonical 8-4-4-4-12 lowercase hex form to b and
+// returns the extended slice — the allocation-free counterpart of String for
+// hot encoders that pack into a reused buffer (the PHP row builder, JSON
+// output), where String's per-call result string is pure waste.
+func (u UUID) AppendString(b []byte) []byte {
+	var tmp [36]byte
+	u.writeHyphenated(&tmp)
+	return append(b, tmp[:]...)
+}
+
+// writeHyphenated fills dst with u's canonical hex form; one layout definition
+// shared by String and AppendString.
+func (u UUID) writeHyphenated(dst *[36]byte) {
+	hex.Encode(dst[0:8], u[0:4])
+	dst[8] = '-'
+	hex.Encode(dst[9:13], u[4:6])
+	dst[13] = '-'
+	hex.Encode(dst[14:18], u[6:8])
+	dst[18] = '-'
+	hex.Encode(dst[19:23], u[8:10])
+	dst[23] = '-'
+	hex.Encode(dst[24:36], u[10:16])
 }
 
 // hexNibble maps an ASCII byte to its hex value, or 0xFF if not a hex digit.
