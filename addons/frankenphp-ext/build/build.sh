@@ -2,7 +2,8 @@
 # build.sh — produce ./dist/frankenphp with the hazedb extension + Caddy module
 # compiled in.
 #
-#   Stage 1: build (or reuse) the cached generator image (Dockerfile.gen).
+#   Stage 1: reuse the cached generator image if present, else build it
+#            (Dockerfile.gen); --rebuild-gen-image forces a clean rebuild.
 #   Stage 2: stage the in-repo hazedb core + caddymodule + this ext (with the
 #            committed C wrappers), then `xcaddy build` the final binary.
 #
@@ -25,18 +26,19 @@ GEN_IMAGE="hazedb-frankenphp-builder:latest"
 
 mkdir -p "$DIST_DIR"
 
-DOCKER_BUILD_ARGS=()
+# Reuse the gen image if it already exists — `docker build` otherwise contacts
+# the registry (base-image auth token) on every run, which fails when Docker Hub
+# is flaky (seen: 504 Gateway Timeout) even though nothing needs rebuilding.
+# Build only when the image is missing or --rebuild-gen-image forces it.
 if [ "${1:-}" = "--rebuild-gen-image" ]; then
     echo ">>> [pre] --rebuild-gen-image: forcing a clean rebuild of $GEN_IMAGE"
-    DOCKER_BUILD_ARGS+=(--no-cache)
+    ( cd "$SCRIPT_DIR" && MSYS_NO_PATHCONV=1 docker build --no-cache -t "$GEN_IMAGE" -f Dockerfile.gen . )
+elif docker image inspect "$GEN_IMAGE" >/dev/null 2>&1; then
+    echo ">>> [pre] reusing existing $GEN_IMAGE (skip build; --rebuild-gen-image to force, e.g. after editing Dockerfile.gen)"
+else
+    echo ">>> [pre] $GEN_IMAGE not found — building it"
+    ( cd "$SCRIPT_DIR" && MSYS_NO_PATHCONV=1 docker build -t "$GEN_IMAGE" -f Dockerfile.gen . )
 fi
-
-echo ">>> [pre] building (or reusing cached) $GEN_IMAGE"
-( cd "$SCRIPT_DIR" && MSYS_NO_PATHCONV=1 docker build \
-    "${DOCKER_BUILD_ARGS[@]}" \
-    -t "$GEN_IMAGE" \
-    -f Dockerfile.gen \
-    . )
 
 WRAPPER_FILES=(
     "$EXT_SRC/hazedb_ext.c"
