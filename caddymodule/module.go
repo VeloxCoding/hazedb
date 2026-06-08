@@ -1,9 +1,9 @@
 // Package caddymodule exposes hazedb as a Caddy HTTP handler.
 //
-// The core hazedb package stays stdlib-only (plus goccy/go-json); this adapter
-// owns the transport: it opens a *DB, serves GET /get (typed PK read), POST
-// /query and POST /exec over an internal mux, and registers the *DB under a
-// name in the core registry so an
+// The core hazedb package stays Caddy-free; this adapter owns the transport:
+// it opens a *DB, serves GET /get (single-row read), GET /list (multi-row
+// read), POST /query and POST /exec over an internal mux, and registers the
+// *DB under a name in the core registry so an
 // in-process consumer (the FrankenPHP/PHP extension) reaches the very same
 // instance. Per the gateway boundary in the RFC, request-context cross-cutting
 // concerns (auth, per-tenant routing, rate limits) belong here, never in core.
@@ -103,6 +103,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 
 	h.mux = http.NewServeMux()
 	h.mux.HandleFunc("/get", h.handleGet)
+	h.mux.HandleFunc("/list", h.handleList)
 	h.mux.HandleFunc("/query", h.handleQuery)
 	h.mux.HandleFunc("/exec", h.handleExec)
 
@@ -279,9 +280,67 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 	getBufPool.Put(bp)
 }
 
-// getBufPool reuses the JSON output buffer for GET /get across requests, so a
-// steady-state read allocates nothing (QueryRowJSONByPK appends into it).
+// getBufPool reuses the JSON output buffer for GET /get and /list across
+// requests, so a steady-state read appends into it rather than allocating.
 var getBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 256); return &b }}
+
+// handleList is the multi-row read: GET /list?table=T[&cols=a,b][&col=C&val=V][&limit=N]
+// → SELECT cols FROM T [WHERE C = ?] [LIMIT N], encoded as a JSON array
+// [{...},...] via QueryJSONInto — rows streamed into one pooled buffer under the
+// shard locks, no []Row clone. Covers full scans, equality filters (indexed or
+// not), and indexed multi-match. Joins need a JOIN clause and so go through
+// POST /query, not this param handler. table/cols/col are validated as
+// identifiers and limit as a non-negative integer before SQL is built.
+func (h *Handler) handleList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, hazedb.ErrorJSON("use GET"))
+		return
+	}
+	q := r.URL.Query()
+	table, cols, col := q.Get("table"), q.Get("cols"), q.Get("col")
+	if !isIdent(table) {
+		writeJSON(w, http.StatusBadRequest, hazedb.ErrorJSON("table (identifier) is required"))
+		return
+	}
+	sel := "*"
+	if cols != "" {
+		if !isColList(cols) {
+			writeJSON(w, http.StatusBadRequest, hazedb.ErrorJSON("cols must be a comma-separated identifier list"))
+			return
+		}
+		sel = cols
+	}
+	sql := "SELECT " + sel + " FROM " + table
+	var args []hazedb.Value
+	if col != "" {
+		if !isIdent(col) {
+			writeJSON(w, http.StatusBadRequest, hazedb.ErrorJSON("col must be an identifier"))
+			return
+		}
+		sql += " WHERE " + col + " = ?"
+		args = append(args, hazedb.Str(q.Get("val")))
+	}
+	if lim := q.Get("limit"); lim != "" {
+		n, err := strconv.Atoi(lim)
+		if err != nil || n < 0 {
+			writeJSON(w, http.StatusBadRequest, hazedb.ErrorJSON("limit must be a non-negative integer"))
+			return
+		}
+		sql += " LIMIT " + strconv.Itoa(n)
+	}
+	bp := getBufPool.Get().(*[]byte)
+	_, out, err := h.db.QueryJSONInto((*bp)[:0], sql, args...)
+	if err != nil {
+		getBufPool.Put(bp)
+		writeJSON(w, http.StatusBadRequest, hazedb.ErrorJSON(err.Error()))
+		return
+	}
+	*bp = out // keep the grown backing for the next call on this worker
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(out)
+	getBufPool.Put(bp)
+}
 
 // isIdent reports whether s is a bare SQL identifier ([A-Za-z_][A-Za-z0-9_]*).
 func isIdent(s string) bool {
