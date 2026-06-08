@@ -91,6 +91,28 @@ func appendRowJSONObject(b []byte, cols []string, row Row) []byte {
 	return append(b, '}')
 }
 
+// appendRowJSONObjectProject appends a projected row as a {"col":val,...}
+// object: cols[j] keys row[ords[j]]. The PK→JSON read path uses it to encode
+// only the SELECTed columns straight from the live row under the shard lock
+// (every cell is copied into b, so nothing is retained). SELECT * passes ords
+// nil and uses appendRowJSONObject instead.
+func appendRowJSONObjectProject(b []byte, cols []string, row Row, ords []int) []byte {
+	b = append(b, '{')
+	for j, ord := range ords {
+		if j > 0 {
+			b = append(b, ',')
+		}
+		if j < len(cols) {
+			b = appendJSONString(b, cols[j])
+		} else {
+			b = appendJSONString(b, "")
+		}
+		b = append(b, ':')
+		b = appendValueJSON(b, row[ord])
+	}
+	return append(b, '}')
+}
+
 // appendRowJSONObjectPre appends one row as a {"col":val,...} object using
 // pre-escaped key fragments (each prefix is `"col":`, built once at plan time),
 // so the constant column names are not re-escaped per row. The row may alias

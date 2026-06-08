@@ -148,6 +148,42 @@ func (t *table) getByPKProjectIntoPartitioned(pk UUID, ords []int, dst []Value) 
 	return dst[:0], false
 }
 
+// getByPKJSONIntoPartitioned is getByPKJSONInto for a partitioned table: same
+// resolve + retry-on-stale-location loop as getByPKProjectIntoPartitioned, but
+// it appends the row as a flat JSON object into dst under the shard lock instead
+// of cloning cells. dst is reset to its entry length on each retry so a stale
+// first attempt leaves no partial object behind.
+func (t *table) getByPKJSONIntoPartitioned(pk UUID, cols []string, ords []int, dst []byte) ([]byte, bool) {
+	base := len(dst)
+	for retry := 0; retry < pkRetryBudget; retry++ {
+		t.pkDir.mu.RLock()
+		loc, ok := t.pkDir.idx[pk]
+		t.pkDir.mu.RUnlock()
+		if !ok {
+			return dst[:base], false
+		}
+		s := &t.shards[loc.shard]
+		s.mu.RLock()
+		out, found := dst[:base], false
+		if loc.rowID < uint64(len(s.rows)) {
+			if r := s.rows[loc.rowID]; r != nil && r[t.def.pkOrdinal].UUID() == pk {
+				if ords == nil {
+					out = appendRowJSONObject(out, cols, r)
+				} else {
+					out = appendRowJSONObjectProject(out, cols, r, ords)
+				}
+				found = true
+			}
+		}
+		s.mu.RUnlock()
+		if found {
+			return out, true
+		}
+		// Stale location (deleted or moved) → re-resolve via the directory.
+	}
+	return dst[:base], false
+}
+
 // getByPKProjectPartitioned is getByPKPartitioned for a projected SELECT:
 // same resolve + retry-on-stale-location loop, but it clones only the ords
 // columns under the shard read lock instead of the whole row.

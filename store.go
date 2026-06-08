@@ -402,6 +402,33 @@ func (t *table) getByPKProjectInto(pk UUID, ords []int, dst []Value) ([]Value, b
 	return out, found
 }
 
+// getByPKJSONInto finds pk's live row and appends it as a flat JSON object into
+// dst UNDER the shard read lock, encoding the cells straight from the live row
+// (appendValueJSON copies every cell, so nothing aliases the arena) — so it
+// makes no Row clone. ords nil = all columns (SELECT *). Returns the grown
+// buffer and whether a row matched. The encode-under-lock counterpart of
+// getByPKProjectInto, for an in-process JSON consumer.
+func (t *table) getByPKJSONInto(pk UUID, cols []string, ords []int, dst []byte) ([]byte, bool) {
+	if t.pkDir != nil {
+		return t.getByPKJSONIntoPartitioned(pk, cols, ords, dst)
+	}
+	s := t.shardOf(pk)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rowID, ok := s.pk[pk]
+	if !ok {
+		return dst, false
+	}
+	r := s.rows[rowID]
+	if r == nil {
+		return dst, false
+	}
+	if ords == nil {
+		return appendRowJSONObject(dst, cols, r), true
+	}
+	return appendRowJSONObjectProject(dst, cols, r, ords), true
+}
+
 // projectClone copies the ords columns of r into a fresh Row, deep-copying any
 // []byte cells so the result aliases nothing in the arena. Caller holds the
 // shard read lock.

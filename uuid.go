@@ -41,37 +41,52 @@ func (u UUID) String() string {
 	return string(b[:])
 }
 
+// hexNibble maps an ASCII byte to its hex value, or 0xFF if not a hex digit.
+// One table lookup per nibble replaces hex.Decode's per-byte branching.
+var hexNibble = func() [256]byte {
+	var t [256]byte
+	for i := range t {
+		t[i] = 0xFF
+	}
+	for c := byte('0'); c <= '9'; c++ {
+		t[c] = c - '0'
+	}
+	for c := byte('a'); c <= 'f'; c++ {
+		t[c] = c - 'a' + 10
+	}
+	for c := byte('A'); c <= 'F'; c++ {
+		t[c] = c - 'A' + 10
+	}
+	return t
+}()
+
+// uuidByteOff maps each of the 16 output bytes to the hi-nibble offset of its
+// pair in the 36-char canonical string (lo-nibble is the next char); the
+// hyphen positions 8/13/18/23 are skipped.
+var uuidByteOff = [16]int{0, 2, 4, 6, 9, 11, 14, 16, 19, 21, 24, 26, 28, 30, 32, 34}
+
 // ParseUUID parses the canonical 36-character hyphenated hex form. It accepts
 // any well-formed UUID (version is not enforced here — callers that require
 // v7 check IsV7). Used at the API boundary to turn a string PK into the
 // internal [16]byte; storage never sees the string form.
+//
+// Hand-decoded via a nibble lookup table in one pass — no per-segment
+// hex.Decode call and no string→[]byte conversion (a hot read-path cost since
+// every string PK arg lands here).
 func ParseUUID(s string) (UUID, error) {
 	var u UUID
 	if len(s) != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
 		return u, fmt.Errorf("%w: invalid UUID %q", ErrParse, s)
 	}
-	for _, seg := range [][2]int{{0, 8}, {9, 13}, {14, 18}, {19, 23}, {24, 36}} {
-		if _, err := hex.Decode(uuidSegDst(&u, seg[0]), []byte(s[seg[0]:seg[1]])); err != nil {
-			return UUID{}, fmt.Errorf("%w: invalid UUID %q: %v", ErrParse, s, err)
+	for i := 0; i < 16; i++ {
+		o := uuidByteOff[i]
+		hi, lo := hexNibble[s[o]], hexNibble[s[o+1]]
+		if hi == 0xFF || lo == 0xFF {
+			return UUID{}, fmt.Errorf("%w: invalid UUID %q", ErrParse, s)
 		}
+		u[i] = hi<<4 | lo
 	}
 	return u, nil
-}
-
-// uuidSegDst maps a string offset to the matching destination slice in u.
-func uuidSegDst(u *UUID, strOff int) []byte {
-	switch strOff {
-	case 0:
-		return u[0:4]
-	case 9:
-		return u[4:6]
-	case 14:
-		return u[6:8]
-	case 19:
-		return u[8:10]
-	default: // 24
-		return u[10:16]
-	}
 }
 
 // --- monotonic UUIDv7 generator (RFC 9562 §5.7 + monotonic counter) ---

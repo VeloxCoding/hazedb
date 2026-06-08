@@ -385,6 +385,26 @@ func (db *DB) QueryValues(sql string, args ...Value) ([]string, []Row, error) {
 	return db.execSelect(pl, args)
 }
 
+// QueryRowJSONByPK looks up a PK-pinned SELECT and appends the single matching
+// row as a flat JSON object {"col":val,...} into dst, encoding the cells UNDER
+// the shard read lock straight from the live row (no Row clone) with a typed id
+// (no string→any boxing). dst is caller-owned and reused across calls, so a
+// steady-state call allocates nothing. Returns the grown buffer and whether a
+// row matched. The allocation-free read lane for an in-process JSON consumer
+// (the Caddy GET handler); requires WHERE id = ? — a non-PK-pinned SELECT is
+// rejected, like QueryRowByPK.
+func (db *DB) QueryRowJSONByPK(dst []byte, sql string, id UUID) (out []byte, found bool, err error) {
+	pl, err := db.prepare(sql, db.cat.Load())
+	if err != nil {
+		return dst, false, err
+	}
+	if !pl.pkLookup {
+		return dst, false, fmt.Errorf("hazedb: QueryRowJSONByPK requires a PK-pinned SELECT (WHERE id = ?)")
+	}
+	out, found = pl.rt.getByPKJSONInto(id, pl.colNames, pl.projOrdinals, dst)
+	return out, found, nil
+}
+
 // QueryRowValues is QueryRow with pre-typed args (see QueryValues).
 func (db *DB) QueryRowValues(sql string, args ...Value) ([]string, Row, error) {
 	pl, err := db.prepare(sql, db.cat.Load())

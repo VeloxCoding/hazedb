@@ -26,6 +26,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/VeloxCoding/hazedb"
@@ -236,18 +237,33 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 		}
 		sel = cols
 	}
-	colsOut, row, err := h.db.QueryRow("SELECT "+sel+" FROM "+table+" WHERE id = ?", id)
+	uid, err := hazedb.ParseUUID(id)
 	if err != nil {
+		writeJSON(w, http.StatusBadRequest, hazedb.ErrorJSON("id must be a UUID"))
+		return
+	}
+	bp := getBufPool.Get().(*[]byte)
+	out, found, err := h.db.QueryRowJSONByPK((*bp)[:0], "SELECT "+sel+" FROM "+table+" WHERE id = ?", uid)
+	if err != nil {
+		getBufPool.Put(bp)
 		writeJSON(w, http.StatusBadRequest, hazedb.ErrorJSON(err.Error()))
 		return
 	}
-	if row == nil {
+	if !found {
+		getBufPool.Put(bp)
 		writeJSON(w, http.StatusOK, []byte("null")) // not found → JSON null
 		return
 	}
-	body, _ := hazedb.RowToJSONObject(colsOut, row)
-	writeJSON(w, http.StatusOK, body)
+	*bp = out // keep the grown backing for the next call on this worker
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(out)
+	getBufPool.Put(bp)
 }
+
+// getBufPool reuses the JSON output buffer for GET /get across requests, so a
+// steady-state read allocates nothing (QueryRowJSONByPK appends into it).
+var getBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 256); return &b }}
 
 // isIdent reports whether s is a bare SQL identifier ([A-Za-z_][A-Za-z0-9_]*).
 func isIdent(s string) bool {
