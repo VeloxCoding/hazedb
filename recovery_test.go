@@ -25,6 +25,87 @@ func dumpUsers(t *testing.T, db *DB) string {
 	return b.String()
 }
 
+// dumpWideRow renders every cell of wide's row for id, for equality comparison
+// across a close+reopen (WAL replay).
+func dumpWideRow(t *testing.T, db *DB, id UUID) string {
+	t.Helper()
+	_, row, err := db.QueryRow("SELECT * FROM wide WHERE id = ?", id)
+	if err != nil || row == nil {
+		t.Fatalf("queryrow wide: err=%v nil=%v", err, row == nil)
+	}
+	var b strings.Builder
+	for _, v := range row {
+		fmt.Fprintf(&b, "%s,", v.AsString())
+	}
+	return b.String()
+}
+
+// TestWideUpdateWALRoundTrip pins the uint16 nsets fix: an UPDATE setting more
+// than 255 columns in one statement must replay correctly. With nsets as a
+// single byte the SET count wrapped (300 -> 44), so replay applied the wrong
+// columns and the reopened DB diverged from RAM (or Open aborted on a decode
+// error). The per-cell ordinal was always uint16, so only the count was at fault.
+func TestWideUpdateWALRoundTrip(t *testing.T) {
+	const ncol = 300
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wide.wal")
+
+	id := tid(1)
+	// Columns are NOT NULL by default, so insert every column (value 0), then
+	// UPDATE all ncol of them to distinct values — the >255-SET-column write.
+	var create, insert, upd strings.Builder
+	create.WriteString("CREATE TABLE wide (id uuid primary key")
+	insert.WriteString("INSERT INTO wide (id")
+	upd.WriteString("UPDATE wide SET ")
+	insArgs := []any{id}
+	updArgs := make([]any, 0, ncol+1)
+	for i := 0; i < ncol; i++ {
+		fmt.Fprintf(&create, ", c%d int", i)
+		fmt.Fprintf(&insert, ", c%d", i)
+		insArgs = append(insArgs, int64(0))
+		if i > 0 {
+			upd.WriteString(", ")
+		}
+		fmt.Fprintf(&upd, "c%d = ?", i)
+		updArgs = append(updArgs, int64(i*7+1))
+	}
+	create.WriteString(")")
+	insert.WriteString(") VALUES (?")
+	for i := 0; i < ncol; i++ {
+		insert.WriteString(", ?")
+	}
+	insert.WriteString(")")
+	upd.WriteString(" WHERE id = ?")
+	updArgs = append(updArgs, id)
+
+	db, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(create.String()); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := db.Exec(insert.String(), insArgs...); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if _, err := db.Exec(upd.String(), updArgs...); err != nil {
+		t.Fatalf("update %d SET columns: %v", ncol, err)
+	}
+	want := dumpWideRow(t, db, id)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	if err != nil {
+		t.Fatalf("reopen (replay of >255-column UPDATE) must succeed: %v", err)
+	}
+	defer db2.Close()
+	if got := dumpWideRow(t, db2, id); got != want {
+		t.Fatalf("post-replay row diverged from in-memory:\n in-mem: %s\n replay: %s", want, got)
+	}
+}
+
 // A rejected duplicate INSERT must not be journaled. Before the fix, the
 // WAL record was written before the uniqueness check, so the rejected
 // insert landed in the WAL and the next Open() re-hit ErrDuplicatePK

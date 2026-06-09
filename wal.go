@@ -24,7 +24,7 @@ import (
 //
 //	op:1 | tableID:2 | op-body
 //	  opInsert: full row     (numCols:2 + typed cells)
-//	  opUpdate: pk-cell | nsets:1 | (col_ordinal:2 | typed cell) × nsets
+//	  opUpdate: pk-cell | nsets:2 | (col_ordinal:2 | typed cell) × nsets
 //	  opDelete: pk-cell
 //
 // UPDATE carries only the changed columns (the spike's measured win); replay
@@ -224,7 +224,7 @@ func encodeUpdateMutation(buf []byte, tableID uint16, pk Value, ords []int, row 
 	buf = append(buf, opUpdate)
 	buf = appendU16LE(buf, tableID)
 	buf = encodeCell(buf, pk)
-	buf = append(buf, byte(len(ords)))
+	buf = appendU16LE(buf, uint16(len(ords))) // nsets: uint16, matching INSERT's numCols + the per-cell ordinal (u8 wrapped past 255 SET columns)
 	for _, ord := range ords {
 		buf = appendU16LE(buf, uint16(ord))
 		buf = encodeCell(buf, row[ord])

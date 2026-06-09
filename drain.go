@@ -415,11 +415,11 @@ func (m *sqliteMirror) applyMutation(tx *sql.Tx, payload []byte) error {
 			return err
 		}
 		body = body[n:]
-		if len(body) < 1 {
+		if len(body) < 2 {
 			return fmt.Errorf("%w: update missing nsets", ErrWALCorrupt)
 		}
-		nsets := int(body[0])
-		body = body[1:]
+		nsets := int(binary.LittleEndian.Uint16(body[0:2]))
+		body = body[2:]
 		var set strings.Builder
 		args := make([]any, 0, nsets+1)
 		for i := 0; i < nsets; i++ {

@@ -2,7 +2,7 @@
 
 **Status:** M1–M6 implemented (store, SQL, WAL durability, UUIDv7 PK, partitioning, runtime catalog + `CREATE`/`DROP TABLE`, single-table transactions); M7–M8 open. See *Implementation status* for what is running vs designed.  
 **Module:** `github.com/VeloxCoding/hazedb`  
-**Updated:** 2026-06-01 (rev. 28 — documented composite `ORDERED INDEX (a, b)` as shipped: prefix equality, `WHERE a=? ORDER BY b` walk, and composite-leading join probing; removed composite from the deferred list)
+**Updated:** 2026-06-09 (rev. 29 — UPDATE WAL `nsets` widened u8 → u16: a single UPDATE setting >255 columns wrapped the SET-count byte, diverging replay/mirror from RAM; now matches INSERT's `numCols` and the per-cell `col_ordinal`)
 
 ---
 
@@ -229,7 +229,7 @@ Envelope: magic:2 | type:1 | version:1 | length:4 | payload:length | crc32c:4
 
 MUTATION payload:   op:1 | tableID:2 | op-body
   INSERT op-body:   row            (numCols:2, then a typed cell per column)
-  UPDATE op-body:   pk-cell | nsets:1 | (col_ordinal:2 | typed cell) × nsets
+  UPDATE op-body:   pk-cell | nsets:2 | (col_ordinal:2 | typed cell) × nsets
   DELETE op-body:   pk-cell
 TXN payload:        stmt_count:4 | MUTATION-payload × stmt_count
 CHECKPOINT payload: snapshot_path_len:2 | snapshot_path | lsn:8

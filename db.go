@@ -612,17 +612,17 @@ func (db *DB) applyMutation(rt *tableRT, op uint8, body []byte) error {
 		}
 		return rt.insert(row)
 	case opUpdate:
-		// op-body: pk-cell | nsets:1 | (ordinal:2 | cell) × nsets.
+		// op-body: pk-cell | nsets:2 | (ordinal:2 | cell) × nsets.
 		pk, n, err := decodeCell(body)
 		if err != nil {
 			return err
 		}
 		body = body[n:]
-		if len(body) < 1 {
+		if len(body) < 2 {
 			return fmt.Errorf("%w: update missing nsets", ErrWALCorrupt)
 		}
-		nsets := int(body[0])
-		body = body[1:]
+		nsets := int(binary.LittleEndian.Uint16(body[0:2]))
+		body = body[2:]
 		ords := make([]int, nsets)
 		vals := make([]Value, nsets)
 		for i := 0; i < nsets; i++ {
