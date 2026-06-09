@@ -176,7 +176,7 @@ func (db *DB) QueryEach(sql string, args []Value, visit func(cols []string, row 
 		return err
 	}
 	if _, ok := pl.st.(*selectStmt); !ok {
-		return fmt.Errorf("fastsql: QueryEach used with non-SELECT — use Exec instead")
+		return fmt.Errorf("hazedb: QueryEach used with non-SELECT — use Exec instead")
 	}
 	cols := pl.colNames
 	_, err = db.selectEach(pl, args, func(row Row) bool { return visit(cols, row) })
@@ -205,7 +205,7 @@ func (db *DB) QueryJSONInto(dst []byte, sql string, args ...Value) ([]string, []
 		return nil, nil, err
 	}
 	if _, ok := pl.st.(*selectStmt); !ok {
-		return nil, nil, fmt.Errorf("fastsql: QueryJSONInto used with non-SELECT — use Exec instead")
+		return nil, nil, fmt.Errorf("hazedb: QueryJSONInto used with non-SELECT — use Exec instead")
 	}
 	cols := pl.colNames
 	prefix := pl.colJSONPrefix

@@ -256,7 +256,7 @@ func (db *DB) execPlan(pl *plan, args []any) (int, error) {
 	case *deleteStmt:
 		return db.execDelete(pl, vargs)
 	}
-	return 0, fmt.Errorf("fastsql: Exec used with SELECT — use Query instead")
+	return 0, fmt.Errorf("hazedb: Exec used with SELECT — use Query instead")
 }
 
 // execPlanValues is execPlan for pre-typed args: it clones each arg with
@@ -288,7 +288,7 @@ func (db *DB) execPlanValues(pl *plan, args []Value) (int, error) {
 	case *deleteStmt:
 		return db.execDelete(pl, vargs)
 	}
-	return 0, fmt.Errorf("fastsql: ExecValues used with SELECT — use Query instead")
+	return 0, fmt.Errorf("hazedb: ExecValues used with SELECT — use Query instead")
 }
 
 // Query runs a SELECT. Returns the column names (in projection order)
@@ -305,7 +305,7 @@ func (db *DB) Query(sql string, args ...any) ([]string, []Row, error) {
 // queryPlan runs a SELECT plan against raw args. Shared by Query and *Stmt.Query.
 func (db *DB) queryPlan(pl *plan, args []any) ([]string, []Row, error) {
 	if _, ok := pl.st.(*selectStmt); !ok {
-		return nil, nil, fmt.Errorf("fastsql: Query used with non-SELECT — use Exec instead")
+		return nil, nil, fmt.Errorf("hazedb: Query used with non-SELECT — use Exec instead")
 	}
 	if pl.pkLookup {
 		keyVal, err := evalLitOrParamAny(pl.pkSource, args)
@@ -340,7 +340,7 @@ func (db *DB) QueryRow(sql string, args ...any) ([]string, Row, error) {
 // QueryRow and *Stmt.QueryRow.
 func (db *DB) queryRowPlan(pl *plan, args []any) ([]string, Row, error) {
 	if _, ok := pl.st.(*selectStmt); !ok {
-		return nil, nil, fmt.Errorf("fastsql: QueryRow used with non-SELECT — use Exec instead")
+		return nil, nil, fmt.Errorf("hazedb: QueryRow used with non-SELECT — use Exec instead")
 	}
 	if pl.pkLookup {
 		keyVal, err := evalLitOrParamAny(pl.pkSource, args)
@@ -373,7 +373,7 @@ func (db *DB) QueryValues(sql string, args ...Value) ([]string, []Row, error) {
 		return nil, nil, err
 	}
 	if _, ok := pl.st.(*selectStmt); !ok {
-		return nil, nil, fmt.Errorf("fastsql: Query used with non-SELECT — use Exec instead")
+		return nil, nil, fmt.Errorf("hazedb: Query used with non-SELECT — use Exec instead")
 	}
 	if pl.pkLookup {
 		keyVal, err := evalLitOrParamValue(pl.pkSource, args)
@@ -471,7 +471,7 @@ func (db *DB) QueryRowValues(sql string, args ...Value) ([]string, Row, error) {
 		return nil, nil, err
 	}
 	if _, ok := pl.st.(*selectStmt); !ok {
-		return nil, nil, fmt.Errorf("fastsql: QueryRow used with non-SELECT — use Exec instead")
+		return nil, nil, fmt.Errorf("hazedb: QueryRow used with non-SELECT — use Exec instead")
 	}
 	if pl.pkLookup {
 		keyVal, err := evalLitOrParamValue(pl.pkSource, args)

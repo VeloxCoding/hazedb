@@ -17,7 +17,7 @@ import (
 // measure SELECT * WHERE pk = ?, which is the SQL-engine equivalent.
 //
 // Run as a test (not a bench) so output renders normally.
-// `go test -run TestMixedWorkloadLatency -v ./fastsql/...`
+// `go test -run TestMixedWorkloadLatency -v .`
 func TestMixedWorkloadLatency(t *testing.T) {
 	if testing.Short() {
 		t.Skip("mixed workload test takes ~3s")
