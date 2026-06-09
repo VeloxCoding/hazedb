@@ -297,3 +297,35 @@ func BenchmarkOrderByNoLimitWide(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkWALReplay: reopen a WAL-backed DB with 20k journaled inserts; each
+// iteration replays the whole WAL. scanRecords now reuses one grow-only read
+// buffer instead of allocating per record.
+func BenchmarkWALReplay(b *testing.B) {
+	const nrow = 20000
+	path := filepath.Join(b.TempDir(), "replay.wal")
+	db, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE TABLE r (id uuid primary key, name text, n int)"); err != nil {
+		b.Fatal(err)
+	}
+	for i := 0; i < nrow; i++ {
+		if _, err := db.Exec("INSERT INTO r (id, name, n) VALUES (?, ?, ?)", NewUUIDv7(), "x", int64(i)); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for k := 0; k < b.N; k++ {
+		d, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+		if err != nil {
+			b.Fatal(err)
+		}
+		d.Close()
+	}
+}

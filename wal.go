@@ -367,6 +367,7 @@ func scanRecords(f *os.File, apply func(recType uint8, payload []byte) error) er
 	fileSize := fi.Size()
 	var pos int64
 	var hdr [8]byte
+	var buf []byte // grown once, reused per record — decoders copy what they keep
 	for {
 		_, err := io.ReadFull(f, hdr[:])
 		if err == io.EOF {
@@ -396,7 +397,12 @@ func scanRecords(f *os.File, apply func(recType uint8, payload []byte) error) er
 		if int64(length)+4 > fileSize-pos {
 			return nil
 		}
-		buf := make([]byte, length+4)
+		need := int(length) + 4
+		if cap(buf) < need {
+			buf = make([]byte, need)
+		} else {
+			buf = buf[:need]
+		}
 		if _, err := io.ReadFull(f, buf); err != nil {
 			if err == io.ErrUnexpectedEOF {
 				return nil // truncated payload at tail — tolerated
