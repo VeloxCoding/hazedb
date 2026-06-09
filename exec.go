@@ -2,7 +2,7 @@ package hazedb
 
 import (
 	"fmt"
-	"sort"
+	"slices"
 )
 
 // assignParamIndices walks the AST and replaces every paramRef.index
@@ -1215,7 +1215,15 @@ func (tbl *tableRT) buildDirtyCands(match func(Row) bool, keyFn func(Row) indexK
 			dc = append(dc, dcand{keyFn(r), r})
 		}
 	}
-	sort.Slice(dc, func(i, j int) bool { return dc[i].key.less(dc[j].key) })
+	slices.SortFunc(dc, func(a, b dcand) int {
+		if a.key.less(b.key) {
+			return -1
+		}
+		if b.key.less(a.key) {
+			return 1
+		}
+		return 0
+	})
 	return dc, dirtySet
 }
 
@@ -1712,15 +1720,15 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 // sortRowsByCol stable-sorts rows by column ord (ascending, or descending when
 // desc). Incomparable cells (NULL) sort as "not less".
 func sortRowsByCol(rows []Row, ord int, desc bool) {
-	sort.SliceStable(rows, func(i, j int) bool {
-		c, ok := rows[i][ord].Compare(rows[j][ord])
+	slices.SortStableFunc(rows, func(a, b Row) int {
+		c, ok := a[ord].Compare(b[ord])
 		if !ok {
-			return false
+			return 0 // incomparable (NULL): equal → stable order preserved
 		}
 		if desc {
-			return c > 0
+			return -c
 		}
-		return c < 0
+		return c
 	})
 }
 
@@ -1827,15 +1835,15 @@ func (t *topN) offer(r Row) {
 // sorted returns the kept rows in ORDER BY order (already projected). It sorts by
 // the captured key, stably, so ties keep heap order (arbitrary but deterministic).
 func (t *topN) sorted() []Row {
-	sort.SliceStable(t.h, func(i, j int) bool {
-		c, ok := t.h[i].key.Compare(t.h[j].key)
+	slices.SortStableFunc(t.h, func(a, b topEntry) int {
+		c, ok := a.key.Compare(b.key)
 		if !ok {
-			return false
+			return 0 // incomparable (NULL): equal → stable heap order preserved
 		}
 		if t.desc {
-			return c > 0
+			return -c
 		}
-		return c < 0
+		return c
 	})
 	out := make([]Row, len(t.h))
 	for i := range t.h {

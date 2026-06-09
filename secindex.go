@@ -2,6 +2,7 @@ package hazedb
 
 import (
 	"bytes"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -79,8 +80,6 @@ type ordEntry struct {
 	key indexKey
 	pk  UUID
 }
-
-func uuidLess(a, b UUID) bool { return bytes.Compare(a[:], b[:]) < 0 }
 
 // secIndex is one secondary index: a forward map value->PKs and a reverse map
 // PK->current key, so a change can drop the stale forward entry without the
@@ -162,17 +161,22 @@ func (si *secIndex) apply(pk UUID, newKey indexKey, indexable bool) {
 	si.mu.Unlock()
 }
 
-// ordLess is the total order on the sorted view: by key, then PK as a stable
-// tie-break among equal keys. Shared by the full rebuild and the incremental merge.
-func ordLess(a, b ordEntry) bool {
+// ordCmp is the total order on the sorted view: by key, then PK as a stable
+// tie-break among equal keys. Returns <0/0/>0 for slices.SortFunc (which uses a
+// generic swapper — no reflect, unlike sort.Slice). Shared by the full rebuild
+// and the incremental merge.
+func ordCmp(a, b ordEntry) int {
 	if a.key.less(b.key) {
-		return true
+		return -1
 	}
 	if b.key.less(a.key) {
-		return false
+		return 1
 	}
-	return uuidLess(a.pk, b.pk)
+	return bytes.Compare(a.pk[:], b.pk[:])
 }
+
+// ordLess is ordCmp as a bool, for the merge's 2-way comparisons.
+func ordLess(a, b ordEntry) bool { return ordCmp(a, b) < 0 }
 
 // rebuildSorted regenerates the whole sorted view from rev — O(n log n). Used for
 // the cold build (after WAL replay / rebuildIndexes), where there is no prior
@@ -184,7 +188,7 @@ func (si *secIndex) rebuildSorted() {
 	for pk, key := range si.rev {
 		s = append(s, ordEntry{key: key, pk: pk})
 	}
-	sort.Slice(s, func(i, j int) bool { return ordLess(s[i], s[j]) })
+	slices.SortFunc(s, ordCmp)
 	si.sorted = s
 	si.mu.Unlock()
 }
@@ -213,7 +217,7 @@ func (si *secIndex) mergeSorted(dirtyPKs []UUID) {
 			add = append(add, ordEntry{key: key, pk: pk})
 		}
 	}
-	sort.Slice(add, func(i, j int) bool { return ordLess(add[i], add[j]) })
+	slices.SortFunc(add, ordCmp)
 
 	old := si.sorted
 	out := make([]ordEntry, 0, len(old)+len(add))
