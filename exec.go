@@ -760,6 +760,21 @@ func (t *table) offerLiveRow(pk UUID, pred func(Row) bool, top *topN) {
 	s.mu.RUnlock()
 }
 
+// collectLiveRow is offerLiveRow's unbounded form (ORDER BY without LIMIT): under
+// the shard read lock it fetches pk's live row, checks pred, and on a pass
+// collects its (order key + projection) into top — capturing only those, never a
+// full-row clone to narrow again later.
+func (t *table) collectLiveRow(pk UUID, pred func(Row) bool, top *topN) {
+	s := t.shardOf(pk)
+	s.mu.RLock()
+	if rowID, ok := s.pk[pk]; ok {
+		if r := s.rows[rowID]; r != nil && pred(r) {
+			top.collect(r)
+		}
+	}
+	s.mu.RUnlock()
+}
+
 // getMatchProject fetches pk's live row, evaluates pred (the full WHERE) on it
 // UNDER the shard read lock, and on a pass returns the projection: the ords
 // columns cloned, or the whole row for SELECT *. Folding the WHERE check into the
@@ -992,18 +1007,15 @@ func (db *DB) execCandidates(pl *plan, ctx *evalCtx, cand idxCandidateSet) ([]st
 			})
 			return colNames, sliceOffsetLimit(top.sorted(), st.offset, st.limit), nil
 		}
-		// ORDER BY without LIMIT: gather every match, then sort (OFFSET drops the
-		// leading rows).
-		var matched []Row
+		// ORDER BY without LIMIT: capture only (order key + projection) per match
+		// under the shard lock, then sort by the captured key (OFFSET drops the
+		// leading rows). No full-row clone, no second projection pass.
+		top := topN{ord: pl.orderOrdinal, desc: st.orderDesc, proj: projOrNil(st.starAll, pl.projOrdinals)}
 		cand.emit(func(pk UUID) bool {
-			if r, ok := tbl.getByPK(pk); ok && pred(r) {
-				matched = append(matched, r)
-			}
+			tbl.collectLiveRow(pk, pred, &top)
 			return false
 		})
-		sortRowsByCol(matched, pl.orderOrdinal, st.orderDesc)
-		kept := sliceOffsetLimit(matched, st.offset, st.limit)
-		return colNames, projectRows(kept, st.starAll, pl.projOrdinals), nil
+		return colNames, sliceOffsetLimit(top.sorted(), st.offset, st.limit), nil
 	}
 
 	// No ORDER BY: project and stop once offset+limit rows are collected. Pack
@@ -1699,22 +1711,19 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 		return colNames, sliceOffsetLimit(top.sorted(), st.offset, st.limit), nil
 	}
 
-	// ORDER BY without LIMIT: gather all matches (full clone under the lock, so the
-	// order column is present for the sort), sort, then project. No-ORDER-BY scans
-	// took the packed path above.
-	var matched []Row
+	// ORDER BY without LIMIT: capture only (order key + projection) per match —
+	// the packed form topN keeps — instead of a full-row clone we'd narrow again.
+	// For a wide table with a narrow projection that drops the per-match copy from
+	// the whole row to the projected cells, and removes the second projection pass.
+	// (orderOrdinal >= 0 here: the no-ORDER-BY case returned via the packed path above.)
+	top := topN{ord: pl.orderOrdinal, desc: st.orderDesc, proj: projOrNil(st.starAll, pl.projOrdinals)}
 	scan(func(r Row) bool {
-		if !match(r) {
-			return true
+		if match(r) {
+			top.collect(r)
 		}
-		matched = append(matched, r.Clone())
 		return true
 	})
-	if pl.orderOrdinal >= 0 {
-		sortRowsByCol(matched, pl.orderOrdinal, st.orderDesc)
-	}
-	matched = sliceOffsetLimit(matched, st.offset, st.limit)
-	return colNames, projectRows(matched, st.starAll, pl.projOrdinals), nil
+	return colNames, sliceOffsetLimit(top.sorted(), st.offset, st.limit), nil
 }
 
 // sortRowsByCol stable-sorts rows by column ord (ascending, or descending when
@@ -1830,6 +1839,13 @@ func (t *topN) offer(r Row) {
 		t.h[i], t.h[worst] = t.h[worst], t.h[i]
 		i = worst
 	}
+}
+
+// collect appends r's kept form (captured order key + projection) with no
+// bounded-heap eviction — the ORDER BY without LIMIT case, where every match is
+// kept and the final order comes from sorted(), not the heap.
+func (t *topN) collect(r Row) {
+	t.h = append(t.h, topEntry{cloneValue(r[t.ord]), t.take(r)})
 }
 
 // sorted returns the kept rows in ORDER BY order (already projected). It sorts by

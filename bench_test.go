@@ -252,3 +252,48 @@ func BenchmarkRoundtripSelectByPK(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkOrderByNoLimitWide: SELECT one column ORDER BY another over a wide
+// table, no LIMIT — the case where capturing (key + projection) per match beats
+// cloning the whole row and narrowing it afterwards. The win scales with table
+// width (here 40 columns, projecting 1).
+func BenchmarkOrderByNoLimitWide(b *testing.B) {
+	const ncol, nrow = 40, 2000
+	db, err := Open(Options{Schema: Schema{}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	create := "CREATE TABLE w (id uuid primary key, ord int"
+	insCols := "INSERT INTO w (id, ord"
+	insVals := ") VALUES (?, ?"
+	for i := 0; i < ncol; i++ {
+		create += fmt.Sprintf(", c%d int", i)
+		insCols += fmt.Sprintf(", c%d", i)
+		insVals += ", ?"
+	}
+	create += ")"
+	insVals += ")"
+	if _, err := db.Exec(create); err != nil {
+		b.Fatal(err)
+	}
+	insSQL := insCols + insVals
+	for r := 0; r < nrow; r++ {
+		args := make([]any, 0, ncol+2)
+		args = append(args, NewUUIDv7(), int64((r*7)%nrow))
+		for i := 0; i < ncol; i++ {
+			args = append(args, int64(i))
+		}
+		if _, err := db.Exec(insSQL, args...); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for k := 0; k < b.N; k++ {
+		_, rows, err := db.Query("SELECT c0 FROM w ORDER BY ord")
+		if err != nil || len(rows) != nrow {
+			b.Fatalf("rows=%d err=%v", len(rows), err)
+		}
+	}
+}
