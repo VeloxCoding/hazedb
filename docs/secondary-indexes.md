@@ -145,12 +145,14 @@ so a clean shutdown leaves no lag. Each cycle, per shard:
    `apply` to each index (hash: into `fwd`; ordered: into `rev`). Re-reading the
    live row makes duplicate PKs in the batch naturally idempotent — no explicit
    coalescing pass.
-3. After every shard's batch is applied, rebuild each ordered index's sorted
-   view from `rev`, then re-lock each shard and **drop the processed prefix**
-   (`dirty = dirty[n:]`), leaving entries appended during the merge for next time.
+3. After every shard's batch is applied, fold the batch's changed PKs into each
+   ordered index's sorted view (incremental `mergeSorted` — sort only the dirty
+   entries, 2-way-merge them into the existing sorted slice), then re-lock each
+   shard and **drop the processed prefix** (`dirty = dirty[n:]`), leaving entries
+   appended during the merge for next time.
 
 **No-gap rule.** A dirty PK is dropped only *after* its effect is in the index
-(and the ordered sorted view rebuilt). Applying before dropping guarantees a
+(and folded into the ordered sorted view). Applying before dropping guarantees a
 concurrent reader sees the row via the dirty overlay until the moment it is in
 the index — never in the gap between the two.
 
@@ -296,6 +298,11 @@ into the same async-merge + dirty-overlay model:
   SQLite. See [php-sql-layer.md](php-sql-layer.md).
 
 Open: range predicates (`col > ?`) on an ordered index reuse the same sorted
-view (seek + walk) — not yet wired. Maintenance currently rebuilds the sorted
-slice per merge (O(n log n)); a write-heavy large table may want incremental
-maintenance (skiplist/btree) — measure before adding.
+view (seek + walk) — not yet wired. Merge maintenance is incremental
+(`mergeSorted`): it sorts only the dirty entries and 2-way-merges them into the
+existing sorted slice, O(n + d log d) per merge instead of a full O(n log n)
+re-sort — folding 10 dirty rows into a 100k-entry index runs ~11.6× faster. The
+cold build after WAL replay still uses the full `rebuildSorted`. Still open: the
+fold allocates a fresh n-entry slice each merge (kept fresh so the old one stays
+valid for lock-free readers); eliminating that churn needs a reader-reclamation
+scheme (double-buffer/epoch) — measure before adding.

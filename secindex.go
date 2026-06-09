@@ -162,27 +162,82 @@ func (si *secIndex) apply(pk UUID, newKey indexKey, indexable bool) {
 	si.mu.Unlock()
 }
 
-// rebuildSorted regenerates the sorted view from rev. The merger calls it once
-// after applying a batch (and recovery after a full scan), before dropping the
-// dirty entries, so a reader sees a row via the dirty overlay until it is in the
-// sorted view (no gap). Ordered indexes only. O(n log n).
+// ordLess is the total order on the sorted view: by key, then PK as a stable
+// tie-break among equal keys. Shared by the full rebuild and the incremental merge.
+func ordLess(a, b ordEntry) bool {
+	if a.key.less(b.key) {
+		return true
+	}
+	if b.key.less(a.key) {
+		return false
+	}
+	return uuidLess(a.pk, b.pk)
+}
+
+// rebuildSorted regenerates the whole sorted view from rev — O(n log n). Used for
+// the cold build (after WAL replay / rebuildIndexes), where there is no prior
+// sorted view to fold into. The per-merge hot path uses mergeSorted instead.
+// Ordered indexes only.
 func (si *secIndex) rebuildSorted() {
 	si.mu.Lock()
 	s := make([]ordEntry, 0, len(si.rev))
 	for pk, key := range si.rev {
 		s = append(s, ordEntry{key: key, pk: pk})
 	}
-	sort.Slice(s, func(i, j int) bool {
-		if s[i].key.less(s[j].key) {
-			return true
-		}
-		if s[j].key.less(s[i].key) {
-			return false
-		}
-		return uuidLess(s[i].pk, s[j].pk) // stable tie-break among equal keys
-	})
+	sort.Slice(s, func(i, j int) bool { return ordLess(s[i], s[j]) })
 	si.sorted = s
 	si.mu.Unlock()
+}
+
+// mergeSorted folds a merge batch's changed PKs into the sorted view
+// incrementally: it sorts only the (≤ d) changed entries and 2-way-merges them
+// with the existing sorted slice, skipping every old entry whose PK changed — an
+// update repositions it (old skipped, new in add), a delete drops it (skipped,
+// absent from rev → not in add), an insert has no old entry. O(n + d log d) vs
+// rebuildSorted's O(n log n) — the win for a write-heavy large ordered index
+// whose merges each touch few rows. A FRESH slice is allocated, so the old one
+// stays valid for lock-free in-flight readers (snapshot semantics unchanged).
+// dirtyPKs is the set of PKs applied this merge; duplicates are tolerated.
+func (si *secIndex) mergeSorted(dirtyPKs []UUID) {
+	si.mu.Lock()
+	defer si.mu.Unlock()
+	dirty := make(map[UUID]struct{}, len(dirtyPKs))
+	for _, pk := range dirtyPKs {
+		dirty[pk] = struct{}{}
+	}
+	// add: the changed PKs still live, at their current key, sorted. Iterating the
+	// dedup set (not dirtyPKs) means a PK touched twice yields at most one entry.
+	add := make([]ordEntry, 0, len(dirty))
+	for pk := range dirty {
+		if key, ok := si.rev[pk]; ok {
+			add = append(add, ordEntry{key: key, pk: pk})
+		}
+	}
+	sort.Slice(add, func(i, j int) bool { return ordLess(add[i], add[j]) })
+
+	old := si.sorted
+	out := make([]ordEntry, 0, len(old)+len(add))
+	i, j := 0, 0
+	for i < len(old) && j < len(add) {
+		if _, changed := dirty[old[i].pk]; changed {
+			i++ // superseded or removed; the live version (if any) is in add
+			continue
+		}
+		if ordLess(old[i], add[j]) {
+			out = append(out, old[i])
+			i++
+		} else {
+			out = append(out, add[j])
+			j++
+		}
+	}
+	for ; i < len(old); i++ {
+		if _, changed := dirty[old[i].pk]; !changed {
+			out = append(out, old[i])
+		}
+	}
+	out = append(out, add[j:]...)
+	si.sorted = out
 }
 
 // removeFwdLocked drops pk from k's bucket (swap-remove; order is irrelevant),
@@ -553,6 +608,7 @@ func (t *table) mergeIndexes() {
 		nr, nd int
 	}
 	var drops []pending
+	var dirtyPKs []UUID // every PK applied this merge, for the incremental sorted-view fold
 	for i := range t.shards {
 		s := &t.shards[i]
 		s.mu.RLock()
@@ -583,15 +639,18 @@ func (t *table) mergeIndexes() {
 				si.apply(pk, key, indexable)
 			}
 		}
+		dirtyPKs = append(dirtyPKs, batch...)
 		drops = append(drops, pending{s, nr, nd})
 	}
 	if len(drops) == 0 {
 		return
 	}
-	// Rebuild ordered indexes' sorted view from rev BEFORE dropping dirty.
+	// Fold ordered indexes' changed PKs into the sorted view BEFORE dropping
+	// dirty, so a reader sees a row via the dirty overlay until it lands in the
+	// sorted view (no gap). Incremental: O(n + d log d), not a full re-sort.
 	for _, si := range t.indexes {
 		if si.ordered {
-			si.rebuildSorted()
+			si.mergeSorted(dirtyPKs)
 		}
 	}
 	for _, d := range drops {

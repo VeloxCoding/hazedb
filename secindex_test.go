@@ -919,3 +919,103 @@ func TestOrderedIndexUUIDBoundary(t *testing.T) {
 		}
 	}
 }
+
+// refSorted builds the sorted view a full rebuildSorted would produce from rev —
+// the reference the incremental mergeSorted must always match.
+func refSorted(si *secIndex) []ordEntry {
+	s := make([]ordEntry, 0, len(si.rev))
+	for pk, k := range si.rev {
+		s = append(s, ordEntry{key: k, pk: pk})
+	}
+	sort.Slice(s, func(i, j int) bool { return ordLess(s[i], s[j]) })
+	return s
+}
+
+// sameOrd reports whether two sorted views are element-wise equal (key via the
+// total order's neither-less test, PK by value).
+func sameOrd(a, b []ordEntry) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].pk != b[i].pk || a[i].key.less(b[i].key) || b[i].key.less(a[i].key) {
+			return false
+		}
+	}
+	return true
+}
+
+// TestMergeSortedEqualsFullRebuild is the differential test for the incremental
+// sorted-view fold: across 500 rounds of random insert/update/delete batches,
+// the incremental mergeSorted result must equal a full rebuild of rev every
+// time. Exercises repositioning (update to a new key), removal (delete), fresh
+// inserts, no-op updates (same key), delete-of-absent, and PKs touched twice in
+// one batch. Deterministic inline PRNG so a failure is reproducible.
+func TestMergeSortedEqualsFullRebuild(t *testing.T) {
+	seed := uint64(0x9e3779b97f4a7c15)
+	next := func(n int) int {
+		seed ^= seed << 13
+		seed ^= seed >> 7
+		seed ^= seed << 17
+		return int(seed % uint64(n))
+	}
+	si := &secIndex{ordered: true, ordinals: []int{0}, rev: map[UUID]indexKey{}}
+	const npk = 64
+	pool := make([]UUID, npk)
+	for i := range pool {
+		pool[i] = tid(i)
+	}
+	for round := 0; round < 500; round++ {
+		var dirty []UUID
+		for ops := next(12) + 1; ops > 0; ops-- {
+			pk := pool[next(npk)]
+			if next(4) == 0 {
+				si.apply(pk, indexKey{}, false) // delete
+			} else {
+				si.apply(pk, keyOf(Int(int64(next(20)))), true) // insert/update to a random key
+			}
+			dirty = append(dirty, pk)
+		}
+		si.mergeSorted(dirty)
+		if !sameOrd(si.sorted, refSorted(si)) {
+			t.Fatalf("round %d: incremental mergeSorted diverged from full rebuild (got %d entries, want %d)",
+				round, len(si.sorted), len(refSorted(si)))
+		}
+	}
+	// Sanity: the view is non-trivial (not everything got deleted to nothing).
+	if len(si.sorted) == 0 {
+		t.Fatal("expected a populated sorted view after the run")
+	}
+}
+
+// benchSortedFold builds an n-entry ordered index, then per iteration updates d
+// existing rows and folds them into the sorted view — incrementally (mergeSorted)
+// or via a full re-sort (rebuildSorted). The merge per tick touches few rows, the
+// realistic write-heavy-large-table shape.
+func benchSortedFold(b *testing.B, n int, incremental bool) {
+	const d = 10
+	si := &secIndex{ordered: true, ordinals: []int{0}, rev: make(map[UUID]indexKey, n)}
+	for i := 0; i < n; i++ {
+		si.rev[tid(i)] = keyOf(Int(int64(i)))
+	}
+	si.rebuildSorted()
+	dirty := make([]UUID, d)
+	for i := range dirty {
+		dirty[i] = tid(i)
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for k := 0; k < b.N; k++ {
+		for i := 0; i < d; i++ {
+			si.rev[dirty[i]] = keyOf(Int(int64(n + k*d + i))) // reposition the d rows
+		}
+		if incremental {
+			si.mergeSorted(dirty)
+		} else {
+			si.rebuildSorted()
+		}
+	}
+}
+
+func BenchmarkSortedFold_Incremental_100k(b *testing.B) { benchSortedFold(b, 100_000, true) }
+func BenchmarkSortedFold_FullRebuild_100k(b *testing.B) { benchSortedFold(b, 100_000, false) }
