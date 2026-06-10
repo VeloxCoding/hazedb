@@ -197,6 +197,39 @@ func BenchmarkParseOnly(b *testing.B) {
 	}
 }
 
+// BenchmarkInsertWideSparse: insert into a wide table providing only 2 of 62
+// columns (the rest nullable + omitted). Isolates the per-insert work that
+// scales with total column count — the Null() prefill and the NOT-NULL sweep
+// over every column — both of which the plan-time insert template removes.
+func BenchmarkInsertWideSparse(b *testing.B) {
+	const ncol = 60
+	db, err := Open(Options{Schema: Schema{}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	create := "CREATE TABLE w (id uuid primary key, c0 int"
+	for i := 1; i < ncol; i++ {
+		create += fmt.Sprintf(", c%d int null", i)
+	}
+	create += ")"
+	if _, err := db.Exec(create); err != nil {
+		b.Fatal(err)
+	}
+	pl, err := db.prepare("INSERT INTO w (id, c0) VALUES (?, ?)", db.cat.Load())
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		args := []Value{UUIDVal(tid(i)), Int(int64(i))}
+		if _, err := db.execInsert(pl, args); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // String formatting overhead reference. Compare against BenchmarkInsert
 // to gauge how much of the per-call cost is parser+plan vs storage.
 func BenchmarkInsertViaStmtNoSQL(b *testing.B) {

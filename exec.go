@@ -49,6 +49,22 @@ func assignParamIndices(st stmt) {
 	}
 }
 
+// insCell is one compiled INSERT VALUES entry. The three shapes are
+// distinguished by arg: a param reads args[arg] at exec; a literal (arg ==
+// insCellLit) is pre-validated and pre-coerced into lit at plan time; anything
+// else (arg == insCellExpr, e.g. ? + 1) falls back to evalExpr on expr.
+type insCell struct {
+	ord  int   // target column ordinal
+	arg  int   // >=0: param index; insCellLit: literal; insCellExpr: expr
+	lit  Value // arg == insCellLit: pre-validated, pre-coerced literal
+	expr expr  // arg == insCellExpr: fallback expression
+}
+
+const (
+	insCellLit  = -1
+	insCellExpr = -2
+)
+
 // plan resolves table/column names and validates them. Produces a
 // minimal plan with the resolved table pointer + column ordinals
 // baked in, so the runtime path does no map lookups.
@@ -75,6 +91,11 @@ type plan struct {
 	orderOrdinal int
 	// INSERT column ordinals matching the values list.
 	insertOrdinals []int
+	// insertTmpl is the compiled INSERT VALUES list, one cell per provided
+	// column. Built once at plan time so buildInsertRow skips per-cell evalExpr
+	// dispatch for params and skips eval+validate entirely for literals.
+	// Read-only and shared across concurrent callers (like colNames).
+	insertTmpl []insCell
 	// UPDATE SET column ordinals matching the sets list.
 	updateOrdinals []int
 	// setRowDependent is true when any SET right-hand side references a
@@ -255,12 +276,47 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 		}
 	case *insertStmt:
 		pl.insertOrdinals = make([]int, 0, len(s.cols))
-		for _, c := range s.cols {
+		pl.insertTmpl = make([]insCell, len(s.cols))
+		provided := make([]bool, len(rt.def.Columns))
+		for i, c := range s.cols {
 			ord, ok := rt.colByName[c]
 			if !ok {
 				return nil, fmt.Errorf("%w: %q.%q (INSERT)", ErrUnknownColumn, tname, c)
 			}
 			pl.insertOrdinals = append(pl.insertOrdinals, ord)
+			provided[ord] = true
+			col := rt.def.Columns[ord]
+			cell := insCell{ord: ord, arg: insCellExpr, expr: s.vals[i]}
+			switch v := s.vals[i].(type) {
+			case *paramRef:
+				cell.arg, cell.expr = v.index, nil
+			case *litValue:
+				// Literals are constant, so validate + coerce them once here
+				// instead of on every insert.
+				lv := v.v
+				if col.Type == TypeUUID && lv.Kind == KindString {
+					u, perr := ParseUUID(lv.Str())
+					if perr != nil {
+						return nil, perr
+					}
+					lv = UUIDVal(u)
+				}
+				if err := validateValue(col, lv); err != nil {
+					return nil, err
+				}
+				cell.arg, cell.lit, cell.expr = insCellLit, lv, nil
+			}
+			pl.insertTmpl[i] = cell
+		}
+		// NOT NULL on omitted columns is a property of the statement, not the
+		// args: a non-nullable column left out of the list can never be filled,
+		// so reject the plan now rather than on every insert. The PK is exempt —
+		// it is auto-generated when omitted.
+		for ord := range rt.def.Columns {
+			c := rt.def.Columns[ord]
+			if !provided[ord] && ord != rt.pkOrdinal && !c.Nullable {
+				return nil, fmt.Errorf("column %q is NOT NULL", c.Name)
+			}
 		}
 	case *updateStmt:
 		pl.updateOrdinals = make([]int, 0, len(s.sets))
@@ -1876,27 +1932,48 @@ func projOrNil(starAll bool, ords []int) []int {
 	return ords
 }
 
-// buildInsertRow materialises the full row for an INSERT plan: evaluates each
-// supplied value (with API-boundary string→UUID coercion), validates it,
-// auto-generates the PK when omitted, and enforces NOT NULL. The resolved row
-// is what both the single-statement path and the transaction path journal, so
-// replay reproduces the exact same row (including any auto-generated UUID).
+// buildInsertRow materialises the full row from the plan-time insert template
+// (pl.insertTmpl): copies params from args (with API-boundary string→UUID
+// coercion + validation), drops pre-validated literals straight in, and
+// auto-generates the PK when omitted. Omitted columns stay zero, which is
+// KindNull. NOT NULL on omitted columns is enforced at plan time, not here.
+// The resolved row is what both the single-statement path and the transaction
+// path journal, so replay reproduces the exact same row (including any
+// auto-generated UUID).
 func (db *DB) buildInsertRow(pl *plan, args []Value) (Row, error) {
-	st := pl.st.(*insertStmt)
 	tbl := pl.rt
-	row := make(Row, len(tbl.def.def.Columns))
-	for i := range row {
-		row[i] = Null()
-	}
-	ctx := &evalCtx{args: args}
+	cols := tbl.def.def.Columns
+	row := make(Row, len(cols)) // omitted columns stay zero == Null()
 	pkOrd := tbl.def.pkOrdinal
 	pkProvided := false
-	for i, ord := range pl.insertOrdinals {
-		v, err := evalExpr(st.vals[i], ctx)
-		if err != nil {
-			return nil, err
+	// Stack-allocated (never escapes); referenced only by the fallback
+	// expression branch below. Declaring it unconditionally keeps args off the
+	// heap — a lazily-assigned *evalCtx makes escape analysis spill args.
+	ctx := &evalCtx{args: args}
+	for i := range pl.insertTmpl {
+		c := &pl.insertTmpl[i]
+		ord := c.ord
+		if c.arg == insCellLit {
+			row[ord] = c.lit // pre-validated + pre-coerced at plan time
+			if ord == pkOrd {
+				pkProvided = true
+			}
+			continue
 		}
-		col := tbl.def.def.Columns[ord]
+		var v Value
+		if c.arg >= 0 {
+			if c.arg >= len(args) {
+				return nil, fmt.Errorf("%w: param index %d out of range", ErrParamMismatch, c.arg)
+			}
+			v = args[c.arg]
+		} else { // insCellExpr: arithmetic etc., evaluated per insert
+			ev, err := evalExpr(c.expr, ctx)
+			if err != nil {
+				return nil, err
+			}
+			v = ev
+		}
+		col := cols[ord]
 		// API-boundary coercion: a string destined for a UUID column is
 		// parsed into a UUID — storage only ever sees [16]byte.
 		if col.Type == TypeUUID && v.Kind == KindString {
@@ -1918,12 +1995,6 @@ func (db *DB) buildInsertRow(pl *plan, args []Value) (Row, error) {
 	// row before the WAL record is written, so replay reproduces it exactly.
 	if !pkProvided {
 		row[pkOrd] = UUIDVal(NewUUIDv7())
-	}
-	// Check NOT NULL on omitted columns.
-	for ord, c := range tbl.def.def.Columns {
-		if row[ord].IsNull() && !c.Nullable {
-			return nil, fmt.Errorf("column %q is NOT NULL", c.Name)
-		}
 	}
 	return row, nil
 }

@@ -309,6 +309,19 @@ func TestBigSanity(t *testing.T) {
 		if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(9003), nil, 3); err == nil {
 			t.Fatal("NULL into NOT NULL column: want error, got nil")
 		}
+		// Omitting a NOT-NULL column can never be satisfied, so it is rejected
+		// at plan time — fail-fast on both Exec and Prepare, not on first run.
+		if _, err := db.Exec("INSERT INTO users (id, age) VALUES (?, ?)", tid(9005), 5); err == nil {
+			t.Fatal("omit NOT NULL column (Exec): want error, got nil")
+		}
+		if _, err := db.Prepare("INSERT INTO users (id, age) VALUES (?, ?)"); err == nil {
+			t.Fatal("omit NOT NULL column (Prepare): want error, got nil")
+		}
+		// A literal whose type violates its column is validated once at plan
+		// time, so Prepare rejects it before any execution.
+		if _, err := db.Prepare("INSERT INTO users (id, name, age) VALUES (?, 'ok', 'notint')"); err == nil {
+			t.Fatal("bad literal type (Prepare): want error, got nil")
+		}
 		// Duplicate PK.
 		dup := tid(9004)
 		mustExec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", dup, "first", 1)
