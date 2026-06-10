@@ -41,6 +41,21 @@ func BenchmarkInsert_Parallel_Mem(b *testing.B) {
 	})
 }
 
+// BenchmarkInsertAutoPK_Parallel_Mem: concurrent auto-PK inserts (id omitted)
+// all funnel through the single UUIDv7 generator mutex — the contention point
+// the client-PK parallel benchmark never touches.
+func BenchmarkInsertAutoPK_Parallel_Mem(b *testing.B) {
+	db, _ := Open(Options{Schema: benchSchema(), sizeHint: 2 * 1024 * 1024})
+	defer db.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			db.Exec("INSERT INTO users (name, age) VALUES (?, ?)", "name", 7)
+		}
+	})
+}
+
 func BenchmarkInsert_Parallel_WAL(b *testing.B) {
 	dir := b.TempDir()
 	db, _ := Open(Options{Schema: benchSchema(), sizeHint: 2 * 1024 * 1024, WALLevel: WALPeriodic, WALPath: dir + "/bench.wal"})

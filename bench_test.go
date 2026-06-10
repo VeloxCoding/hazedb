@@ -54,6 +54,24 @@ func BenchmarkInsert_Mem(b *testing.B) {
 	}
 }
 
+// BenchmarkInsertAutoPK_Mem: insert with the id omitted, so each row's PK comes
+// from the global UUIDv7 generator (its mutex + periodic crypto/rand refill).
+// The client-PK Insert benchmarks supply tid(i) and bypass that path entirely.
+func BenchmarkInsertAutoPK_Mem(b *testing.B) {
+	db, err := Open(Options{Schema: benchSchema(), sizeHint: b.N})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := db.Exec("INSERT INTO users (name, age) VALUES (?, ?)", "name", i%100); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkInsert_WAL(b *testing.B) {
 	dir := b.TempDir()
 	db, err := Open(Options{Schema: benchSchema(), sizeHint: b.N, WALLevel: WALPeriodic, WALPath: filepath.Join(dir, "b.wal")})

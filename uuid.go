@@ -112,8 +112,14 @@ var uuidGen = newUUIDGenerator()
 // NewUUIDv7 returns a fresh UUIDv7 with within-millisecond monotonicity: IDs
 // from this process sort by creation time, including inside one millisecond,
 // via a 12-bit counter in rand_a (RFC 9562 "fixed-length dedicated counter").
-// Beyond 4096 IDs in a single ms the timestamp is nudged forward to keep the
-// ordering total. Client-supplied UUIDs get no such guarantee.
+// The counter caps at 4096 IDs per ms (≈4.1M auto-PKs/sec); beyond that the
+// timestamp is nudged forward to keep the ordering total, so under sustained
+// bulk-load above that rate the stamp drifts ahead of the wall clock (it
+// self-corrects once the rate drops; uniqueness and ordering always hold).
+//
+// Auto-PK inserts (id omitted) are the only callers, so they alone pay the
+// generator's mutex + periodic crypto/rand refill. Client-supplied UUIDs skip
+// this path entirely — no monotonicity guarantee, but also no serialisation.
 func NewUUIDv7() UUID { return uuidGen.next(time.Now().UnixMilli()) }
 
 type uuidGenerator struct {
@@ -122,13 +128,15 @@ type uuidGenerator struct {
 	counter uint16 // 12-bit, within lastMs
 
 	// Bulk-buffered randomness for rand_b: one crypto/rand read serves many
-	// UUIDs, so the hot path is a copy under the lock, not a syscall.
-	randBuf [504]byte
+	// UUIDs, so the hot path is a copy under the lock, not a syscall. 4080 bytes
+	// = 510 UUIDs per refill, amortising the getrandom syscall 8× further than a
+	// 504-byte (63-UUID) buffer; the cost is held memory, which is negligible.
+	randBuf [4080]byte
 	randPos int
 }
 
 func newUUIDGenerator() *uuidGenerator {
-	return &uuidGenerator{randPos: 504} // force a refill on first use
+	return &uuidGenerator{randPos: 4080} // force a refill on first use
 }
 
 func (g *uuidGenerator) next(ms int64) UUID {
