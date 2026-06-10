@@ -293,6 +293,13 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 		for r, tuple := range s.rows {
 			tmpl := make([]insCell, len(pl.insertOrdinals))
 			for i, ord := range pl.insertOrdinals {
+				// INSERT VALUES has no current row, so a column reference can
+				// never resolve — and evalExpr would index a nil ctx.row and
+				// panic the process. Reject any colRef (bare or inside an
+				// expression like a+1) at plan time.
+				if exprRefsColumn(tuple[i]) {
+					return nil, fmt.Errorf("%w: column reference not allowed in INSERT VALUES", ErrParse)
+				}
 				col := rt.def.Columns[ord]
 				cell := insCell{ord: ord, arg: insCellExpr, expr: tuple[i]}
 				switch v := tuple[i].(type) {

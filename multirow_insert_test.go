@@ -225,3 +225,22 @@ func TestMultiRowInsertWALReplay(t *testing.T) {
 		t.Fatalf("after replay: got %d rows want 3", len(rows))
 	}
 }
+
+// TestInsertRejectsColumnRef: a column reference in INSERT VALUES has no current
+// row to resolve against — evalExpr would index a nil ctx.row and panic the
+// whole process (a wire-API DoS). It must be a clean plan error instead. Running
+// to completion (no panic) is itself part of the assertion.
+func TestInsertRejectsColumnRef(t *testing.T) {
+	db := openMem(t)
+	cases := []string{
+		"INSERT INTO users (name, age) VALUES (name, 1)",           // bare colRef
+		"INSERT INTO users (name, age) VALUES ('x', age + 1)",      // colRef in arithmetic
+		"INSERT INTO users (name, age) VALUES (nope, 1)",           // unknown-column colRef
+		"INSERT INTO users (name, age) VALUES ('a', 1), ('b', age)", // multi-row, second tuple
+	}
+	for _, sql := range cases {
+		if _, err := db.Exec(sql); !errors.Is(err, ErrParse) {
+			t.Errorf("%q: want ErrParse, got %v", sql, err)
+		}
+	}
+}
