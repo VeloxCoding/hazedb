@@ -237,26 +237,12 @@ func (db *DB) ExecValues(sql string, args ...Value) (int, error) {
 // execPlan runs a non-SELECT plan against raw args. Shared by Exec (which looks
 // the plan up by SQL each call) and *Stmt.Exec (which holds a compiled plan).
 func (db *DB) execPlan(pl *plan, args []any) (int, error) {
-	switch s := pl.st.(type) {
-	case *createStmt:
-		return 0, db.createTable(s.def)
-	case *dropStmt:
-		return 0, db.dropTable(s.name)
-	}
 	var argBuf [8]Value
 	vargs, err := toValuesInto(args, argBuf[:])
 	if err != nil {
 		return 0, err
 	}
-	switch pl.st.(type) {
-	case *insertStmt:
-		return db.execInsert(pl, vargs)
-	case *updateStmt:
-		return db.execUpdate(pl, vargs)
-	case *deleteStmt:
-		return db.execDelete(pl, vargs)
-	}
-	return 0, fmt.Errorf("hazedb: Exec used with SELECT — use Query instead")
+	return db.execWrite(pl, vargs)
 }
 
 // execPlanValues is execPlan for pre-typed args: it clones each arg with
@@ -264,12 +250,6 @@ func (db *DB) execPlan(pl *plan, args []any) (int, error) {
 // across the write boundary — the same guarantee toValue gives the []any path)
 // and dispatches to the same write executors.
 func (db *DB) execPlanValues(pl *plan, args []Value) (int, error) {
-	switch s := pl.st.(type) {
-	case *createStmt:
-		return 0, db.createTable(s.def)
-	case *dropStmt:
-		return 0, db.dropTable(s.name)
-	}
 	var argBuf [8]Value
 	var vargs []Value
 	if len(args) <= len(argBuf) {
@@ -280,7 +260,18 @@ func (db *DB) execPlanValues(pl *plan, args []Value) (int, error) {
 	for i, a := range args {
 		vargs[i] = cloneValue(a)
 	}
-	switch pl.st.(type) {
+	return db.execWrite(pl, vargs)
+}
+
+// execWrite dispatches a write plan to its executor. Shared by execPlan (any
+// args) and execPlanValues (pre-typed Value args) once each has converted its
+// args; DDL ignores vargs.
+func (db *DB) execWrite(pl *plan, vargs []Value) (int, error) {
+	switch s := pl.st.(type) {
+	case *createStmt:
+		return 0, db.createTable(s.def)
+	case *dropStmt:
+		return 0, db.dropTable(s.name)
 	case *insertStmt:
 		return db.execInsert(pl, vargs)
 	case *updateStmt:
@@ -288,7 +279,7 @@ func (db *DB) execPlanValues(pl *plan, args []Value) (int, error) {
 	case *deleteStmt:
 		return db.execDelete(pl, vargs)
 	}
-	return 0, fmt.Errorf("hazedb: ExecValues used with SELECT — use Query instead")
+	return 0, fmt.Errorf("hazedb: Exec used with SELECT — use Query instead")
 }
 
 // Query runs a SELECT. Returns the column names (in projection order)
@@ -307,16 +298,23 @@ func (db *DB) queryPlan(pl *plan, args []any) ([]string, []Row, error) {
 	if _, ok := pl.st.(*selectStmt); !ok {
 		return nil, nil, fmt.Errorf("hazedb: Query used with non-SELECT — use Exec instead")
 	}
+	vargs, err := toValues(args)
+	if err != nil {
+		return nil, nil, err
+	}
+	return db.queryPlanV(pl, vargs)
+}
+
+// queryPlanV runs a SELECT plan against pre-typed args, routing a PK lookup to
+// the point reader. Shared by the []any entry points (after toValues) and the
+// []Value entry points (QueryValues).
+func (db *DB) queryPlanV(pl *plan, vargs []Value) ([]string, []Row, error) {
 	if pl.pkLookup {
-		keyVal, err := evalLitOrParamAny(pl.pkSource, args)
+		keyVal, err := evalLitOrParamValue(pl.pkSource, vargs)
 		if err != nil {
 			return nil, nil, err
 		}
 		return db.execSelectPK(pl, keyVal)
-	}
-	vargs, err := toValues(args)
-	if err != nil {
-		return nil, nil, err
 	}
 	return db.execSelect(pl, vargs)
 }
@@ -342,16 +340,24 @@ func (db *DB) queryRowPlan(pl *plan, args []any) ([]string, Row, error) {
 	if _, ok := pl.st.(*selectStmt); !ok {
 		return nil, nil, fmt.Errorf("hazedb: QueryRow used with non-SELECT — use Exec instead")
 	}
+	vargs, err := toValues(args)
+	if err != nil {
+		return nil, nil, err
+	}
+	return db.queryRowPlanV(pl, vargs)
+}
+
+// queryRowPlanV is queryPlanV for single-row reads: a PK lookup goes through
+// the alloc-free point reader (execSelectPKOne), an indexed point lookup
+// through execSelectIdxOne, else it takes the first row of the scan. Shared by
+// the []any entry points (after toValues) and QueryRowValues.
+func (db *DB) queryRowPlanV(pl *plan, vargs []Value) ([]string, Row, error) {
 	if pl.pkLookup {
-		keyVal, err := evalLitOrParamAny(pl.pkSource, args)
+		keyVal, err := evalLitOrParamValue(pl.pkSource, vargs)
 		if err != nil {
 			return nil, nil, err
 		}
 		return db.execSelectPKOne(pl, keyVal)
-	}
-	vargs, err := toValues(args)
-	if err != nil {
-		return nil, nil, err
 	}
 	if pl.idxLookup && pl.orderOrdinal < 0 && pl.st.(*selectStmt).offset == 0 {
 		return db.execSelectIdxOne(pl, vargs)
@@ -375,14 +381,7 @@ func (db *DB) QueryValues(sql string, args ...Value) ([]string, []Row, error) {
 	if _, ok := pl.st.(*selectStmt); !ok {
 		return nil, nil, fmt.Errorf("hazedb: Query used with non-SELECT — use Exec instead")
 	}
-	if pl.pkLookup {
-		keyVal, err := evalLitOrParamValue(pl.pkSource, args)
-		if err != nil {
-			return nil, nil, err
-		}
-		return db.execSelectPK(pl, keyVal)
-	}
-	return db.execSelect(pl, args)
+	return db.queryPlanV(pl, args)
 }
 
 // QueryRowJSONByPK looks up a PK-pinned SELECT and appends the single matching
@@ -473,21 +472,7 @@ func (db *DB) QueryRowValues(sql string, args ...Value) ([]string, Row, error) {
 	if _, ok := pl.st.(*selectStmt); !ok {
 		return nil, nil, fmt.Errorf("hazedb: QueryRow used with non-SELECT — use Exec instead")
 	}
-	if pl.pkLookup {
-		keyVal, err := evalLitOrParamValue(pl.pkSource, args)
-		if err != nil {
-			return nil, nil, err
-		}
-		return db.execSelectPKOne(pl, keyVal)
-	}
-	if pl.idxLookup && pl.orderOrdinal < 0 && pl.st.(*selectStmt).offset == 0 {
-		return db.execSelectIdxOne(pl, args)
-	}
-	cols, rows, err := db.execSelect(pl, args)
-	if err != nil || len(rows) == 0 {
-		return cols, nil, err
-	}
-	return cols, rows[0], nil
+	return db.queryRowPlanV(pl, args)
 }
 
 // prepare returns a plan bound against cat. A cached plan is reused only if it

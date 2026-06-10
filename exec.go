@@ -728,22 +728,9 @@ func truthy(v Value) bool {
 	return false
 }
 
-func evalLitOrParamAny(e expr, args []any) (Value, error) {
-	switch x := e.(type) {
-	case *litValue:
-		return x.v, nil
-	case *paramRef:
-		if x.index < 0 || x.index >= len(args) {
-			return Value{}, fmt.Errorf("%w: param index %d out of range", ErrParamMismatch, x.index)
-		}
-		return toValue(args[x.index], x.index)
-	default:
-		return Value{}, fmt.Errorf("internal: expected literal or parameter, got %T", e)
-	}
-}
-
-// evalLitOrParamValue is evalLitOrParamAny for pre-typed Value args (the
-// QueryValues / QueryRowValues path) — no toValue conversion needed.
+// evalLitOrParamValue resolves a literal or positional parameter to its Value.
+// Used to evaluate a PK-lookup key from already-converted args (every Query
+// entry point converts to []Value before routing — see queryPlanV).
 func evalLitOrParamValue(e expr, args []Value) (Value, error) {
 	switch x := e.(type) {
 	case *litValue:
@@ -1579,39 +1566,16 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 
 	ctx := evalCtx{cols: tbl.def.colByName, args: args}
 
-	// Fast path: PK equality — single map lookup, no scan, no sort.
-	// Project directly into the result row to skip the matched-list
-	// allocation and the full-row clone.
+	// Fast path: PK equality — single map lookup, no scan, no sort. Evaluate
+	// the key here (execSelect has the eval context), then delegate to the
+	// point reader so the limit/offset/null/coerce/projection logic lives in
+	// one place (execSelectPK, which db.go also routes PK queries to directly).
 	if pl.pkLookup {
-		// A PK match is at most one row, so LIMIT 0 or any OFFSET drops it.
-		if st.limit == 0 || st.offset > 0 {
-			return colNames, nil, nil
-		}
 		keyVal, err := evalExpr(pl.pkSource, &ctx)
 		if err != nil {
 			return nil, nil, err
 		}
-		if keyVal.IsNull() {
-			return colNames, nil, nil
-		}
-		pk, err := coerceToUUID(keyVal)
-		if err != nil {
-			return nil, nil, err
-		}
-		// SELECT * needs the whole row; a projection clones only its columns
-		// under the lock (getByPKProject), skipping a full-row clone.
-		if st.starAll {
-			r, ok := tbl.getByPK(pk)
-			if !ok {
-				return colNames, nil, nil
-			}
-			return colNames, []Row{r}, nil
-		}
-		pr, ok := tbl.getByPKProject(pk, pl.projOrdinals)
-		if !ok {
-			return colNames, nil, nil
-		}
-		return colNames, []Row{pr}, nil
+		return db.execSelectPK(pl, keyVal)
 	}
 
 	// Secondary-index lookup: resolve candidate PKs through the index, fetch
