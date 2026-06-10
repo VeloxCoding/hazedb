@@ -24,7 +24,7 @@ import (
 // mutation_codec.go; this file owns the envelope + the WAL file mechanics.
 const (
 	walMagic   uint16 = 0x485A // "HZ"
-	walVersion uint8  = 2 // bumped when opUpdate nsets widened u8->u16; replay rejects any other version
+	walVersion uint8  = 2      // bumped when opUpdate nsets widened u8->u16; replay rejects any other version
 
 	recMutation    uint8 = 1
 	recTxn         uint8 = 2 // transaction: a group of sub-mutations, atomic

@@ -233,9 +233,9 @@ func TestMultiRowInsertWALReplay(t *testing.T) {
 func TestInsertRejectsColumnRef(t *testing.T) {
 	db := openMem(t)
 	cases := []string{
-		"INSERT INTO users (name, age) VALUES (name, 1)",           // bare colRef
-		"INSERT INTO users (name, age) VALUES ('x', age + 1)",      // colRef in arithmetic
-		"INSERT INTO users (name, age) VALUES (nope, 1)",           // unknown-column colRef
+		"INSERT INTO users (name, age) VALUES (name, 1)",            // bare colRef
+		"INSERT INTO users (name, age) VALUES ('x', age + 1)",       // colRef in arithmetic
+		"INSERT INTO users (name, age) VALUES (nope, 1)",            // unknown-column colRef
 		"INSERT INTO users (name, age) VALUES ('a', 1), ('b', age)", // multi-row, second tuple
 	}
 	for _, sql := range cases {
