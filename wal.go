@@ -238,6 +238,42 @@ func encodeDeleteMutation(buf []byte, tableID uint16, pk Value) []byte {
 	return encodeCell(buf, pk)
 }
 
+// decodeUpdateMutation walks an opUpdate op-body — pk-cell | nsets:2 |
+// (ordinal:2 | cell) × nsets — invoking set(ord, v) for each changed column,
+// and returns the decoded pk cell. The byte framing lives ONLY here: both the
+// in-memory replay (applyMutation) and the SQLite drain consume the update
+// through this, so a format change (e.g. the nsets width) is made in one place
+// and can never diverge RAM from the mirror. set may return an error to abort
+// (the drain uses it for an out-of-range ordinal).
+func decodeUpdateMutation(body []byte, set func(ord int, v Value) error) (Value, error) {
+	pk, n, err := decodeCell(body)
+	if err != nil {
+		return Value{}, err
+	}
+	body = body[n:]
+	if len(body) < 2 {
+		return Value{}, fmt.Errorf("%w: update missing nsets", ErrWALCorrupt)
+	}
+	nsets := int(binary.LittleEndian.Uint16(body[0:2]))
+	body = body[2:]
+	for i := 0; i < nsets; i++ {
+		if len(body) < 2 {
+			return Value{}, fmt.Errorf("%w: update ordinal truncated", ErrWALCorrupt)
+		}
+		ord := int(binary.LittleEndian.Uint16(body[0:2]))
+		body = body[2:]
+		v, m, err := decodeCell(body)
+		if err != nil {
+			return Value{}, err
+		}
+		if err := set(ord, v); err != nil {
+			return Value{}, err
+		}
+		body = body[m:]
+	}
+	return pk, nil
+}
+
 // encodeTxn frames a transaction as one record payload: a count followed by
 // each sub-mutation length-prefixed. Each sub-mutation is the same
 // op|tableID|op-body the single-statement encoders above produce, so replay

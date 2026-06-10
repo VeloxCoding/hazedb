@@ -612,31 +612,15 @@ func (db *DB) applyMutation(rt *tableRT, op uint8, body []byte) error {
 		}
 		return rt.insert(row)
 	case opUpdate:
-		// op-body: pk-cell | nsets:2 | (ordinal:2 | cell) × nsets.
-		pk, n, err := decodeCell(body)
+		var ords []int
+		var vals []Value
+		pk, err := decodeUpdateMutation(body, func(ord int, v Value) error {
+			ords = append(ords, ord)
+			vals = append(vals, v)
+			return nil
+		})
 		if err != nil {
 			return err
-		}
-		body = body[n:]
-		if len(body) < 2 {
-			return fmt.Errorf("%w: update missing nsets", ErrWALCorrupt)
-		}
-		nsets := int(binary.LittleEndian.Uint16(body[0:2]))
-		body = body[2:]
-		ords := make([]int, nsets)
-		vals := make([]Value, nsets)
-		for i := 0; i < nsets; i++ {
-			if len(body) < 2 {
-				return fmt.Errorf("%w: update ordinal truncated", ErrWALCorrupt)
-			}
-			ords[i] = int(binary.LittleEndian.Uint16(body[0:2]))
-			body = body[2:]
-			v, m, err := decodeCell(body)
-			if err != nil {
-				return err
-			}
-			vals[i] = v
-			body = body[m:]
 		}
 		if !rt.update(pk.UUID(), func(r Row) Row {
 			for i := range ords {

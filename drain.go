@@ -410,38 +410,22 @@ func (m *sqliteMirror) applyMutation(tx *sql.Tx, payload []byte) error {
 		_, err = tx.Exec(dt.insertSQL, args...)
 		return err
 	case opUpdate:
-		pk, n, err := decodeCell(body)
-		if err != nil {
-			return err
-		}
-		body = body[n:]
-		if len(body) < 2 {
-			return fmt.Errorf("%w: update missing nsets", ErrWALCorrupt)
-		}
-		nsets := int(binary.LittleEndian.Uint16(body[0:2]))
-		body = body[2:]
 		var set strings.Builder
-		args := make([]any, 0, nsets+1)
-		for i := 0; i < nsets; i++ {
-			if len(body) < 2 {
-				return fmt.Errorf("%w: update ordinal truncated", ErrWALCorrupt)
-			}
-			ord := int(binary.LittleEndian.Uint16(body[0:2]))
-			body = body[2:]
-			v, sz, err := decodeCell(body)
-			if err != nil {
-				return err
-			}
-			body = body[sz:]
+		var args []any // changed-column values in order; pk appended at the end
+		pk, err := decodeUpdateMutation(body, func(ord int, v Value) error {
 			if ord < 0 || ord >= len(dt.cols) {
 				return fmt.Errorf("%w: update ordinal %d out of range", ErrWALCorrupt, ord)
 			}
-			if i > 0 {
+			if set.Len() > 0 {
 				set.WriteString(", ")
 			}
 			set.WriteString(quoteIdent(dt.cols[ord].Name))
 			set.WriteString(" = ?")
 			args = append(args, valueToArg(v))
+			return nil
+		})
+		if err != nil {
+			return err
 		}
 		args = append(args, valueToArg(pk))
 		sqlStr := "UPDATE " + quoteIdent(dt.name) + " SET " + set.String() +
