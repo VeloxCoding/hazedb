@@ -15,7 +15,7 @@ import (
 //
 //	magic:2     (walMagic) — guards against reading non-WAL bytes
 //	type:1      (recMutation, recTxn; recCheckpoint reserved for M7)
-//	version:1   (walVersion) — replay aborts on a newer version
+//	version:1   (walVersion) — replay aborts on any non-current version
 //	length:4    (payload length, little-endian)
 //	payload     (length bytes)
 //	crc32c:4    (Castagnoli, over magic|type|version|length|payload)
@@ -24,7 +24,7 @@ import (
 // mutation_codec.go; this file owns the envelope + the WAL file mechanics.
 const (
 	walMagic   uint16 = 0x485A // "HZ"
-	walVersion uint8  = 1
+	walVersion uint8  = 2 // bumped when opUpdate nsets widened u8->u16; replay rejects any other version
 
 	recMutation    uint8 = 1
 	recTxn         uint8 = 2 // transaction: a group of sub-mutations, atomic
@@ -296,7 +296,7 @@ func (w *wal) replayFile(f *os.File, apply func(recType uint8, payload []byte) e
 //
 // Tail tolerance: a truncated final record (short header/payload read, or a
 // declared length past EOF) is the incomplete tail of an interrupted write
-// and is discarded. A wrong magic, a version newer than this binary, or a CRC
+// and is discarded. A wrong magic, a version other than this binary's, or a CRC
 // mismatch on a fully-present record is hard corruption and aborts the caller.
 // payload aliases the read buffer; the caller's decoders copy what they keep.
 func scanRecords(f *os.File, apply func(recType uint8, payload []byte) error) error {
@@ -331,8 +331,8 @@ func scanRecords(f *os.File, apply func(recType uint8, payload []byte) error) er
 		if magic != walMagic {
 			return fmt.Errorf("%w: bad magic %#04x at offset %d", ErrWALCorrupt, magic, pos-8)
 		}
-		if version > walVersion {
-			return fmt.Errorf("%w: record version %d newer than supported %d", ErrWALCorrupt, version, walVersion)
+		if version != walVersion {
+			return fmt.Errorf("%w: record version %d != supported %d — shut the old binary down cleanly (which drains the WAL) before upgrading", ErrWALCorrupt, version, walVersion)
 		}
 		// Bounds-check before allocating: a torn/corrupt tail can carry a
 		// bogus huge length. If payload+crc can't fit in what remains, it is

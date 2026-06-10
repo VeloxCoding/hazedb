@@ -270,3 +270,41 @@ func TestConcurrentMultiShardWritesReplayConsistent(t *testing.T) {
 		t.Fatal("concurrent multi-shard writes: WAL replay diverged from in-memory state")
 	}
 }
+
+// TestWALRejectsForeignVersion: a record stamped with a non-current walVersion
+// (e.g. a WAL written before the opUpdate nsets u8->u16 change, version 1) must
+// abort Open with ErrWALCorrupt — never be silently misparsed under the new
+// layout. The version byte exists precisely to catch a format change.
+func TestWALRejectsForeignVersion(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+	db, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "a", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stamp the first record's version byte (header is magic:2 | type:1 |
+	// version:1 | ...) with an old version. The check fires before the CRC, so
+	// this exercises the version guard, not a CRC mismatch.
+	seg := walSegmentFile(t, path)
+	f, err := os.OpenFile(seg, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{walVersion - 1}, 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path}); !errors.Is(err, ErrWALCorrupt) {
+		t.Fatalf("Open with a stale-version WAL: want ErrWALCorrupt, got %v", err)
+	}
+}
