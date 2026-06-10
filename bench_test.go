@@ -234,6 +234,23 @@ func BenchmarkSelectRange_Mem(b *testing.B) {
 	}
 }
 
+// BenchmarkScanMatchAll: full multi-shard scan where every row matches and
+// there is no LIMIT, so the packed-projection inner body (the partPinned /
+// all-shards twin loops in execSelect) runs once per row — the path whose
+// per-row cost matters if that body is factored out.
+func BenchmarkScanMatchAll(b *testing.B) {
+	const N = 10000
+	db := newBenchDB(b, N)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, rows, err := db.Query("SELECT id FROM users WHERE age >= ?", 0)
+		if err != nil || len(rows) != N {
+			b.Fatalf("rows=%d err=%v", len(rows), err)
+		}
+	}
+}
+
 func BenchmarkUpdate_Mem(b *testing.B) {
 	const N = 10000
 	db := newBenchDB(b, N)

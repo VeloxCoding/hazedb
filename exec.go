@@ -1652,6 +1652,12 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 			width = len(tbl.def.def.Columns)
 		}
 		var packed []Value
+		// The partition-pinned and all-shards loops below share an identical
+		// per-row body (match → packed projection → capped view → limit check),
+		// differing only in the row source. It is left inlined on purpose:
+		// factoring the body into a helper measured ~5-8% slower on the scan path
+		// (BenchmarkScanMatchAll / BenchmarkSelectRange_Mem) — the helper does not
+		// inline past the clone calls, so every matched row pays a call.
 		if partPinned {
 			s := tbl.shardOf(part)
 			s.mu.RLock()
