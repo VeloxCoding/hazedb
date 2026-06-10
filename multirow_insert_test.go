@@ -244,3 +244,35 @@ func TestInsertRejectsColumnRef(t *testing.T) {
 		}
 	}
 }
+
+// TestInsertRejectsDuplicateColumn: a column named twice in the INSERT target
+// list silently took the last value before; it must be a plan error.
+func TestInsertRejectsDuplicateColumn(t *testing.T) {
+	db := openMem(t)
+	if _, err := db.Exec("INSERT INTO users (name, name) VALUES ('a', 'b')"); !errors.Is(err, ErrParse) {
+		t.Fatalf("duplicate target column: want ErrParse, got %v", err)
+	}
+}
+
+// TestArgCountStrict: the arg count must match the statement's parameter count
+// in both directions (too many were silently ignored before). Covers all three
+// dispatch funnels: execWrite (INSERT), queryPlanV (Query), queryRowPlanV
+// (QueryRow).
+func TestArgCountStrict(t *testing.T) {
+	db := openMem(t)
+	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "a", 1); err != nil {
+		t.Fatalf("exact count: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(2), "b", 2, "extra"); !errors.Is(err, ErrParamMismatch) {
+		t.Errorf("INSERT too many: want ErrParamMismatch, got %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(3), "c"); !errors.Is(err, ErrParamMismatch) {
+		t.Errorf("INSERT too few: want ErrParamMismatch, got %v", err)
+	}
+	if _, _, err := db.Query("SELECT id FROM users WHERE id = ?", tid(1), "extra"); !errors.Is(err, ErrParamMismatch) {
+		t.Errorf("Query too many: want ErrParamMismatch, got %v", err)
+	}
+	if _, _, err := db.QueryRow("SELECT id FROM users WHERE id = ?", tid(1), "extra"); !errors.Is(err, ErrParamMismatch) {
+		t.Errorf("QueryRow too many: want ErrParamMismatch, got %v", err)
+	}
+}

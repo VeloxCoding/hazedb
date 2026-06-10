@@ -4,8 +4,8 @@ import "fmt"
 
 // assignParamIndices walks the AST and replaces every paramRef.index
 // = -1 with a running count, so positional args bind in source order.
-// Called once after parse, before plan.
-func assignParamIndices(st stmt) {
+// Called once after parse, before plan. Returns the parameter count.
+func assignParamIndices(st stmt) int {
 	var n int
 	var walk func(expr) expr
 	walk = func(e expr) expr {
@@ -46,6 +46,7 @@ func assignParamIndices(st stmt) {
 	case *deleteStmt:
 		s.where = walk(s.where)
 	}
+	return n
 }
 
 // insCell is one compiled INSERT VALUES entry. The three shapes are
@@ -75,6 +76,11 @@ type plan struct {
 	// prepare re-binds the plan if the catalog has changed since.
 	rt         *tableRT
 	catVersion uint64
+	// nparams is the number of positional ? parameters in the statement, set
+	// from assignParamIndices. Exec/Query reject an arg count that does not
+	// match it (too many were silently ignored before; too few panicked a
+	// per-param bounds check).
+	nparams int
 	// SELECT projection: ordinals into the row, in output order. nil if
 	// SELECT *.
 	projOrdinals []int
@@ -281,6 +287,9 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 			ord, ok := rt.colByName[c]
 			if !ok {
 				return nil, fmt.Errorf("%w: %q.%q (INSERT)", ErrUnknownColumn, tname, c)
+			}
+			if provided[ord] {
+				return nil, fmt.Errorf("%w: column %q specified more than once in INSERT", ErrParse, c)
 			}
 			pl.insertOrdinals = append(pl.insertOrdinals, ord)
 			provided[ord] = true

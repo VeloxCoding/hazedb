@@ -266,7 +266,21 @@ func (db *DB) execPlanValues(pl *plan, args []Value) (int, error) {
 // execWrite dispatches a write plan to its executor. Shared by execPlan (any
 // args) and execPlanValues (pre-typed Value args) once each has converted its
 // args; DDL ignores vargs.
+// checkArgs rejects an arg count that does not match the statement's parameter
+// count. Standard drivers fail loud on a count mismatch in either direction;
+// before this, too many args were silently ignored and too few hit a per-param
+// bounds error deeper in.
+func (pl *plan) checkArgs(n int) error {
+	if n != pl.nparams {
+		return fmt.Errorf("%w: got %d args, statement has %d parameters", ErrParamMismatch, n, pl.nparams)
+	}
+	return nil
+}
+
 func (db *DB) execWrite(pl *plan, vargs []Value) (int, error) {
+	if err := pl.checkArgs(len(vargs)); err != nil {
+		return 0, err
+	}
 	switch s := pl.st.(type) {
 	case *createStmt:
 		return 0, db.createTable(s.def)
@@ -309,6 +323,9 @@ func (db *DB) queryPlan(pl *plan, args []any) ([]string, []Row, error) {
 // the point reader. Shared by the []any entry points (after toValues) and the
 // []Value entry points (QueryValues).
 func (db *DB) queryPlanV(pl *plan, vargs []Value) ([]string, []Row, error) {
+	if err := pl.checkArgs(len(vargs)); err != nil {
+		return nil, nil, err
+	}
 	if pl.pkLookup {
 		keyVal, err := evalLitOrParamValue(pl.pkSource, vargs)
 		if err != nil {
@@ -352,6 +369,9 @@ func (db *DB) queryRowPlan(pl *plan, args []any) ([]string, Row, error) {
 // through execSelectIdxOne, else it takes the first row of the scan. Shared by
 // the []any entry points (after toValues) and QueryRowValues.
 func (db *DB) queryRowPlanV(pl *plan, vargs []Value) ([]string, Row, error) {
+	if err := pl.checkArgs(len(vargs)); err != nil {
+		return nil, nil, err
+	}
 	if pl.pkLookup {
 		keyVal, err := evalLitOrParamValue(pl.pkSource, vargs)
 		if err != nil {
@@ -496,11 +516,12 @@ func (db *DB) prepare(sql string, cat *catalog) (*plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	assignParamIndices(st)
+	nparams := assignParamIndices(st)
 	pl, err := db.plan(st, cat)
 	if err != nil {
 		return nil, err
 	}
+	pl.nparams = nparams
 	db.stmtCache.Store(sql, pl) // overwrite any stale-version entry
 	return pl, nil
 }
