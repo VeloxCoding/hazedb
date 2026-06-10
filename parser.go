@@ -420,25 +420,34 @@ func (p *parser) parseInsert() (*insertStmt, error) {
 	if _, err := p.expect(tkValues, "VALUES"); err != nil {
 		return nil, err
 	}
-	if _, err := p.expect(tkLParen, "("); err != nil {
-		return nil, err
-	}
+	// One or more comma-separated tuples: VALUES (...), (...), ...
 	for {
-		v, err := p.parseExpr()
-		if err != nil {
+		if _, err := p.expect(tkLParen, "("); err != nil {
 			return nil, err
 		}
-		st.vals = append(st.vals, v)
+		var tuple []expr
+		for {
+			v, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			tuple = append(tuple, v)
+			if p.peek().kind != tkComma {
+				break
+			}
+			p.advance()
+		}
+		if _, err := p.expect(tkRParen, ")"); err != nil {
+			return nil, err
+		}
+		if len(tuple) != len(st.cols) {
+			return nil, fmt.Errorf("%w: column count (%d) != value count (%d)", ErrParse, len(st.cols), len(tuple))
+		}
+		st.rows = append(st.rows, tuple)
 		if p.peek().kind != tkComma {
 			break
 		}
-		p.advance()
-	}
-	if _, err := p.expect(tkRParen, ")"); err != nil {
-		return nil, err
-	}
-	if len(st.cols) != len(st.vals) {
-		return nil, fmt.Errorf("%w: column count (%d) != value count (%d)", ErrParse, len(st.cols), len(st.vals))
+		p.advance() // comma between tuples
 	}
 	return st, nil
 }

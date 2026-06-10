@@ -98,12 +98,16 @@ func (tx *Tx) stage(sql string, args ...any) (int, error) {
 	}
 	switch pl.st.(type) {
 	case *insertStmt:
-		row, err := tx.db.buildInsertRow(pl, vargs)
-		if err != nil {
-			return 0, err
+		// One stagedMut per VALUES tuple (multi-row INSERT stages every row).
+		pkOrd := pl.rt.def.pkOrdinal
+		for r := range pl.insertTmpl {
+			row, err := tx.db.buildRowFromTmpl(pl, pl.insertTmpl[r], vargs)
+			if err != nil {
+				return 0, err
+			}
+			tx.staged = append(tx.staged, stagedMut{kind: opInsert, pk: row[pkOrd].UUID(), row: row})
 		}
-		tx.staged = append(tx.staged, stagedMut{kind: opInsert, pk: row[pl.rt.def.pkOrdinal].UUID(), row: row})
-		return 1, nil
+		return len(pl.insertTmpl), nil
 	case *updateStmt:
 		if !pl.pkLookup {
 			return 0, fmt.Errorf("%w: UPDATE must be PK-pinned (WHERE id = ?)", ErrTxUnsupported)

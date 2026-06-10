@@ -31,7 +31,7 @@ type joinClause struct {
 type insertStmt struct {
 	table string
 	cols  []string
-	vals  []expr
+	rows  [][]expr // one or more VALUES tuples; each tuple has len(cols) exprs
 }
 
 type updateStmt struct {

@@ -36,8 +36,10 @@ func assignParamIndices(st stmt) {
 	case *selectStmt:
 		s.where = walk(s.where)
 	case *insertStmt:
-		for i := range s.vals {
-			s.vals[i] = walk(s.vals[i])
+		for _, tuple := range s.rows {
+			for i := range tuple {
+				tuple[i] = walk(tuple[i])
+			}
 		}
 	case *updateStmt:
 		for i := range s.sets {
@@ -91,11 +93,12 @@ type plan struct {
 	orderOrdinal int
 	// INSERT column ordinals matching the values list.
 	insertOrdinals []int
-	// insertTmpl is the compiled INSERT VALUES list, one cell per provided
-	// column. Built once at plan time so buildInsertRow skips per-cell evalExpr
-	// dispatch for params and skips eval+validate entirely for literals.
-	// Read-only and shared across concurrent callers (like colNames).
-	insertTmpl []insCell
+	// insertTmpl is the compiled INSERT VALUES list: one cell template per
+	// VALUES tuple (len 1 for single-row INSERT, N for multi-row), each with one
+	// cell per provided column. Built once at plan time so buildRowFromTmpl
+	// skips per-cell evalExpr dispatch for params and skips eval+validate
+	// entirely for literals. Read-only and shared across concurrent callers.
+	insertTmpl [][]insCell
 	// UPDATE SET column ordinals matching the sets list.
 	updateOrdinals []int
 	// setRowDependent is true when any SET right-hand side references a
@@ -276,37 +279,45 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 		}
 	case *insertStmt:
 		pl.insertOrdinals = make([]int, 0, len(s.cols))
-		pl.insertTmpl = make([]insCell, len(s.cols))
 		provided := make([]bool, len(rt.def.Columns))
-		for i, c := range s.cols {
+		for _, c := range s.cols {
 			ord, ok := rt.colByName[c]
 			if !ok {
 				return nil, fmt.Errorf("%w: %q.%q (INSERT)", ErrUnknownColumn, tname, c)
 			}
 			pl.insertOrdinals = append(pl.insertOrdinals, ord)
 			provided[ord] = true
-			col := rt.def.Columns[ord]
-			cell := insCell{ord: ord, arg: insCellExpr, expr: s.vals[i]}
-			switch v := s.vals[i].(type) {
-			case *paramRef:
-				cell.arg, cell.expr = v.index, nil
-			case *litValue:
-				// Literals are constant, so validate + coerce them once here
-				// instead of on every insert.
-				lv := v.v
-				if col.Type == TypeUUID && lv.Kind == KindString {
-					u, perr := ParseUUID(lv.Str())
-					if perr != nil {
-						return nil, perr
+		}
+		// Compile each VALUES tuple into its own cell template: params bind by
+		// arg index, literals are validated + coerced once here (not per insert),
+		// and anything else falls back to evalExpr. Single-row INSERT is the
+		// len-1 case; multi-row gets one template per tuple.
+		pl.insertTmpl = make([][]insCell, len(s.rows))
+		for r, tuple := range s.rows {
+			tmpl := make([]insCell, len(pl.insertOrdinals))
+			for i, ord := range pl.insertOrdinals {
+				col := rt.def.Columns[ord]
+				cell := insCell{ord: ord, arg: insCellExpr, expr: tuple[i]}
+				switch v := tuple[i].(type) {
+				case *paramRef:
+					cell.arg, cell.expr = v.index, nil
+				case *litValue:
+					lv := v.v
+					if col.Type == TypeUUID && lv.Kind == KindString {
+						u, perr := ParseUUID(lv.Str())
+						if perr != nil {
+							return nil, perr
+						}
+						lv = UUIDVal(u)
 					}
-					lv = UUIDVal(u)
+					if err := validateValue(col, lv); err != nil {
+						return nil, err
+					}
+					cell.arg, cell.lit, cell.expr = insCellLit, lv, nil
 				}
-				if err := validateValue(col, lv); err != nil {
-					return nil, err
-				}
-				cell.arg, cell.lit, cell.expr = insCellLit, lv, nil
+				tmpl[i] = cell
 			}
-			pl.insertTmpl[i] = cell
+			pl.insertTmpl[r] = tmpl
 		}
 		// NOT NULL on omitted columns is a property of the statement, not the
 		// args: a non-nullable column left out of the list can never be filled,
@@ -1932,15 +1943,14 @@ func projOrNil(starAll bool, ords []int) []int {
 	return ords
 }
 
-// buildInsertRow materialises the full row from the plan-time insert template
-// (pl.insertTmpl): copies params from args (with API-boundary string→UUID
-// coercion + validation), drops pre-validated literals straight in, and
-// auto-generates the PK when omitted. Omitted columns stay zero, which is
-// KindNull. NOT NULL on omitted columns is enforced at plan time, not here.
-// The resolved row is what both the single-statement path and the transaction
-// path journal, so replay reproduces the exact same row (including any
-// auto-generated UUID).
-func (db *DB) buildInsertRow(pl *plan, args []Value) (Row, error) {
+// buildRowFromTmpl materialises one row from a tuple's plan-time cell template:
+// copies params from args (with API-boundary string→UUID coercion + validation),
+// drops pre-validated literals straight in, and auto-generates the PK when
+// omitted. Omitted columns stay zero, which is KindNull. NOT NULL on omitted
+// columns is enforced at plan time, not here. The resolved row is what both the
+// single-statement path and the transaction path journal, so replay reproduces
+// the exact same row (including any auto-generated UUID).
+func (db *DB) buildRowFromTmpl(pl *plan, tmpl []insCell, args []Value) (Row, error) {
 	tbl := pl.rt
 	cols := tbl.def.def.Columns
 	row := make(Row, len(cols)) // omitted columns stay zero == Null()
@@ -1950,8 +1960,8 @@ func (db *DB) buildInsertRow(pl *plan, args []Value) (Row, error) {
 	// expression branch below. Declaring it unconditionally keeps args off the
 	// heap — a lazily-assigned *evalCtx makes escape analysis spill args.
 	ctx := &evalCtx{args: args}
-	for i := range pl.insertTmpl {
-		c := &pl.insertTmpl[i]
+	for i := range tmpl {
+		c := &tmpl[i]
 		ord := c.ord
 		if c.arg == insCellLit {
 			row[ord] = c.lit // pre-validated + pre-coerced at plan time
@@ -1999,9 +2009,20 @@ func (db *DB) buildInsertRow(pl *plan, args []Value) (Row, error) {
 	return row, nil
 }
 
-// execInsert builds the row and appends. Returns the count (1 if
-// inserted) and an error.
+// buildInsertRow builds the row for a single-row INSERT (tuple 0). Transaction
+// staging and the single-row exec path use it; multi-row INSERT iterates the
+// per-tuple templates directly via buildRowFromTmpl.
+func (db *DB) buildInsertRow(pl *plan, args []Value) (Row, error) {
+	return db.buildRowFromTmpl(pl, pl.insertTmpl[0], args)
+}
+
+// execInsert builds the row(s) and appends. Returns the count and an error.
+// A multi-row INSERT (VALUES with >1 tuple) commits all rows atomically as one
+// transaction — a duplicate PK anywhere fails the whole statement.
 func (db *DB) execInsert(pl *plan, args []Value) (int, error) {
+	if len(pl.insertTmpl) > 1 {
+		return db.execInsertBatch(pl, args)
+	}
 	tbl := pl.rt
 	row, err := db.buildInsertRow(pl, args)
 	if err != nil {
@@ -2023,6 +2044,29 @@ func (db *DB) execInsert(pl *plan, args []Value) (int, error) {
 		return 0, err
 	}
 	return 1, nil
+}
+
+// execInsertBatch builds every VALUES tuple's row, then commits them as one
+// atomic transaction: a single TXN WAL envelope, each touched shard locked
+// once, and intra-batch + against-store PK uniqueness enforced under those
+// locks. This amortises the per-row envelope/lock/bufio overhead a sequence of
+// single-row inserts would each pay. Reuses the transaction commit machinery.
+func (db *DB) execInsertBatch(pl *plan, args []Value) (int, error) {
+	tbl := pl.rt
+	pkOrd := tbl.def.pkOrdinal
+	staged := make([]stagedMut, len(pl.insertTmpl))
+	for r := range pl.insertTmpl {
+		row, err := db.buildRowFromTmpl(pl, pl.insertTmpl[r], args)
+		if err != nil {
+			return 0, err
+		}
+		staged[r] = stagedMut{kind: opInsert, pk: row[pkOrd].UUID(), row: row}
+	}
+	tx := &Tx{db: db, rt: tbl, staged: staged}
+	if err := tx.commit(); err != nil {
+		return 0, err
+	}
+	return len(staged), nil
 }
 
 // execUpdate evaluates the SET values once, then dispatches on the WHERE
