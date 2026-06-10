@@ -163,9 +163,20 @@ type txAct struct {
 // journal the whole group as ONE TXN envelope BEFORE applying — so a WAL
 // failure aborts with nothing applied, and a committed envelope always replays
 // cleanly.
+// maxTxnMutations caps the mutations in one atomic commit (a transaction or a
+// multi-row INSERT). It bounds how long the touched shard locks are held and
+// the commit's transient memory, and keeps the count well under the uint16 the
+// recTxn envelope encodes it in. Large loads are split into smaller batches —
+// the per-batch fsync amortisation is already near-complete by ~1000 rows.
+const maxTxnMutations = 1000
+
 func (tx *Tx) commit() error {
 	if len(tx.staged) == 0 {
 		return nil
+	}
+	if len(tx.staged) > maxTxnMutations {
+		return fmt.Errorf("%w: %d mutations exceeds the %d-row limit; split into smaller INSERTs/transactions",
+			ErrBatchTooLarge, len(tx.staged), maxTxnMutations)
 	}
 	t := tx.rt.table
 	if t.pkDir != nil {

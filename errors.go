@@ -14,4 +14,5 @@ var (
 	ErrWALCorrupt    = errors.New("hazedb: WAL corrupted")
 	ErrTableExists   = errors.New("hazedb: table already exists")
 	ErrTxUnsupported = errors.New("hazedb: operation not supported in a transaction")
+	ErrBatchTooLarge = errors.New("hazedb: atomic batch too large")
 )

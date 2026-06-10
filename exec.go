@@ -2053,6 +2053,10 @@ func (db *DB) execInsert(pl *plan, args []Value) (int, error) {
 // single-row inserts would each pay. Reuses the transaction commit machinery.
 func (db *DB) execInsertBatch(pl *plan, args []Value) (int, error) {
 	tbl := pl.rt
+	if len(pl.insertTmpl) > maxTxnMutations {
+		return 0, fmt.Errorf("%w: INSERT of %d rows exceeds the %d-row limit; split into smaller INSERTs",
+			ErrBatchTooLarge, len(pl.insertTmpl), maxTxnMutations)
+	}
 	pkOrd := tbl.def.pkOrdinal
 	staged := make([]stagedMut, len(pl.insertTmpl))
 	for r := range pl.insertTmpl {

@@ -3,6 +3,7 @@ package hazedb
 import (
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -158,6 +159,37 @@ func TestMultiRowInsert(t *testing.T) {
 			tid(1), "a", 1, tid(2), "b")
 		if !errors.Is(err, ErrParse) {
 			t.Fatalf("want ErrParse, got %v", err)
+		}
+	})
+
+	t.Run("batch_size_cap", func(t *testing.T) {
+		mk := func(n int) (string, []any) {
+			var sb strings.Builder
+			sb.WriteString("INSERT INTO users (id, name, age) VALUES ")
+			args := make([]any, 0, n*3)
+			for i := 0; i < n; i++ {
+				if i > 0 {
+					sb.WriteString(", ")
+				}
+				sb.WriteString("(?, ?, ?)")
+				args = append(args, tid(i+1), "n", i%100)
+			}
+			return sb.String(), args
+		}
+		// Exactly the cap is accepted.
+		db := openMem(t)
+		sql, args := mk(maxTxnMutations)
+		if n, err := db.Exec(sql, args...); err != nil || n != maxTxnMutations {
+			t.Fatalf("at cap: n=%d err=%v", n, err)
+		}
+		// One over the cap is rejected, and nothing from it is inserted.
+		db2 := openMem(t)
+		sql, args = mk(maxTxnMutations + 1)
+		if _, err := db2.Exec(sql, args...); !errors.Is(err, ErrBatchTooLarge) {
+			t.Fatalf("over cap: want ErrBatchTooLarge, got %v", err)
+		}
+		if _, rows, _ := db2.Query("SELECT id FROM users"); len(rows) != 0 {
+			t.Fatalf("over-cap statement inserted %d rows, want 0", len(rows))
 		}
 	})
 }

@@ -48,7 +48,7 @@ the one-row semantics — `hazedb_fetch` already stops at the first match.
 |---|---|
 | DDL | `CREATE TABLE name (col TYPE …)` with `PRIMARY KEY` / `PARTITION KEY` constraints and `[ORDERED] INDEX [name] (col[, col…])` declarations (a composite/multi-column index must be `ORDERED`); `DROP TABLE name` |
 | Column types | `int`, `text`/`string`, `bool`, `bytes`/`blob`, `uuid` |
-| Writes | `INSERT INTO … VALUES (…)[, (…)…]` (multi-row inserts commit atomically — all rows or none), `UPDATE … SET … WHERE …`, `DELETE FROM … WHERE …` |
+| Writes | `INSERT INTO … VALUES (…)[, (…)…]` (multi-row inserts commit atomically — all rows or none; max 1000 rows per statement), `UPDATE … SET … WHERE …`, `DELETE FROM … WHERE …` |
 | `SELECT` | `*` or an explicit column list, `FROM t [alias]`, optional `WHERE`, `ORDER BY col [ASC\|DESC]`, `LIMIT n`, `OFFSET m` |
 | `JOIN` | **two tables only** (for now) — `[INNER\|LEFT [OUTER]\|RIGHT [OUTER]] JOIN t2 [alias] ON a.col = b.col` (single equi-join); the probed join column **must be the PK or indexed**; columns are `table.col` / `alias.col`. A 3rd+ `JOIN` is rejected. |
 | `WHERE` expressions | comparisons `= != < <= > >=`, `IS [NOT] NULL`, boolean `AND` / `OR` / `NOT`, arithmetic `+ - *`, parentheses, `?` positional parameters |
