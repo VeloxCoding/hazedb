@@ -93,3 +93,23 @@ func TestModuleCleanupDeregisters(t *testing.T) {
 		t.Fatal("still registered after cleanup")
 	}
 }
+
+// TestBodyLimit: a POST body over MaxBodyBytes is rejected with 413 instead of
+// being read into memory — the memory-exhaustion DoS guard.
+func TestBodyLimit(t *testing.T) {
+	h := &Handler{MaxBodyBytes: 64} // tiny cap; Provision leaves a non-zero value alone
+	if err := h.Provision(caddy.Context{}); err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	defer h.Cleanup()
+
+	big := `{"sql":"SELECT 1","args":["` + strings.Repeat("x", 200) + `"]}` // ~220 B > 64
+	if w, _ := do(t, h, "/query", big); w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized body: got %d, want 413; body=%s", w.Code, w.Body.String())
+	}
+	// A small body under the cap still works (sanity: the cap is not rejecting
+	// everything).
+	if w, _ := do(t, h, "/query", `{"sql":"SELECT 1"}`); w.Code == http.StatusRequestEntityTooLarge {
+		t.Fatalf("small body wrongly rejected as too large: %s", w.Body.String())
+	}
+}

@@ -21,6 +21,7 @@ package caddymodule
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -57,6 +58,11 @@ type Handler struct {
 	// RegistryName is the name the *DB is published under for in-process
 	// consumers. Empty = "default" (what the PHP extension looks up).
 	RegistryName string `json:"registry_name,omitempty"`
+	// MaxBodyBytes caps the POST body for /query and /exec, in bytes. 0 = the
+	// 4 MiB default. Bounds per-request memory against an oversized body — and
+	// since the SQL string and the positional-arg array both live in that body,
+	// it bounds their sizes too.
+	MaxBodyBytes int64 `json:"max_body_bytes,omitempty"`
 
 	db   *hazedb.DB
 	mux  *http.ServeMux
@@ -74,9 +80,18 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 
 // Provision opens the *DB, runs init_sql, wires the routes, and registers the
 // instance. Called once per module instance at Caddy start / config reload.
+// defaultMaxBodyBytes caps a /query or /exec POST body when MaxBodyBytes is 0.
+const defaultMaxBodyBytes = 4 << 20 // 4 MiB
+
 func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.WALRotateMillis < 0 {
 		return fmt.Errorf("hazedb: wal_rotate_ms must be >= 0")
+	}
+	if h.MaxBodyBytes < 0 {
+		return fmt.Errorf("hazedb: max_body_bytes must be >= 0")
+	}
+	if h.MaxBodyBytes == 0 {
+		h.MaxBodyBytes = defaultMaxBodyBytes
 	}
 	opts := hazedb.Options{
 		Schema:     hazedb.Schema{}, // tables created at runtime (init_sql / POST /exec)
@@ -178,7 +193,15 @@ func (h *Handler) decode(w http.ResponseWriter, r *http.Request) (sqlRequest, []
 		writeJSON(w, http.StatusMethodNotAllowed, hazedb.ErrorJSON("use POST with a JSON body"))
 		return req, nil, false
 	}
+	// Cap the body so an oversized POST can't exhaust memory; this also bounds
+	// the SQL string and the arg array, which both live in it.
+	r.Body = http.MaxBytesReader(w, r.Body, h.MaxBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, hazedb.ErrorJSON("request body too large"))
+			return req, nil, false
+		}
 		writeJSON(w, http.StatusBadRequest, hazedb.ErrorJSON("invalid JSON body: "+err.Error()))
 		return req, nil, false
 	}
@@ -413,6 +436,12 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				h.InitSQL = value
 			case "registry_name":
 				h.RegistryName = value
+			case "max_body_bytes":
+				n, err := strconv.ParseInt(value, 10, 64)
+				if err != nil {
+					return d.Errf("%s: %v", key, err)
+				}
+				h.MaxBodyBytes = n
 			case "wal_level":
 				n, err := strconv.Atoi(value)
 				if err != nil {
