@@ -106,7 +106,7 @@ func (db *DB) selectEach(pl *plan, args []Value, visit func(row Row) bool) ([]st
 			s := tbl.shardOf(pk)
 			s.mu.RLock()
 			stop := false
-			if rowID, ok := s.pk[pk]; ok {
+			if rowID, ok := s.pk.get(pk); ok {
 				if r := s.rows[rowID]; r != nil {
 					stop = consume(r)
 				}
@@ -130,7 +130,7 @@ func (db *DB) selectEach(pl *plan, args []Value, visit func(row Row) bool) ([]st
 			s := tbl.shardOf(pk)
 			s.mu.RLock()
 			stop := false
-			if rowID, ok := s.pk[pk]; ok {
+			if rowID, ok := s.pk.get(pk); ok {
 				if r := s.rows[rowID]; r != nil {
 					stop = consume(r)
 				}

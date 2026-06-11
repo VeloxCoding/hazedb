@@ -60,8 +60,10 @@ type table struct {
 type tableShard struct {
 	mu   sync.RWMutex
 	rows []Row // arena; nil entries are tombstones
-	// pk is the per-shard PK→rowID index for NON-partitioned tables.
-	pk map[UUID]uint64
+	// pk is the per-shard PK→rowID index for NON-partitioned tables (an
+	// open-addressed table, see pkmap.go; zero/empty on partitioned shards,
+	// which route through pkDir instead).
+	pk pkMap
 	// tails groups rowIDs by PartitionKey value for PARTITIONED tables, in
 	// insert order. A WHERE partition=? scan reads only the matching list
 	// instead of every row, so it is O(partition size), not O(table). Deleted
@@ -142,7 +144,7 @@ func newTable(def *resolvedTable, sizeHint int) *table {
 		if def.partitioned() {
 			t.shards[i].tails = make(map[UUID][]uint64)
 		} else {
-			t.shards[i].pk = make(map[UUID]uint64, per)
+			t.shards[i].pk.init(per)
 		}
 	}
 	if def.partitioned() {
@@ -181,12 +183,13 @@ func (t *table) insert(row Row) error {
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.pk[pk]; exists {
+	slot, exists := s.pk.reserve(pk)
+	if exists {
 		return ErrDuplicatePK
 	}
 	rowID := uint64(len(s.rows))
 	s.rows = append(s.rows, row)
-	s.pk[pk] = rowID
+	s.pk.commit(slot, pk, rowID)
 	s.live++
 	t.markDirtyLocked(s, pk)
 	return nil
@@ -214,7 +217,11 @@ func (t *table) insertJournaled(row Row, j mutJournal) error {
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.pk[pk]; exists {
+	// reserve probes ONCE for both the duplicate check and the target slot;
+	// the reservation holds across journal because the shard lock is held and
+	// the WAL append never touches the pk map.
+	slot, exists := s.pk.reserve(pk)
+	if exists {
 		return ErrDuplicatePK
 	}
 	if err := j.insert(row); err != nil {
@@ -222,7 +229,7 @@ func (t *table) insertJournaled(row Row, j mutJournal) error {
 	}
 	rowID := uint64(len(s.rows))
 	s.rows = append(s.rows, row)
-	s.pk[pk] = rowID
+	s.pk.commit(slot, pk, rowID)
 	s.live++
 	t.markDirtyLocked(s, pk)
 	return nil
@@ -243,7 +250,7 @@ func (t *table) updateByPKJournaled(pk UUID, ords []int, compute func(Row) ([]Va
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rowID, ok := s.pk[pk]
+	rowID, ok := s.pk.get(pk)
 	if !ok {
 		return false, nil
 	}
@@ -286,7 +293,7 @@ func (t *table) updateByPKOneJournaled(pk UUID, ord int, compute func(Row) (Valu
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rowID, ok := s.pk[pk]
+	rowID, ok := s.pk.get(pk)
 	if !ok {
 		return false, nil
 	}
@@ -320,7 +327,7 @@ func (t *table) deleteByPKJournaled(pk UUID, j mutJournal) (bool, error) {
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rowID, ok := s.pk[pk]
+	rowID, ok := s.pk.get(pk)
 	if !ok {
 		return false, nil
 	}
@@ -328,7 +335,7 @@ func (t *table) deleteByPKJournaled(pk UUID, j mutJournal) (bool, error) {
 		return false, err
 	}
 	s.rows[rowID] = nil
-	delete(s.pk, pk)
+	s.pk.del(pk)
 	s.live--
 	t.markDelDirtyLocked(s, pk)
 	return true, nil
@@ -342,7 +349,7 @@ func (t *table) getByPK(pk UUID) (Row, bool) {
 	}
 	s := t.shardOf(pk)
 	s.mu.RLock()
-	rowID, ok := s.pk[pk]
+	rowID, ok := s.pk.get(pk)
 	var cl Row
 	if ok {
 		if r := s.rows[rowID]; r != nil {
@@ -364,7 +371,7 @@ func (t *table) getByPKProject(pk UUID, ords []int) (Row, bool) {
 	s := t.shardOf(pk)
 	s.mu.RLock()
 	var pr Row
-	if rowID, ok := s.pk[pk]; ok {
+	if rowID, ok := s.pk.get(pk); ok {
 		if r := s.rows[rowID]; r != nil {
 			pr = projectClone(r, ords)
 		}
@@ -384,7 +391,7 @@ func (t *table) getByPKProjectInto(pk UUID, ords []int, dst []Value) ([]Value, b
 	s := t.shardOf(pk)
 	s.mu.RLock()
 	out, found := dst[:0], false
-	if rowID, ok := s.pk[pk]; ok {
+	if rowID, ok := s.pk.get(pk); ok {
 		if r := s.rows[rowID]; r != nil {
 			if ords == nil {
 				out = appendRowClone(out, r)
@@ -411,7 +418,7 @@ func (t *table) getByPKJSONInto(pk UUID, cols []string, ords []int, dst []byte) 
 	s := t.shardOf(pk)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rowID, ok := s.pk[pk]
+	rowID, ok := s.pk.get(pk)
 	if !ok {
 		return dst, false
 	}
@@ -516,7 +523,7 @@ func (t *table) update(pk UUID, mutate func(Row) Row) bool {
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rowID, ok := s.pk[pk]
+	rowID, ok := s.pk.get(pk)
 	if !ok {
 		return false
 	}
@@ -644,7 +651,7 @@ func (t *table) updateByCandidates(pks []UUID, match func(Row) bool, ords []int,
 	var bodies [][]byte
 	for _, pk := range pks {
 		s := t.shardOf(pk)
-		rowID, ok := s.pk[pk]
+		rowID, ok := s.pk.get(pk)
 		if !ok {
 			continue
 		}
@@ -691,7 +698,7 @@ func (t *table) updateOneByCandidate(pk UUID, ord int, match func(Row) bool, com
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rowID, ok := s.pk[pk]
+	rowID, ok := s.pk.get(pk)
 	if !ok {
 		return 0, nil
 	}
@@ -732,12 +739,11 @@ func (t *table) deleteByPK(pk UUID) bool {
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rowID, ok := s.pk[pk]
+	rowID, ok := s.pk.del(pk) // one probe: del returns the removed rowID
 	if !ok {
 		return false
 	}
 	s.rows[rowID] = nil
-	delete(s.pk, pk)
 	s.live--
 	t.markDelDirtyLocked(s, pk)
 	return true
@@ -780,7 +786,7 @@ func (t *table) deleteWhereAll(match func(Row) bool, encode func(pk Value) []byt
 		}
 	}
 	for _, p := range pending {
-		delete(p.s.pk, p.pk)
+		p.s.pk.del(p.pk)
 		p.s.rows[p.j] = nil
 		p.s.live--
 		t.markDelDirtyLocked(p.s, p.pk)
@@ -803,7 +809,7 @@ func (t *table) deleteByCandidates(pks []UUID, match func(Row) bool, encode func
 	var bodies [][]byte
 	for _, pk := range pks {
 		s := t.shardOf(pk)
-		rowID, ok := s.pk[pk]
+		rowID, ok := s.pk.get(pk)
 		if !ok {
 			continue
 		}
@@ -822,7 +828,7 @@ func (t *table) deleteByCandidates(pks []UUID, match func(Row) bool, encode func
 		}
 	}
 	for _, p := range pending {
-		delete(p.s.pk, p.pk)
+		p.s.pk.del(p.pk)
 		p.s.rows[p.j] = nil
 		p.s.live--
 		t.markDelDirtyLocked(p.s, p.pk)

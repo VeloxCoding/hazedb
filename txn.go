@@ -372,7 +372,7 @@ func (t *table) txGetLocked(pk UUID) (Row, bool) {
 		return r, true
 	}
 	s := t.shardOf(pk)
-	rowID, ok := s.pk[pk]
+	rowID, ok := s.pk.get(pk)
 	if !ok {
 		return nil, false
 	}
@@ -402,7 +402,7 @@ func (t *table) txInsertLocked(row Row) {
 	s := t.shardOf(pk)
 	rowID := uint64(len(s.rows))
 	s.rows = append(s.rows, row)
-	s.pk[pk] = rowID
+	s.pk.put(pk, rowID)
 	s.live++
 	t.markDirtyLocked(s, pk)
 }
@@ -416,7 +416,8 @@ func (t *table) txReplaceLocked(pk UUID, nr Row) {
 		return
 	}
 	s := t.shardOf(pk)
-	s.rows[s.pk[pk]] = nr
+	rowID, _ := s.pk.get(pk) // present by commit's overlay-walk contract
+	s.rows[rowID] = nr
 	t.markDirtyLocked(s, pk)
 }
 
@@ -431,9 +432,8 @@ func (t *table) txDeleteLocked(pk UUID) {
 		return
 	}
 	s := t.shardOf(pk)
-	rowID := s.pk[pk]
+	rowID, _ := s.pk.del(pk) // present by commit's overlay-walk contract
 	s.rows[rowID] = nil
-	delete(s.pk, pk)
 	s.live--
 	t.markDelDirtyLocked(s, pk)
 }

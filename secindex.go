@@ -551,19 +551,20 @@ func (t *table) dirtyPKs() []UUID {
 		return nil // no read-relevant dirty (deletes don't count): skip the scan
 	}
 	var out []UUID
+	partitioned := t.pkDir != nil
 	for i := range t.shards {
 		s := &t.shards[i]
 		s.mu.RLock()
 		// Walk only dirtyRead (inserts + indexed updates); deletes live in dirtyDel
 		// and never belong in the read overlay. The s.pk liveness check still drops
 		// the rare insert-then-delete pair (the insert's PK lingers in dirtyRead but
-		// its row is already gone). Partitioned shards have no per-shard pk map, so
-		// they keep the unfiltered behaviour.
-		if s.pk == nil {
+		// its row is already gone). Partitioned shards have no per-shard pk map
+		// (they route through pkDir), so they keep the unfiltered behaviour.
+		if partitioned {
 			out = append(out, s.dirtyRead...)
 		} else {
 			for _, pk := range s.dirtyRead {
-				if _, live := s.pk[pk]; live {
+				if _, live := s.pk.get(pk); live {
 					out = append(out, pk)
 				}
 			}

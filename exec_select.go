@@ -63,7 +63,7 @@ func (db *DB) execSelectPKOne(pl *plan, keyVal Value) ([]string, Row, error) {
 func (t *table) offerLiveRow(pk UUID, pred func(Row) bool, top *topN) {
 	s := t.shardOf(pk)
 	s.mu.RLock()
-	if rowID, ok := s.pk[pk]; ok {
+	if rowID, ok := s.pk.get(pk); ok {
 		if r := s.rows[rowID]; r != nil && pred(r) {
 			top.offer(r)
 		}
@@ -78,7 +78,7 @@ func (t *table) offerLiveRow(pk UUID, pred func(Row) bool, top *topN) {
 func (t *table) collectLiveRow(pk UUID, pred func(Row) bool, top *topN) {
 	s := t.shardOf(pk)
 	s.mu.RLock()
-	if rowID, ok := s.pk[pk]; ok {
+	if rowID, ok := s.pk.get(pk); ok {
 		if r := s.rows[rowID]; r != nil && pred(r) {
 			top.collect(r)
 		}
@@ -96,7 +96,7 @@ func (t *table) getMatchProject(pk UUID, pred func(Row) bool, ords []int, starAl
 	s := t.shardOf(pk)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rowID, ok := s.pk[pk]
+	rowID, ok := s.pk.get(pk)
 	if !ok {
 		return nil, false
 	}
@@ -128,7 +128,7 @@ func (t *table) appendMatchProject(pk UUID, pred func(Row) bool, ords []int, sta
 	s := t.shardOf(pk)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rowID, ok := s.pk[pk]
+	rowID, ok := s.pk.get(pk)
 	if !ok {
 		return dst, false
 	}
@@ -152,7 +152,7 @@ func (t *table) appendMatchJSON(pk UUID, pred func(Row) bool, cols []string, ord
 	s := t.shardOf(pk)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rowID, ok := s.pk[pk]
+	rowID, ok := s.pk.get(pk)
 	if !ok {
 		return dst, false
 	}
@@ -745,7 +745,7 @@ func (db *DB) orderedWalkEach(pl *plan, args []Value, snap []ordEntry, dirtyKey 
 	emitIdx := func(pk UUID) { // fresh index entry: visit the live row under its shard lock
 		s := tbl.shardOf(pk)
 		s.mu.RLock()
-		if rowID, ok := s.pk[pk]; ok {
+		if rowID, ok := s.pk.get(pk); ok {
 			if r := s.rows[rowID]; r != nil && (len(residual) == 0 || passResidual(r)) {
 				deliver(r)
 			}
