@@ -168,6 +168,7 @@ func decodeCell(b []byte) (Value, int, error) {
 		}
 		ln := int(binary.LittleEndian.Uint32(b[off : off+4]))
 		off += 4
+		// ln<0 catches a >2 GiB length wrapping negative on 32-bit; dead on 64-bit.
 		if ln < 0 || off+ln > len(b) {
 			return Value{}, 0, fmt.Errorf("%w: string body truncated", ErrWALCorrupt)
 		}
@@ -178,6 +179,7 @@ func decodeCell(b []byte) (Value, int, error) {
 		}
 		ln := int(binary.LittleEndian.Uint32(b[off : off+4]))
 		off += 4
+		// ln<0 catches a >2 GiB length wrapping negative on 32-bit; dead on 64-bit.
 		if ln < 0 || off+ln > len(b) {
 			return Value{}, 0, fmt.Errorf("%w: bytes body truncated", ErrWALCorrupt)
 		}
