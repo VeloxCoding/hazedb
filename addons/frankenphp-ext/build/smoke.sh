@@ -33,7 +33,8 @@ MSYS_NO_PATHCONV=1 docker run --rm \
         # test.php emits quote-free *_ok=yes markers; require all of them.
         ok=1
         for marker in ping=pong exec_ok=yes exec_int_ok=yes fetch_ok=yes \
-                      fetch_missing_ok=yes fetch_scalar_ok=yes fetchall_ok=yes fetchall_json_ok=yes; do
+                      fetch_missing_ok=yes fetch_scalar_ok=yes fetchall_ok=yes fetchall_json_ok=yes \
+                      meta_ok=yes; do
             echo "$OUT" | grep -q "^$marker$" || { echo "MISSING: $marker"; ok=0; }
         done
         [ "$ok" = "1" ] && { echo "SMOKE: PASS"; exit 0; }

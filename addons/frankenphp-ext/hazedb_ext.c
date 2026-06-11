@@ -97,6 +97,17 @@ PHP_FUNCTION(hazedb_exec)
     RETURN_LONG(result);
 }
 
+PHP_FUNCTION(hazedb_meta)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    zend_string *result = go_hazedb_meta();
+    if (result) {
+        RETURN_STR(result);
+    }
+
+	RETURN_NULL();
+}
+
 PHP_FUNCTION(hazedb_ping)
 {
     ZEND_PARSE_PARAMETERS_NONE();

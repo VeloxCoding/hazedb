@@ -19,6 +19,8 @@ function hazedb_fetchall_json(string $sql, mixed $args = null): ?string {}
 
 function hazedb_exec(string $sql, mixed $args = null): int {}
 
+function hazedb_meta(): ?string {}
+
 function hazedb_ping(): string {}
 
 

@@ -31,6 +31,11 @@
 //	    INSERT / UPDATE / DELETE / CREATE TABLE / DROP TABLE. Returns the
 //	    affected row count (≈ PDOStatement::rowCount), or -1 on error / no DB.
 //
+//	hazedb_meta(): ?string
+//	    Store-size overview as a JSON string — the same bytes the Caddy GET
+//	    /meta route returns ({"tables":N,"table_stats":[...]}). For dashboards /
+//	    health checks; sizes are estimates. null only when no DB is registered.
+//
 //	hazedb_ping(): string
 //	    Liveness probe: "pong" if a Caddy module registered a DB under "default",
 //	    "pong (no db)" otherwise. Never null.
@@ -469,6 +474,21 @@ func hazedb_exec(sql *C.zend_string, args *C.zval) (ret int64) {
 		return -1
 	}
 	return int64(affected)
+}
+
+// hazedb_meta returns the store-size overview (table count + per-table rows /
+// columns / index count / approximate bytes) as a JSON string — the exact bytes
+// the Caddy GET /meta route emits, since both call db.MetaJSON. No args. The
+// caller json_decode's it. null only when no Caddy module has registered a DB.
+//
+// export_php:function hazedb_meta(): ?string
+func hazedb_meta() (ret unsafe.Pointer) {
+	defer cgoRecoverPtr("hazedb_meta", &ret)
+	db := defaultSlot.Load()
+	if db == nil {
+		return nil
+	}
+	return phpStringFromBytes(db.MetaJSON())
 }
 
 // hazedb_ping reports that the extension is loaded and whether a DB is wired up.

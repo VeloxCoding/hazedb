@@ -24,23 +24,28 @@ func init() {
 }
 
 //export go_hazedb_fetch
-func go_hazedb_fetch(sql *C.zend_string, args *C.zval) unsafe.Pointer {
+func go_hazedb_fetch(sql *C.zend_string, args *C.zval) (ret unsafe.Pointer) {
 	return hazedb_fetch(sql, args)
 }
 
 //export go_hazedb_fetchall
-func go_hazedb_fetchall(sql *C.zend_string, args *C.zval) unsafe.Pointer {
+func go_hazedb_fetchall(sql *C.zend_string, args *C.zval) (ret unsafe.Pointer) {
 	return hazedb_fetchall(sql, args)
 }
 
 //export go_hazedb_fetchall_json
-func go_hazedb_fetchall_json(sql *C.zend_string, args *C.zval) unsafe.Pointer {
+func go_hazedb_fetchall_json(sql *C.zend_string, args *C.zval) (ret unsafe.Pointer) {
 	return hazedb_fetchall_json(sql, args)
 }
 
 //export go_hazedb_exec
-func go_hazedb_exec(sql *C.zend_string, args *C.zval) int64 {
+func go_hazedb_exec(sql *C.zend_string, args *C.zval) (ret int64) {
 	return hazedb_exec(sql, args)
+}
+
+//export go_hazedb_meta
+func go_hazedb_meta() (ret unsafe.Pointer) {
+	return hazedb_meta()
 }
 
 //export go_hazedb_ping

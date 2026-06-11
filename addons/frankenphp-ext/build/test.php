@@ -38,5 +38,17 @@ $js  = hazedb_fetchall_json('SELECT name, age FROM users WHERE age >= 30 ORDER B
 ok('fetchall_ok',      is_array($all) && count($all) === 2 && $all[0]['name'] === 'alice' && $all[1]['name'] === 'carol');
 ok('fetchall_json_ok', json_encode($all) === $js);
 
+// meta — store-size overview as a JSON string; decode and find the users table.
+$meta = hazedb_meta();
+$m = $meta !== null ? json_decode($meta, true) : null;
+$users = null;
+if (is_array($m) && isset($m['table_stats'])) {
+    foreach ($m['table_stats'] as $t) {
+        if ($t['name'] === 'users') { $users = $t; }
+    }
+}
+ok('meta_ok', $users !== null && $users['rows'] === 2 && $users['columns'] === 3 && $users['approx_bytes'] > 0);
+
 // for eyeballing
 echo 'sample=', $js, "\n";
+echo 'meta=', $meta, "\n";

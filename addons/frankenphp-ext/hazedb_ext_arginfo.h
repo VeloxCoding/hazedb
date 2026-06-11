@@ -1,5 +1,5 @@
 /* This is a generated file, edit the .stub.php file instead.
- * Stub hash: 0300ebbc284335b34bfde6d170aeae4a8455a88a */
+ * Stub hash: 97ba0de5fd09d262d11b2e6b0e94681cc87a313d */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_hazedb_fetch, 0, 1, IS_ARRAY, 1)
 	ZEND_ARG_TYPE_INFO(0, sql, IS_STRING, 0)
@@ -18,6 +18,9 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_hazedb_exec, 0, 1, IS_LONG, 0)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, args, IS_MIXED, 0, "null")
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_hazedb_meta, 0, 0, IS_STRING, 1)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_hazedb_ping, 0, 0, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 
@@ -25,6 +28,7 @@ ZEND_FUNCTION(hazedb_fetch);
 ZEND_FUNCTION(hazedb_fetchall);
 ZEND_FUNCTION(hazedb_fetchall_json);
 ZEND_FUNCTION(hazedb_exec);
+ZEND_FUNCTION(hazedb_meta);
 ZEND_FUNCTION(hazedb_ping);
 
 static const zend_function_entry ext_functions[] = {
@@ -32,6 +36,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(hazedb_fetchall, arginfo_hazedb_fetchall)
 	ZEND_FE(hazedb_fetchall_json, arginfo_hazedb_fetchall_json)
 	ZEND_FE(hazedb_exec, arginfo_hazedb_exec)
+	ZEND_FE(hazedb_meta, arginfo_hazedb_meta)
 	ZEND_FE(hazedb_ping, arginfo_hazedb_ping)
 	ZEND_FE_END
 };
