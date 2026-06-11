@@ -49,6 +49,14 @@ func TestMetaSnapshot(t *testing.T) {
 	if stat["big"].ApproxBytes <= stat["small"].ApproxBytes {
 		t.Fatalf("big (%d) should estimate larger than small (%d)", stat["big"].ApproxBytes, stat["small"].ApproxBytes)
 	}
+
+	// Store-wide totals roll up both tables.
+	if m.TotalRows != 2*n {
+		t.Fatalf("TotalRows=%d, want %d", m.TotalRows, 2*n)
+	}
+	if want := stat["small"].ApproxBytes + stat["big"].ApproxBytes; m.TotalApproxBytes != want {
+		t.Fatalf("TotalApproxBytes=%d, want %d", m.TotalApproxBytes, want)
+	}
 	if stat["big"].ApproxBytes < n*1000 {
 		t.Fatalf("big estimate %d too low for %d×1KB rows", stat["big"].ApproxBytes, n)
 	}
@@ -93,7 +101,7 @@ func TestMetaJSON(t *testing.T) {
 
 	// Snake_case keys are the documented contract — assert on the bytes, not just
 	// the decoded struct, so a tag rename can't pass silently.
-	for _, key := range []string{`"tables"`, `"table_stats"`, `"name"`, `"rows"`, `"columns"`, `"indexes"`, `"approx_bytes"`} {
+	for _, key := range []string{`"tables"`, `"total_rows"`, `"total_approx_bytes"`, `"table_stats"`, `"name"`, `"rows"`, `"columns"`, `"indexes"`, `"approx_bytes"`} {
 		if !strings.Contains(string(raw), key) {
 			t.Fatalf("MetaJSON missing key %s: %s", key, raw)
 		}
@@ -108,5 +116,9 @@ func TestMetaJSON(t *testing.T) {
 	}
 	if ts := got.TableStats[0]; ts.Name != "t" || ts.Rows != 1 || ts.Columns != 2 || ts.Indexes != 1 {
 		t.Fatalf("decoded stat = %+v", ts)
+	}
+	// The store-wide totals must equal the sum of the per-table lines.
+	if got.TotalRows != 1 || got.TotalApproxBytes != got.TableStats[0].ApproxBytes {
+		t.Fatalf("totals: rows=%d bytes=%d, want 1 and %d", got.TotalRows, got.TotalApproxBytes, got.TableStats[0].ApproxBytes)
 	}
 }

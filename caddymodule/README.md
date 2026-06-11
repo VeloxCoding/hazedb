@@ -13,12 +13,13 @@ It exposes five endpoints. `POST /query` and `POST /exec` take a JSON body
 | `POST /exec`  | `INSERT` / `UPDATE` / `DELETE` / `CREATE TABLE` / `DROP TABLE` | `{"affected":N}` |
 | `GET /get?table=T&id=UUID` (or `&col=C&val=V`) `[&cols=a,b]` | one-row read (PK or indexed-column fast path) | one JSON object, or `null` |
 | `GET /list?table=T` `[&cols=a,b][&col=C&val=V][&limit=N]` | multi-row read | `[{...},...]` |
-| `GET /meta` | store-size overview | `{"tables":N,"table_stats":[{name,rows,columns,indexes,approx_bytes},...]}` |
+| `GET /meta` | store-size overview | `{"tables":N,"total_rows":R,"total_approx_bytes":B,"table_stats":[{name,rows,columns,indexes,approx_bytes},...]}` |
 
-`GET /meta` takes no parameters; it reports the table count plus, per table, the
-row / column / index counts and an approximate in-RAM byte size — for dashboards
-and health checks. The byte sizes are deliberate estimates (sampled, biased
-slightly high), not exact accounting.
+`GET /meta` takes no parameters; it reports the table count, the store-wide
+`total_rows` / `total_approx_bytes`, and per table the row / column / index
+counts and an approximate in-RAM byte size — for dashboards and health checks.
+The byte sizes are deliberate estimates (sampled, biased slightly high), not
+exact accounting.
 
 `args` is an optional positional list for `?` placeholders. JSON → SQL value
 mapping: number → INT, bool → BOOL, null → NULL, string → STRING, **except** a

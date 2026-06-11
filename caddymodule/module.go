@@ -262,7 +262,8 @@ func (h *Handler) handleExec(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleMeta is the store-size overview: GET /meta → the MetaSnapshot JSON
-// ({"tables":N,"table_stats":[{name,rows,columns,indexes,approx_bytes},...]}).
+// ({"tables":N,"total_rows":R,"total_approx_bytes":B,
+// "table_stats":[{name,rows,columns,indexes,approx_bytes},...]}).
 // No body, no args — a lock-light read for dashboards and health checks. Sizes
 // are deliberate estimates (see hazedb.StoreMeta), not byte-exact accounting.
 func (h *Handler) handleMeta(w http.ResponseWriter, r *http.Request) {

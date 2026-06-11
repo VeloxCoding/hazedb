@@ -19,8 +19,13 @@ import (
 // It answers "how big, roughly" and sizes a future byte cap — it is not
 // byte-exact, and is biased to slightly over-estimate so a cap trips early.
 type StoreMeta struct {
-	Tables     int         `json:"tables"`
-	TableStats []TableStat `json:"table_stats"`
+	Tables int `json:"tables"`
+	// TotalRows / TotalApproxBytes roll up every table's line, so a caller gets
+	// the store-wide footprint without summing TableStats itself. TotalApproxBytes
+	// is the sum of the per-table estimates and inherits their slight over-bias.
+	TotalRows        int         `json:"total_rows"`
+	TotalApproxBytes int64       `json:"total_approx_bytes"`
+	TableStats       []TableStat `json:"table_stats"`
 }
 
 // TableStat is one table's line in a StoreMeta. ApproxBytes is an estimate (see
@@ -117,6 +122,8 @@ func (db *DB) MetaSnapshot() StoreMeta {
 			Indexes:     len(t.indexes),
 			ApproxBytes: bytes,
 		})
+		out.TotalRows += rows
+		out.TotalApproxBytes += bytes
 	}
 	sort.Slice(out.TableStats, func(i, j int) bool {
 		return out.TableStats[i].Name < out.TableStats[j].Name
