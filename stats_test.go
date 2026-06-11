@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"unsafe"
 )
 
 // MetaSnapshot reports the table count and, per table, rows / columns / index
@@ -70,8 +71,36 @@ func TestMetaSnapshot(t *testing.T) {
 	}
 }
 
-// A row deleted after sampling must drop out of the row count, and an empty
-// table must report zero size without dividing by zero.
+// The byte size is now exact in the payload term, not sampled: for a known
+// schema and string length it must equal the precise per-row formula (cells +
+// fixed overhead), to the byte, regardless of row count — pins that a regression
+// in the accounting is caught exactly. 300 rows is past the old 256-row sample
+// window, so a reintroduced sample would diverge here.
+func TestMetaExactBytes(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE t (id uuid primary key, body text)")
+	const (
+		rows   = 300
+		bodyLn = 137
+	)
+	body := strings.Repeat("x", bodyLn)
+	for i := 0; i < rows; i++ {
+		if _, err := db.Exec("INSERT INTO t (id, body) VALUES (?, ?)", tid(i), body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Per row: id (UUID = one Value) + body (one Value + bodyLn backing bytes) +
+	// rowFixedOverhead; no secondary indexes.
+	valSize := int(unsafe.Sizeof(Value{}))
+	perRow := int64(valSize + (valSize + bodyLn) + rowFixedOverhead)
+	want := perRow * rows
+	if got := db.MetaSnapshot().TableStats[0].ApproxBytes; got != want {
+		t.Fatalf("ApproxBytes=%d, want exact %d", got, want)
+	}
+}
+
+// A deleted row must drop out of both the count and the byte total, and an empty
+// table must report zero size.
 func TestMetaSnapshotEmptyAndDelete(t *testing.T) {
 	db := openEmpty(t)
 	db.Exec("CREATE TABLE t (id uuid primary key, n int)")
@@ -82,10 +111,16 @@ func TestMetaSnapshotEmptyAndDelete(t *testing.T) {
 
 	db.Exec("INSERT INTO t (id, n) VALUES (?, ?)", tid(1), 1)
 	db.Exec("INSERT INTO t (id, n) VALUES (?, ?)", tid(2), 2)
+	twoRows := db.MetaSnapshot().TableStats[0].ApproxBytes // tid(1), tid(2) live
 	db.Exec("DELETE FROM t WHERE id = ?", tid(1))
 
-	if ts := db.MetaSnapshot().TableStats[0]; ts.Rows != 1 {
+	ts := db.MetaSnapshot().TableStats[0]
+	if ts.Rows != 1 {
 		t.Fatalf("after one delete: rows=%d, want 1", ts.Rows)
+	}
+	// Two int rows cost the same, so deleting one must halve the byte total.
+	if ts.ApproxBytes != twoRows/2 {
+		t.Fatalf("after delete: bytes=%d, want %d (half of %d)", ts.ApproxBytes, twoRows/2, twoRows)
 	}
 }
 
@@ -120,5 +155,17 @@ func TestMetaJSON(t *testing.T) {
 	// The store-wide totals must equal the sum of the per-table lines.
 	if got.TotalRows != 1 || got.TotalApproxBytes != got.TableStats[0].ApproxBytes {
 		t.Fatalf("totals: rows=%d bytes=%d, want 1 and %d", got.TotalRows, got.TotalApproxBytes, got.TableStats[0].ApproxBytes)
+	}
+}
+
+// BenchmarkMetaSnapshot sizes the exact (full-walk) snapshot's read cost — it is
+// O(live rows), so this is the number that says whether /meta stays cheap enough
+// for a dashboard. It runs on a read path; no write-path code is touched.
+func BenchmarkMetaSnapshot(b *testing.B) {
+	db := newBenchDB(b, 10000)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = db.MetaSnapshot()
 	}
 }
