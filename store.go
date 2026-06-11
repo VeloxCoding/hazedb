@@ -280,9 +280,12 @@ func (t *table) updateByPKJournaled(pk UUID, ords []int, compute func(Row) ([]Va
 		return false, err
 	}
 	if !j.live() {
+		var delta int64
 		for i, ord := range ords {
+			delta += cellDelta(r[ord], vals[i])
 			r[ord] = vals[i]
 		}
+		s.bytes += delta
 		t.markDirtyLocked(s, pk)
 		return true, nil
 	}
@@ -300,6 +303,11 @@ func (t *table) updateByPKJournaled(pk UUID, ords []int, compute func(Row) ([]Va
 		}
 		return false, err
 	}
+	var delta int64
+	for i := range ords {
+		delta += cellDelta(old[i], vals[i])
+	}
+	s.bytes += delta
 	t.markDirtyLocked(s, pk)
 	return true, nil
 }
@@ -323,6 +331,7 @@ func (t *table) updateByPKOneJournaled(pk UUID, ord int, compute func(Row) (Valu
 		return false, err
 	}
 	if !j.live() {
+		s.bytes += cellDelta(r[ord], val)
 		r[ord] = val
 		t.markDirtyLocked(s, pk)
 		return true, nil
@@ -333,6 +342,7 @@ func (t *table) updateByPKOneJournaled(pk UUID, ord int, compute func(Row) (Valu
 		r[ord] = old
 		return false, err
 	}
+	s.bytes += cellDelta(old, val)
 	t.markDirtyLocked(s, pk)
 	return true, nil
 }
@@ -546,10 +556,16 @@ func (t *table) update(pk UUID, mutate func(Row) Row) bool {
 	if !ok {
 		return false
 	}
+	// mutate may edit the row in place and return the same slice, so capture the
+	// old cost BEFORE calling it — afterwards s.rows[rowID] already holds the new
+	// values and the delta would read as zero.
+	nIdx := len(t.indexes)
+	before := rowCost(s.rows[rowID], nIdx)
 	nr := mutate(s.rows[rowID])
 	if nr == nil || nr[t.def.pkOrdinal].UUID() != pk {
 		return false
 	}
+	s.bytes += rowCost(nr, nIdx) - before
 	s.rows[rowID] = nr
 	t.markDirtyLocked(s, pk)
 	return true
@@ -644,7 +660,9 @@ func (t *table) updateWhereAll(match func(Row) bool, ords []int, compute func(Ro
 	}
 	pkOrd := t.def.pkOrdinal
 	touch := t.updateTouchesIndex(ords)
+	nIdx := len(t.indexes)
 	for _, p := range pending {
+		p.s.bytes += rowCost(p.nr, nIdx) - rowCost(p.s.rows[p.j], nIdx)
 		p.s.rows[p.j] = p.nr
 		if touch {
 			t.markDirtyLocked(p.s, p.nr[pkOrd].UUID())
@@ -698,7 +716,9 @@ func (t *table) updateByCandidates(pks []UUID, match func(Row) bool, ords []int,
 	}
 	pkOrd := t.def.pkOrdinal
 	touch := t.updateTouchesIndex(ords)
+	nIdx := len(t.indexes)
 	for _, p := range pending {
+		p.s.bytes += rowCost(p.nr, nIdx) - rowCost(p.s.rows[p.j], nIdx)
 		p.s.rows[p.j] = p.nr
 		if touch {
 			t.markDirtyLocked(p.s, p.nr[pkOrd].UUID())
@@ -731,6 +751,7 @@ func (t *table) updateOneByCandidate(pk UUID, ord int, match func(Row) bool, com
 	}
 	touch := t.ordIsIndexed(ord)
 	if !j.live() {
+		s.bytes += cellDelta(r[ord], val)
 		r[ord] = val
 		if touch {
 			t.markDirtyLocked(s, pk)
@@ -743,6 +764,7 @@ func (t *table) updateOneByCandidate(pk UUID, ord int, match func(Row) bool, com
 		r[ord] = old
 		return 0, err
 	}
+	s.bytes += cellDelta(old, val)
 	if touch {
 		t.markDirtyLocked(s, pk)
 	}

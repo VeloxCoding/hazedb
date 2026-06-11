@@ -187,8 +187,8 @@ func reconcileBytes(t *testing.T, db *DB) {
 
 // The per-shard byte tally must stay exact across every insert and delete path —
 // PK, indexed-candidate, full-scan, and partitioned — measured against a
-// full-walk oracle. (Size-changing UPDATEs join this once the update paths track
-// the delta; this pins insert/delete.)
+// full-walk oracle. Size-changing UPDATEs get their own reconcile in
+// TestByteTallyReconcilesUpdate.
 func TestByteTallyReconcilesInsertDelete(t *testing.T) {
 	db := openEmpty(t)
 	db.Exec("CREATE TABLE u (id uuid primary key, n int, body text, INDEX (body))")
@@ -215,9 +215,36 @@ func TestByteTallyReconcilesInsertDelete(t *testing.T) {
 	reconcileBytes(t, db)
 }
 
-// Replay rebuilds rows through the same insert/delete paths, so the tally must be
-// exact again after a reopen from the WAL — proves accounting lives low enough to
-// ride recovery, not just live writes.
+// A size-changing UPDATE must move the tally by exactly the cell-size delta,
+// across every update path: PK single- and multi-column, full-scan, indexed
+// candidate, and partitioned. Grows and shrinks, reconciled against a full walk.
+func TestByteTallyReconcilesUpdate(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE u (id uuid primary key, n int, body text, INDEX (body))")
+	db.Exec("CREATE TABLE msgs (id uuid primary key, thread uuid partition key, body text)")
+	for i := 0; i < 300; i++ {
+		db.Exec("INSERT INTO u (id, n, body) VALUES (?, ?, ?)", tid(i), i%5, strings.Repeat("x", 10))
+		db.Exec("INSERT INTO msgs (id, thread, body) VALUES (?, ?, ?)", tid(10000+i), tid(i%8), "short")
+	}
+	reconcileBytes(t, db)
+
+	db.Exec("UPDATE u SET body = ? WHERE id = ?", strings.Repeat("y", 200), tid(0)) // PK one-col, grow
+	db.Exec("UPDATE u SET body = ?, n = ? WHERE id = ?", "", 9, tid(1))             // PK multi-col, shrink
+	reconcileBytes(t, db)
+
+	db.Exec("UPDATE u SET body = ? WHERE n = ?", strings.Repeat("z", 80), 2) // full-scan (n not indexed)
+	reconcileBytes(t, db)
+
+	db.Exec("UPDATE u SET body = ? WHERE body = ?", strings.Repeat("w", 5), strings.Repeat("x", 10)) // indexed WHERE
+	reconcileBytes(t, db)
+
+	db.Exec("UPDATE msgs SET body = ? WHERE id = ?", strings.Repeat("p", 50), tid(10000)) // partitioned PK
+	reconcileBytes(t, db)
+}
+
+// Replay rebuilds rows through the same insert/delete/update paths, so the tally
+// must be exact again after a reopen from the WAL — proves accounting lives low
+// enough to ride recovery, not just live writes.
 func TestByteTallyReconcilesAfterReopen(t *testing.T) {
 	dir := t.TempDir()
 	open := func() *DB {
@@ -234,6 +261,9 @@ func TestByteTallyReconcilesAfterReopen(t *testing.T) {
 	}
 	for i := 0; i < 50; i++ {
 		db.Exec("DELETE FROM u WHERE id = ?", tid(i))
+	}
+	for i := 50; i < 80; i++ { // size-changing updates, replayed via the update op
+		db.Exec("UPDATE u SET body = ? WHERE id = ?", strings.Repeat("z", 100), tid(i))
 	}
 	reconcileBytes(t, db)
 	if err := db.FlushWAL(); err != nil {

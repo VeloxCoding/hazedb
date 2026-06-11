@@ -236,9 +236,12 @@ func (t *table) updateByPKJournaledPartitioned(pk UUID, ords []int, compute func
 		return false, err
 	}
 	if !j.live() {
+		var delta int64
 		for i, ord := range ords {
+			delta += cellDelta(r[ord], vals[i])
 			r[ord] = vals[i]
 		}
+		s.bytes += delta
 		return true, nil
 	}
 	var saved [8]Value
@@ -255,6 +258,11 @@ func (t *table) updateByPKJournaledPartitioned(pk UUID, ords []int, compute func
 		}
 		return false, err
 	}
+	var delta int64
+	for i := range ords {
+		delta += cellDelta(old[i], vals[i])
+	}
+	s.bytes += delta
 	return true, nil
 }
 
@@ -280,6 +288,7 @@ func (t *table) updateByPKOneJournaledPartitioned(pk UUID, ord int, compute func
 		return false, err
 	}
 	if !j.live() {
+		s.bytes += cellDelta(r[ord], val)
 		r[ord] = val
 		return true, nil
 	}
@@ -289,6 +298,7 @@ func (t *table) updateByPKOneJournaledPartitioned(pk UUID, ord int, compute func
 		r[ord] = old
 		return false, err
 	}
+	s.bytes += cellDelta(old, val)
 	return true, nil
 }
 
@@ -308,10 +318,15 @@ func (t *table) updatePartitioned(pk UUID, mutate func(Row) Row) bool {
 	if loc.rowID >= uint64(len(s.rows)) {
 		return false
 	}
+	// Capture the old cost before mutate runs — it may edit the row in place and
+	// return the same slice (see update()).
+	nIdx := len(t.indexes)
+	before := rowCost(s.rows[loc.rowID], nIdx)
 	nr := mutate(s.rows[loc.rowID])
 	if nr == nil || nr[t.def.pkOrdinal].UUID() != pk {
 		return false
 	}
+	s.bytes += rowCost(nr, nIdx) - before
 	s.rows[loc.rowID] = nr
 	return true
 }

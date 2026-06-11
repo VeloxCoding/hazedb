@@ -75,6 +75,23 @@ func rowCost(row Row, nIdx int) int64 {
 	return int64(cells + rowFixedOverhead + nIdx*perIndexRowOverhead)
 }
 
+// cellDelta is the byte-tally change from replacing one cell's value. Only
+// string/bytes backing lengths move it — the fixed 32-byte Value cancels in the
+// difference — so a same-kind fixed-width SET (the common int/uuid update)
+// computes to zero with two Kind checks and no arithmetic. The in-place UPDATE
+// paths sum it over the SET columns, keeping the running tally exact without a
+// full-row rescan; a whole-row replacement uses rowCost(new) - rowCost(old).
+func cellDelta(oldv, newv Value) int64 {
+	var d int64
+	if newv.Kind == KindString || newv.Kind == KindBytes {
+		d += int64(newv.w0)
+	}
+	if oldv.Kind == KindString || oldv.Kind == KindBytes {
+		d -= int64(oldv.w0)
+	}
+	return d
+}
+
 // liveStats returns the live row count and the in-RAM byte size for t by reading
 // the per-shard running counters under a brief RLock — O(shards), not O(rows).
 // The counters are maintained by every row mutation (see rowCost), so this never
