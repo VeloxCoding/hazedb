@@ -44,6 +44,10 @@ type DB struct {
 	schema   Schema // bootstrap schema, re-applied each Open
 	sizeHint int
 
+	// budget is the store-wide byte-capacity admission control (MaxBytes). One
+	// per DB, shared by every table. max == 0 (the default) makes it a no-op.
+	budget *byteBudget
+
 	// cat is the live table catalog, published atomically. Reads/writes load
 	// it lock-free; DDL swaps in a new one. ddlMu serialises CREATE/DROP only.
 	cat   atomic.Pointer[catalog]
@@ -80,14 +84,16 @@ func Open(opts Options) (*DB, error) {
 		return nil, err
 	}
 	opts.applyDefaults()
+	budget := &byteBudget{max: opts.MaxBytes}
 	// An empty schema is allowed — tables can be created at runtime.
-	cat, err := newCatalog(opts.Schema, opts.sizeHint)
+	cat, err := newCatalog(opts.Schema, opts.sizeHint, budget)
 	if err != nil {
 		return nil, err
 	}
 	db := &DB{
 		schema:   opts.Schema,
 		sizeHint: opts.sizeHint,
+		budget:   budget,
 		scratch:  newScratchPool(),
 	}
 	db.cat.Store(cat)
@@ -599,7 +605,7 @@ func (db *DB) applyReplayRecord(recType uint8, payload []byte) error {
 		if err != nil {
 			return err
 		}
-		rt := &tableRT{table: newTable(resolved[td.Name], db.sizeHint), tableID: tableID}
+		rt := &tableRT{table: newTable(resolved[td.Name], db.sizeHint, db.budget), tableID: tableID}
 		db.cat.Store(db.cat.Load().withTable(rt))
 		return nil
 	case recDropTable:

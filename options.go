@@ -53,6 +53,14 @@ type Options struct {
 	// Requires WALLevel > 0.
 	SQLitePath string
 
+	// MaxBytes caps the store's approximate in-RAM size (the sum of every table's
+	// byte tally, the same figure MetaSnapshot reports). An INSERT that would push
+	// the total past it is rejected with ErrCapacity; the store never auto-evicts,
+	// so the caller frees space with DELETE / DROP TABLE. 0 (the default) is
+	// unlimited and adds no write-path cost. The estimate counts cell payloads
+	// plus fixed per-row and per-index overhead, biased slightly high.
+	MaxBytes int64
+
 	// --- internal tuning (package tests only; not operator-facing) ---
 
 	// sizeHint pre-sizes shard arenas (a per-table row-count estimate).

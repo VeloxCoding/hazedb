@@ -33,6 +33,10 @@ type table struct {
 	def    *resolvedTable
 	shards []tableShard
 	mask   uint32
+	// budget is the store-wide byte-capacity admission control, shared by every
+	// table in the DB (nil only in a few internal tests that bypass Open). Inserts
+	// reserve against it; deletes and size-changing updates release/adjust it.
+	budget *byteBudget
 	// indexes are the secondary indexes declared on non-PK columns (nil when
 	// none). Maintained per docs/secondary-indexes.md; only non-partitioned
 	// tables may declare them (enforced in resolveSchema).
@@ -104,25 +108,37 @@ func (t *table) markDelDirtyLocked(s *tableShard, pk UUID) {
 	}
 }
 
-// addRowLocked appends row to the shard arena, bumps the live count, adds the
-// row's byte cost to the tally, and returns its rowID. Caller holds s.mu. nIdx
-// is the table's secondary-index count, folded into the cost so the tally tracks
-// what MetaSnapshot reports. The single append point for the byte tally.
-func (s *tableShard) addRowLocked(row Row, nIdx int) uint64 {
+// addRowLocked appends row to the shard arena, bumps the live count, adds cost
+// (its precomputed rowCost) to the per-shard tally, and returns its rowID. Caller
+// holds s.mu and has already reserved cost against the table budget. The single
+// append point for the byte tally.
+func (s *tableShard) addRowLocked(row Row, cost int64) uint64 {
 	rowID := uint64(len(s.rows))
 	s.rows = append(s.rows, row)
 	s.live++
-	s.bytes += rowCost(row, nIdx)
+	s.bytes += cost
 	return rowID
 }
 
-// tombstoneLocked nil-marks rowID, drops the live count, and subtracts the
-// removed row's byte cost from the tally. Caller holds s.mu and has confirmed
-// s.rows[rowID] is a live (non-nil) row. The single tombstone point for the tally.
-func (s *tableShard) tombstoneLocked(rowID uint64, nIdx int) {
-	s.bytes -= rowCost(s.rows[rowID], nIdx)
+// addBytesLocked applies a signed byte delta from an in-place or whole-row
+// UPDATE to both the per-shard tally and the shared budget, keeping the budget
+// total equal to the sum of the shard tallies. Caller holds s.mu. A grow is not
+// gated (only inserts reserve); it can push the budget over max, after which
+// inserts are rejected until space frees.
+func (s *tableShard) addBytesLocked(delta int64, b *byteBudget) {
+	s.bytes += delta
+	b.adjust(delta)
+}
+
+// tombstoneLocked nil-marks rowID, drops the live count, subtracts the removed
+// row's byte cost from the per-shard tally, and releases those bytes back to the
+// budget b. Caller holds s.mu and has confirmed s.rows[rowID] is a live row.
+func (s *tableShard) tombstoneLocked(rowID uint64, nIdx int, b *byteBudget) {
+	cost := rowCost(s.rows[rowID], nIdx)
+	s.bytes -= cost
 	s.rows[rowID] = nil
 	s.live--
+	b.release(cost)
 }
 
 // ordIsIndexed reports whether column ordinal ord is part of any secondary index
@@ -152,12 +168,13 @@ func (t *table) updateTouchesIndex(ords []int) bool {
 	return false
 }
 
-func newTable(def *resolvedTable, sizeHint int) *table {
+func newTable(def *resolvedTable, sizeHint int, budget *byteBudget) *table {
 	n := shardCount()
 	t := &table{
 		def:    def,
 		shards: make([]tableShard, n),
 		mask:   uint32(n - 1),
+		budget: budget,
 	}
 	per := sizeHint / n
 	if per < 16 {
@@ -211,7 +228,11 @@ func (t *table) insert(row Row) error {
 	if exists {
 		return ErrDuplicatePK
 	}
-	rowID := s.addRowLocked(row, len(t.indexes))
+	cost := rowCost(row, len(t.indexes))
+	if !t.budget.reserve(cost) {
+		return ErrCapacity
+	}
+	rowID := s.addRowLocked(row, cost)
 	s.pk.commit(slot, pk, rowID)
 	t.markDirtyLocked(s, pk)
 	return nil
@@ -246,10 +267,15 @@ func (t *table) insertJournaled(row Row, j mutJournal) error {
 	if exists {
 		return ErrDuplicatePK
 	}
+	cost := rowCost(row, len(t.indexes))
+	if !t.budget.reserve(cost) {
+		return ErrCapacity
+	}
 	if err := j.insert(row); err != nil {
+		t.budget.release(cost) // un-reserve: the row is not added
 		return err
 	}
-	rowID := s.addRowLocked(row, len(t.indexes))
+	rowID := s.addRowLocked(row, cost)
 	s.pk.commit(slot, pk, rowID)
 	t.markDirtyLocked(s, pk)
 	return nil
@@ -285,7 +311,7 @@ func (t *table) updateByPKJournaled(pk UUID, ords []int, compute func(Row) ([]Va
 			delta += cellDelta(r[ord], vals[i])
 			r[ord] = vals[i]
 		}
-		s.bytes += delta
+		s.addBytesLocked(delta, t.budget)
 		t.markDirtyLocked(s, pk)
 		return true, nil
 	}
@@ -307,7 +333,7 @@ func (t *table) updateByPKJournaled(pk UUID, ords []int, compute func(Row) ([]Va
 	for i := range ords {
 		delta += cellDelta(old[i], vals[i])
 	}
-	s.bytes += delta
+	s.addBytesLocked(delta, t.budget)
 	t.markDirtyLocked(s, pk)
 	return true, nil
 }
@@ -331,7 +357,7 @@ func (t *table) updateByPKOneJournaled(pk UUID, ord int, compute func(Row) (Valu
 		return false, err
 	}
 	if !j.live() {
-		s.bytes += cellDelta(r[ord], val)
+		s.addBytesLocked(cellDelta(r[ord], val), t.budget)
 		r[ord] = val
 		t.markDirtyLocked(s, pk)
 		return true, nil
@@ -342,7 +368,7 @@ func (t *table) updateByPKOneJournaled(pk UUID, ord int, compute func(Row) (Valu
 		r[ord] = old
 		return false, err
 	}
-	s.bytes += cellDelta(old, val)
+	s.addBytesLocked(cellDelta(old, val), t.budget)
 	t.markDirtyLocked(s, pk)
 	return true, nil
 }
@@ -364,7 +390,7 @@ func (t *table) deleteByPKJournaled(pk UUID, j mutJournal) (bool, error) {
 	if err := j.delete(); err != nil {
 		return false, err
 	}
-	s.tombstoneLocked(rowID, len(t.indexes))
+	s.tombstoneLocked(rowID, len(t.indexes), t.budget)
 	s.pk.del(pk)
 	t.markDelDirtyLocked(s, pk)
 	return true, nil
@@ -565,7 +591,7 @@ func (t *table) update(pk UUID, mutate func(Row) Row) bool {
 	if nr == nil || nr[t.def.pkOrdinal].UUID() != pk {
 		return false
 	}
-	s.bytes += rowCost(nr, nIdx) - before
+	s.addBytesLocked(rowCost(nr, nIdx)-before, t.budget)
 	s.rows[rowID] = nr
 	t.markDirtyLocked(s, pk)
 	return true
@@ -662,7 +688,7 @@ func (t *table) updateWhereAll(match func(Row) bool, ords []int, compute func(Ro
 	touch := t.updateTouchesIndex(ords)
 	nIdx := len(t.indexes)
 	for _, p := range pending {
-		p.s.bytes += rowCost(p.nr, nIdx) - rowCost(p.s.rows[p.j], nIdx)
+		p.s.addBytesLocked(rowCost(p.nr, nIdx)-rowCost(p.s.rows[p.j], nIdx), t.budget)
 		p.s.rows[p.j] = p.nr
 		if touch {
 			t.markDirtyLocked(p.s, p.nr[pkOrd].UUID())
@@ -718,7 +744,7 @@ func (t *table) updateByCandidates(pks []UUID, match func(Row) bool, ords []int,
 	touch := t.updateTouchesIndex(ords)
 	nIdx := len(t.indexes)
 	for _, p := range pending {
-		p.s.bytes += rowCost(p.nr, nIdx) - rowCost(p.s.rows[p.j], nIdx)
+		p.s.addBytesLocked(rowCost(p.nr, nIdx)-rowCost(p.s.rows[p.j], nIdx), t.budget)
 		p.s.rows[p.j] = p.nr
 		if touch {
 			t.markDirtyLocked(p.s, p.nr[pkOrd].UUID())
@@ -751,7 +777,7 @@ func (t *table) updateOneByCandidate(pk UUID, ord int, match func(Row) bool, com
 	}
 	touch := t.ordIsIndexed(ord)
 	if !j.live() {
-		s.bytes += cellDelta(r[ord], val)
+		s.addBytesLocked(cellDelta(r[ord], val), t.budget)
 		r[ord] = val
 		if touch {
 			t.markDirtyLocked(s, pk)
@@ -764,7 +790,7 @@ func (t *table) updateOneByCandidate(pk UUID, ord int, match func(Row) bool, com
 		r[ord] = old
 		return 0, err
 	}
-	s.bytes += cellDelta(old, val)
+	s.addBytesLocked(cellDelta(old, val), t.budget)
 	if touch {
 		t.markDirtyLocked(s, pk)
 	}
@@ -784,7 +810,7 @@ func (t *table) deleteByPK(pk UUID) bool {
 	if !ok {
 		return false
 	}
-	s.tombstoneLocked(rowID, len(t.indexes))
+	s.tombstoneLocked(rowID, len(t.indexes), t.budget)
 	t.markDelDirtyLocked(s, pk)
 	return true
 }
@@ -827,7 +853,7 @@ func (t *table) deleteWhereAll(match func(Row) bool, encode func(pk Value) []byt
 	}
 	for _, p := range pending {
 		p.s.pk.del(p.pk)
-		p.s.tombstoneLocked(uint64(p.j), len(t.indexes))
+		p.s.tombstoneLocked(uint64(p.j), len(t.indexes), t.budget)
 		t.markDelDirtyLocked(p.s, p.pk)
 	}
 	return len(pending), nil
@@ -868,7 +894,7 @@ func (t *table) deleteByCandidates(pks []UUID, match func(Row) bool, encode func
 	}
 	for _, p := range pending {
 		p.s.pk.del(p.pk)
-		p.s.tombstoneLocked(p.j, len(t.indexes))
+		p.s.tombstoneLocked(p.j, len(t.indexes), t.budget)
 		t.markDelDirtyLocked(p.s, p.pk)
 	}
 	return len(pending), nil

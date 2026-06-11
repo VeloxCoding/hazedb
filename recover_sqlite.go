@@ -26,7 +26,7 @@ func (db *DB) recoverFromSQLite() error {
 		if err != nil {
 			return fmt.Errorf("recover: resolve %q: %w", dt.name, err)
 		}
-		rt := &tableRT{table: newTable(resolved[dt.name], db.sizeHint), tableID: id}
+		rt := &tableRT{table: newTable(resolved[dt.name], db.sizeHint, db.budget), tableID: id}
 		db.cat.Store(cat.withTable(rt))
 	}
 	for id, dt := range m.tables {

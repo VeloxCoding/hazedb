@@ -21,7 +21,7 @@ func (rt *tableRT) name() string { return rt.table.def.def.Name }
 
 // newCatalog builds the bootstrap catalog from the Open() schema. Table IDs
 // are the schema order (0..n-1); these are the durable IDs the WAL uses.
-func newCatalog(schema Schema, sizeHint int) (*catalog, error) {
+func newCatalog(schema Schema, sizeHint int, budget *byteBudget) (*catalog, error) {
 	resolved, err := resolveSchema(schema)
 	if err != nil {
 		return nil, err
@@ -32,7 +32,7 @@ func newCatalog(schema Schema, sizeHint int) (*catalog, error) {
 		byID:    make([]*tableRT, 0, len(schema.Tables)),
 	}
 	for i, td := range schema.Tables {
-		rt := &tableRT{table: newTable(resolved[td.Name], sizeHint), tableID: uint16(i)}
+		rt := &tableRT{table: newTable(resolved[td.Name], sizeHint, budget), tableID: uint16(i)}
 		c.byName[td.Name] = rt
 		c.byID = append(c.byID, rt)
 	}
@@ -94,7 +94,7 @@ func (db *DB) createTable(td TableDef) error {
 	if err != nil {
 		return err
 	}
-	rt := &tableRT{table: newTable(resolved[td.Name], db.sizeHint), tableID: uint16(len(cur.byID))}
+	rt := &tableRT{table: newTable(resolved[td.Name], db.sizeHint, db.budget), tableID: uint16(len(cur.byID))}
 	if db.wal != nil {
 		bp := db.scratch.get()
 		*bp = encodeCreateTable(*bp, rt.tableID, td)

@@ -51,10 +51,15 @@ func (t *table) insertPartitioned(row Row, j mutJournal) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	cost := rowCost(row, len(t.indexes))
+	if !t.budget.reserve(cost) {
+		return ErrCapacity
+	}
 	if err := j.insert(row); err != nil {
+		t.budget.release(cost) // un-reserve: the row is not added
 		return err
 	}
-	rowID := s.addRowLocked(row, len(t.indexes))
+	rowID := s.addRowLocked(row, cost)
 	s.tails[part] = append(s.tails[part], rowID)
 	t.pkDir.idx[pk] = rowLocation{shard: idx, rowID: rowID}
 	return nil
@@ -241,7 +246,7 @@ func (t *table) updateByPKJournaledPartitioned(pk UUID, ords []int, compute func
 			delta += cellDelta(r[ord], vals[i])
 			r[ord] = vals[i]
 		}
-		s.bytes += delta
+		s.addBytesLocked(delta, t.budget)
 		return true, nil
 	}
 	var saved [8]Value
@@ -262,7 +267,7 @@ func (t *table) updateByPKJournaledPartitioned(pk UUID, ords []int, compute func
 	for i := range ords {
 		delta += cellDelta(old[i], vals[i])
 	}
-	s.bytes += delta
+	s.addBytesLocked(delta, t.budget)
 	return true, nil
 }
 
@@ -288,7 +293,7 @@ func (t *table) updateByPKOneJournaledPartitioned(pk UUID, ord int, compute func
 		return false, err
 	}
 	if !j.live() {
-		s.bytes += cellDelta(r[ord], val)
+		s.addBytesLocked(cellDelta(r[ord], val), t.budget)
 		r[ord] = val
 		return true, nil
 	}
@@ -298,7 +303,7 @@ func (t *table) updateByPKOneJournaledPartitioned(pk UUID, ord int, compute func
 		r[ord] = old
 		return false, err
 	}
-	s.bytes += cellDelta(old, val)
+	s.addBytesLocked(cellDelta(old, val), t.budget)
 	return true, nil
 }
 
@@ -326,7 +331,7 @@ func (t *table) updatePartitioned(pk UUID, mutate func(Row) Row) bool {
 	if nr == nil || nr[t.def.pkOrdinal].UUID() != pk {
 		return false
 	}
-	s.bytes += rowCost(nr, nIdx) - before
+	s.addBytesLocked(rowCost(nr, nIdx)-before, t.budget)
 	s.rows[loc.rowID] = nr
 	return true
 }
@@ -348,7 +353,7 @@ func (t *table) deleteByPKJournaledPartitioned(pk UUID, j mutJournal) (bool, err
 		return false, err
 	}
 	if loc.rowID < uint64(len(s.rows)) {
-		s.tombstoneLocked(loc.rowID, len(t.indexes))
+		s.tombstoneLocked(loc.rowID, len(t.indexes), t.budget)
 	}
 	delete(t.pkDir.idx, pk)
 	return true, nil
@@ -396,7 +401,7 @@ func (t *table) deleteWhereAllPartitioned(match func(Row) bool, encode func(pk V
 		}
 	}
 	for _, p := range pending {
-		p.s.tombstoneLocked(uint64(p.j), len(t.indexes))
+		p.s.tombstoneLocked(uint64(p.j), len(t.indexes), t.budget)
 		delete(t.pkDir.idx, p.pk)
 	}
 	return len(pending), nil
