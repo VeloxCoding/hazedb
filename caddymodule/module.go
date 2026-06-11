@@ -2,7 +2,8 @@
 //
 // The core hazedb package stays Caddy-free; this adapter owns the transport:
 // it opens a *DB, serves GET /get (single-row read), GET /list (multi-row
-// read), POST /query and POST /exec over an internal mux, and registers the
+// read), POST /query, POST /exec, and GET /meta (store-size overview) over an
+// internal mux, and registers the
 // *DB under a name in the core registry so an
 // in-process consumer (the FrankenPHP/PHP extension) reaches the very same
 // instance. Per the gateway boundary in the RFC, request-context cross-cutting
@@ -138,6 +139,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	h.mux.HandleFunc("/list", h.handleList)
 	h.mux.HandleFunc("/query", h.handleQuery)
 	h.mux.HandleFunc("/exec", h.handleExec)
+	h.mux.HandleFunc("/meta", h.handleMeta)
 
 	hazedb.RegisterDB(h.name, db)
 	return nil
@@ -257,6 +259,18 @@ func (h *Handler) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, hazedb.ExecResultJSON(n))
+}
+
+// handleMeta is the store-size overview: GET /meta → the MetaSnapshot JSON
+// ({"tables":N,"table_stats":[{name,rows,columns,indexes,approx_bytes},...]}).
+// No body, no args — a lock-light read for dashboards and health checks. Sizes
+// are deliberate estimates (see hazedb.StoreMeta), not byte-exact accounting.
+func (h *Handler) handleMeta(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, hazedb.ErrorJSON("use GET"))
+		return
+	}
+	writeJSON(w, http.StatusOK, h.db.MetaJSON())
 }
 
 // handleGet is the typed PK read: GET /get?table=T&id=UUID[&cols=a,b]. The read

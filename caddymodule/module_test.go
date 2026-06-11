@@ -78,6 +78,63 @@ func TestModuleEndToEnd(t *testing.T) {
 	}
 }
 
+// GET /meta returns the store-size overview; a non-GET is rejected. The size
+// estimate must track payload weight (a 1 KB-text table outweighs an int table).
+func TestModuleMeta(t *testing.T) {
+	h := &Handler{}
+	if err := h.Provision(caddy.Context{}); err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	defer h.Cleanup()
+
+	if _, err := h.db.Exec("CREATE TABLE small (id uuid primary key, n int)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Exec("CREATE TABLE big (id uuid primary key, body text)"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		h.db.Exec("INSERT INTO small (id, n) VALUES (?, ?)", hazedb.NewUUIDv7(), i)
+		h.db.Exec("INSERT INTO big (id, body) VALUES (?, ?)", hazedb.NewUUIDv7(), strings.Repeat("x", 1000))
+	}
+
+	r := httptest.NewRequest(http.MethodGet, "/meta", nil)
+	w := httptest.NewRecorder()
+	if err := h.ServeHTTP(w, r, noopNext); err != nil {
+		t.Fatalf("ServeHTTP /meta: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("/meta: %d %s", w.Code, w.Body.String())
+	}
+	var m hazedb.StoreMeta
+	if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil {
+		t.Fatalf("/meta not StoreMeta JSON: %q", w.Body.String())
+	}
+	if m.Tables != 2 || len(m.TableStats) != 2 {
+		t.Fatalf("meta = %+v, want 2 tables", m)
+	}
+	stat := map[string]hazedb.TableStat{}
+	for _, ts := range m.TableStats {
+		stat[ts.Name] = ts
+	}
+	if stat["small"].Rows != 20 || stat["big"].Rows != 20 {
+		t.Fatalf("rows: small=%d big=%d, want 20 each", stat["small"].Rows, stat["big"].Rows)
+	}
+	if stat["big"].ApproxBytes <= stat["small"].ApproxBytes {
+		t.Fatalf("big (%d) should outweigh small (%d)", stat["big"].ApproxBytes, stat["small"].ApproxBytes)
+	}
+
+	// A non-GET is a clean 405, not a panic or a write.
+	rp := httptest.NewRequest(http.MethodPost, "/meta", strings.NewReader("{}"))
+	wp := httptest.NewRecorder()
+	if err := h.ServeHTTP(wp, rp, noopNext); err != nil {
+		t.Fatalf("ServeHTTP POST /meta: %v", err)
+	}
+	if wp.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /meta: got %d, want 405", wp.Code)
+	}
+}
+
 // Cleanup must clear the registry slot so a removed handler leaves no instance.
 func TestModuleCleanupDeregisters(t *testing.T) {
 	h := &Handler{}
