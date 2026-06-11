@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -111,5 +112,65 @@ func TestBodyLimit(t *testing.T) {
 	// everything).
 	if w, _ := do(t, h, "/query", `{"sql":"SELECT 1"}`); w.Code == http.StatusRequestEntityTooLarge {
 		t.Fatalf("small body wrongly rejected as too large: %s", w.Body.String())
+	}
+}
+
+// TestGetListRejectInjection guards the identifier validation on /get and /list,
+// which build SQL by concatenating table/cols/col. A refactor could silently
+// weaken it, so pin that injection payloads (quote, semicolon, space, …) are
+// rejected with 400 and that valid identifiers (incl. whitespace around a comma,
+// which is normalized) are accepted.
+func TestGetListRejectInjection(t *testing.T) {
+	h := &Handler{}
+	if err := h.Provision(caddy.Context{}); err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	defer h.Cleanup()
+	if _, err := h.db.Exec("CREATE TABLE users (id uuid primary key, name text)"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	get := func(path string) int {
+		r := httptest.NewRequest(http.MethodGet, path, nil)
+		w := httptest.NewRecorder()
+		if err := h.ServeHTTP(w, r, noopNext); err != nil {
+			t.Fatalf("ServeHTTP %s: %v", path, err)
+		}
+		return w.Code
+	}
+
+	const validUUID = "00000000-0000-7000-8000-000000000000"
+	bad := []string{
+		"users;DROP TABLE users", // semicolon
+		"users'",                 // single quote
+		"users\"",                // double quote
+		"a b",                    // space
+		"users)",                 // paren
+		"1users",                 // leading digit
+	}
+	for _, v := range bad {
+		e := url.QueryEscape(v)
+		if code := get("/get?table=" + e + "&id=" + validUUID); code != http.StatusBadRequest {
+			t.Errorf("/get table=%q: got %d, want 400", v, code)
+		}
+		if code := get("/list?table=" + e); code != http.StatusBadRequest {
+			t.Errorf("/list table=%q: got %d, want 400", v, code)
+		}
+		if code := get("/list?table=users&cols=" + e); code != http.StatusBadRequest {
+			t.Errorf("/list cols=%q: got %d, want 400", v, code)
+		}
+		if code := get("/list?table=users&col=" + e + "&val=x"); code != http.StatusBadRequest {
+			t.Errorf("/list col=%q: got %d, want 400", v, code)
+		}
+	}
+
+	// Positive controls: valid identifiers are accepted, and whitespace around a
+	// comma in cols is normalized (not rejected) so the SQL matches what was
+	// validated.
+	if code := get("/list?table=users"); code != http.StatusOK {
+		t.Errorf("/list valid table: got %d, want 200", code)
+	}
+	if code := get("/list?table=users&cols=" + url.QueryEscape("id, name")); code != http.StatusOK {
+		t.Errorf("/list cols with spaces: got %d, want 200", code)
 	}
 }

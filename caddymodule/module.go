@@ -279,11 +279,12 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 	sel := "*"
 	if cols != "" {
-		if !isColList(cols) {
+		norm, ok := validColList(cols)
+		if !ok {
 			writeJSON(w, http.StatusBadRequest, hazedb.ErrorJSON("cols must be a comma-separated identifier list"))
 			return
 		}
-		sel = cols
+		sel = norm
 	}
 
 	bp := getBufPool.Get().(*[]byte)
@@ -349,11 +350,12 @@ func (h *Handler) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 	sel := "*"
 	if cols != "" {
-		if !isColList(cols) {
+		norm, ok := validColList(cols)
+		if !ok {
 			writeJSON(w, http.StatusBadRequest, hazedb.ErrorJSON("cols must be a comma-separated identifier list"))
 			return
 		}
-		sel = cols
+		sel = norm
 	}
 	sql := "SELECT " + sel + " FROM " + table
 	var args []hazedb.Value
@@ -403,14 +405,19 @@ func isIdent(s string) bool {
 	return true
 }
 
-// isColList reports whether s is a comma-separated list of bare identifiers.
-func isColList(s string) bool {
-	for _, p := range strings.Split(s, ",") {
-		if !isIdent(strings.TrimSpace(p)) {
-			return false
+// validColList validates s as a comma-separated list of bare identifiers and
+// returns it normalized (each part whitespace-trimmed, rejoined) so the SQL is
+// built from exactly the validated identifiers, not the raw query-string bytes.
+func validColList(s string) (string, bool) {
+	parts := strings.Split(s, ",")
+	for i, p := range parts {
+		p = strings.TrimSpace(p)
+		if !isIdent(p) {
+			return "", false
 		}
+		parts[i] = p
 	}
-	return true
+	return strings.Join(parts, ","), true
 }
 
 func writeJSON(w http.ResponseWriter, status int, body []byte) {
