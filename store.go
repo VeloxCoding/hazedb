@@ -69,7 +69,10 @@ type tableShard struct {
 	// instead of every row, so it is O(partition size), not O(table). Deleted
 	// rowIDs stay in the list (rows[rowID] is nil) and the scan skips them.
 	tails map[UUID][]uint64
-	live  int // count of non-tombstoned rows
+	live  int   // count of non-tombstoned rows
+	bytes int64 // running in-RAM byte tally of the live rows (see rowCost); the
+	// O(1) source MetaSnapshot reads and a future byte cap checks, maintained
+	// under s.mu by every row mutation so it never walks the arena.
 	// dirtyRead / dirtyDel list PKs mutated on this shard since the last merge
 	// (nil unless the table has secondary indexes). dirtyRead holds inserts +
 	// indexed-column updates (rows the read overlay must consider); dirtyDel holds
@@ -99,6 +102,27 @@ func (t *table) markDelDirtyLocked(s *tableShard, pk UUID) {
 		s.dirtyDel = append(s.dirtyDel, pk)
 		t.delDirtyCount.Add(1)
 	}
+}
+
+// addRowLocked appends row to the shard arena, bumps the live count, adds the
+// row's byte cost to the tally, and returns its rowID. Caller holds s.mu. nIdx
+// is the table's secondary-index count, folded into the cost so the tally tracks
+// what MetaSnapshot reports. The single append point for the byte tally.
+func (s *tableShard) addRowLocked(row Row, nIdx int) uint64 {
+	rowID := uint64(len(s.rows))
+	s.rows = append(s.rows, row)
+	s.live++
+	s.bytes += rowCost(row, nIdx)
+	return rowID
+}
+
+// tombstoneLocked nil-marks rowID, drops the live count, and subtracts the
+// removed row's byte cost from the tally. Caller holds s.mu and has confirmed
+// s.rows[rowID] is a live (non-nil) row. The single tombstone point for the tally.
+func (s *tableShard) tombstoneLocked(rowID uint64, nIdx int) {
+	s.bytes -= rowCost(s.rows[rowID], nIdx)
+	s.rows[rowID] = nil
+	s.live--
 }
 
 // ordIsIndexed reports whether column ordinal ord is part of any secondary index
@@ -187,10 +211,8 @@ func (t *table) insert(row Row) error {
 	if exists {
 		return ErrDuplicatePK
 	}
-	rowID := uint64(len(s.rows))
-	s.rows = append(s.rows, row)
+	rowID := s.addRowLocked(row, len(t.indexes))
 	s.pk.commit(slot, pk, rowID)
-	s.live++
 	t.markDirtyLocked(s, pk)
 	return nil
 }
@@ -227,10 +249,8 @@ func (t *table) insertJournaled(row Row, j mutJournal) error {
 	if err := j.insert(row); err != nil {
 		return err
 	}
-	rowID := uint64(len(s.rows))
-	s.rows = append(s.rows, row)
+	rowID := s.addRowLocked(row, len(t.indexes))
 	s.pk.commit(slot, pk, rowID)
-	s.live++
 	t.markDirtyLocked(s, pk)
 	return nil
 }
@@ -334,9 +354,8 @@ func (t *table) deleteByPKJournaled(pk UUID, j mutJournal) (bool, error) {
 	if err := j.delete(); err != nil {
 		return false, err
 	}
-	s.rows[rowID] = nil
+	s.tombstoneLocked(rowID, len(t.indexes))
 	s.pk.del(pk)
-	s.live--
 	t.markDelDirtyLocked(s, pk)
 	return true, nil
 }
@@ -743,8 +762,7 @@ func (t *table) deleteByPK(pk UUID) bool {
 	if !ok {
 		return false
 	}
-	s.rows[rowID] = nil
-	s.live--
+	s.tombstoneLocked(rowID, len(t.indexes))
 	t.markDelDirtyLocked(s, pk)
 	return true
 }
@@ -787,8 +805,7 @@ func (t *table) deleteWhereAll(match func(Row) bool, encode func(pk Value) []byt
 	}
 	for _, p := range pending {
 		p.s.pk.del(p.pk)
-		p.s.rows[p.j] = nil
-		p.s.live--
+		p.s.tombstoneLocked(uint64(p.j), len(t.indexes))
 		t.markDelDirtyLocked(p.s, p.pk)
 	}
 	return len(pending), nil
@@ -829,8 +846,7 @@ func (t *table) deleteByCandidates(pks []UUID, match func(Row) bool, encode func
 	}
 	for _, p := range pending {
 		p.s.pk.del(p.pk)
-		p.s.rows[p.j] = nil
-		p.s.live--
+		p.s.tombstoneLocked(p.j, len(t.indexes))
 		t.markDelDirtyLocked(p.s, p.pk)
 	}
 	return len(pending), nil

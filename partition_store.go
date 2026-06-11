@@ -54,9 +54,7 @@ func (t *table) insertPartitioned(row Row, j mutJournal) error {
 	if err := j.insert(row); err != nil {
 		return err
 	}
-	rowID := uint64(len(s.rows))
-	s.rows = append(s.rows, row)
-	s.live++
+	rowID := s.addRowLocked(row, len(t.indexes))
 	s.tails[part] = append(s.tails[part], rowID)
 	t.pkDir.idx[pk] = rowLocation{shard: idx, rowID: rowID}
 	return nil
@@ -335,8 +333,7 @@ func (t *table) deleteByPKJournaledPartitioned(pk UUID, j mutJournal) (bool, err
 		return false, err
 	}
 	if loc.rowID < uint64(len(s.rows)) {
-		s.rows[loc.rowID] = nil
-		s.live--
+		s.tombstoneLocked(loc.rowID, len(t.indexes))
 	}
 	delete(t.pkDir.idx, pk)
 	return true, nil
@@ -384,8 +381,7 @@ func (t *table) deleteWhereAllPartitioned(match func(Row) bool, encode func(pk V
 		}
 	}
 	for _, p := range pending {
-		p.s.rows[p.j] = nil
-		p.s.live--
+		p.s.tombstoneLocked(uint64(p.j), len(t.indexes))
 		delete(t.pkDir.idx, p.pk)
 	}
 	return len(pending), nil

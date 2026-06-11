@@ -158,9 +158,100 @@ func TestMetaJSON(t *testing.T) {
 	}
 }
 
-// BenchmarkMetaSnapshot sizes the exact (full-walk) snapshot's read cost — it is
-// O(live rows), so this is the number that says whether /meta stays cheap enough
-// for a dashboard. It runs on a read path; no write-path code is touched.
+// reconcileBytes asserts every table's running byte tally (the per-shard
+// counters) equals a full walk of its live rows using the same rowCost the
+// counters use. A mutation path that forgets to adjust the tally shows up here
+// as a mismatch — the safety net that lets the counter touch many call sites.
+func reconcileBytes(t *testing.T, db *DB) {
+	t.Helper()
+	for _, rt := range db.cat.Load().byName {
+		tbl := rt.table
+		nIdx := len(tbl.indexes)
+		var counter, walk int64
+		for i := range tbl.shards {
+			s := &tbl.shards[i]
+			s.mu.RLock()
+			counter += s.bytes
+			for _, r := range s.rows {
+				if r != nil {
+					walk += rowCost(r, nIdx)
+				}
+			}
+			s.mu.RUnlock()
+		}
+		if counter != walk {
+			t.Fatalf("table %s: byte tally %d != full-walk %d", rt.name(), counter, walk)
+		}
+	}
+}
+
+// The per-shard byte tally must stay exact across every insert and delete path —
+// PK, indexed-candidate, full-scan, and partitioned — measured against a
+// full-walk oracle. (Size-changing UPDATEs join this once the update paths track
+// the delta; this pins insert/delete.)
+func TestByteTallyReconcilesInsertDelete(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE u (id uuid primary key, n int, body text, INDEX (body))")
+	db.Exec("CREATE TABLE msgs (id uuid primary key, thread uuid partition key, body text)")
+	for i := 0; i < 500; i++ {
+		if _, err := db.Exec("INSERT INTO u (id, n, body) VALUES (?, ?, ?)", tid(i), i%10, strings.Repeat("x", i%50)); err != nil {
+			t.Fatal(err)
+		}
+		db.Exec("INSERT INTO msgs (id, thread, body) VALUES (?, ?, ?)", tid(10000+i), tid(i%8), "m")
+	}
+	reconcileBytes(t, db)
+
+	for i := 0; i < 100; i++ { // PK delete
+		db.Exec("DELETE FROM u WHERE id = ?", tid(i))
+	}
+	reconcileBytes(t, db)
+
+	db.Exec("DELETE FROM u WHERE body = ?", strings.Repeat("x", 7)) // indexed-candidate delete
+	db.Exec("DELETE FROM u WHERE n = ?", 3)                         // full-scan delete (n not indexed)
+	reconcileBytes(t, db)
+
+	db.Exec("DELETE FROM msgs WHERE id = ?", tid(10000)) // partitioned PK delete
+	db.Exec("DELETE FROM msgs WHERE body = ?", "m")      // partitioned full-scan delete
+	reconcileBytes(t, db)
+}
+
+// Replay rebuilds rows through the same insert/delete paths, so the tally must be
+// exact again after a reopen from the WAL — proves accounting lives low enough to
+// ride recovery, not just live writes.
+func TestByteTallyReconcilesAfterReopen(t *testing.T) {
+	dir := t.TempDir()
+	open := func() *DB {
+		db, err := Open(Options{WALLevel: WALPeriodic, WALPath: dir})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return db
+	}
+	db := open()
+	db.Exec("CREATE TABLE u (id uuid primary key, body text)")
+	for i := 0; i < 200; i++ {
+		db.Exec("INSERT INTO u (id, body) VALUES (?, ?)", tid(i), strings.Repeat("y", i%40))
+	}
+	for i := 0; i < 50; i++ {
+		db.Exec("DELETE FROM u WHERE id = ?", tid(i))
+	}
+	reconcileBytes(t, db)
+	if err := db.FlushWAL(); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	db2 := open() // replays the WAL into memory via rt.insert / rt.deleteByPK
+	defer db2.Close()
+	reconcileBytes(t, db2)
+	if got := db2.MetaSnapshot().TotalRows; got != 150 {
+		t.Fatalf("after reopen TotalRows=%d, want 150", got)
+	}
+}
+
+// BenchmarkMetaSnapshot sizes the snapshot read cost. It reads the per-shard
+// running counters, so it is O(shards), independent of row count — /meta stays
+// cheap no matter how large the store grows.
 func BenchmarkMetaSnapshot(b *testing.B) {
 	db := newBenchDB(b, 10000)
 	b.ResetTimer()

@@ -61,26 +61,30 @@ func (v Value) approxBytes() int {
 	return n
 }
 
-// liveStats returns the live row count and the in-RAM byte size for t in a
-// single per-shard RLock sweep (see StoreMeta). It walks every live row and sums
-// each cell's exact footprint plus the fixed per-row and per-index overhead;
-// tombstones contribute nothing.
+// rowCost is one row's contribution to a shard's byte tally: every cell's exact
+// footprint plus the fixed per-row overhead and a flat charge per secondary
+// index. nIdx is the table's index count (fixed at CREATE TABLE — hazedb has no
+// runtime CREATE INDEX — so a row's cost never shifts under it). The running
+// tally maintained with this equals what a full live-row walk would sum, which
+// reconcileBytes asserts in tests.
+func rowCost(row Row, nIdx int) int64 {
+	cells := 0
+	for _, v := range row {
+		cells += v.approxBytes()
+	}
+	return int64(cells + rowFixedOverhead + nIdx*perIndexRowOverhead)
+}
+
+// liveStats returns the live row count and the in-RAM byte size for t by reading
+// the per-shard running counters under a brief RLock — O(shards), not O(rows).
+// The counters are maintained by every row mutation (see rowCost), so this never
+// walks the arena.
 func (t *table) liveStats() (rows int, approxBytes int64) {
-	nIdx := len(t.indexes)
 	for i := range t.shards {
 		s := &t.shards[i]
 		s.mu.RLock()
-		for _, r := range s.rows {
-			if r == nil { // tombstone
-				continue
-			}
-			cellBytes := 0
-			for _, v := range r {
-				cellBytes += v.approxBytes()
-			}
-			approxBytes += int64(cellBytes + rowFixedOverhead + nIdx*perIndexRowOverhead)
-			rows++
-		}
+		rows += s.live
+		approxBytes += s.bytes
 		s.mu.RUnlock()
 	}
 	return rows, approxBytes
