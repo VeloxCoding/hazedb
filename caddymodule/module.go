@@ -150,6 +150,15 @@ func (h *Handler) Cleanup() error {
 // next handler, so the module can be mounted under a prefix alongside others.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	if handler, pattern := h.mux.Handler(r); pattern != "" {
+		// Defense in depth: a malformed query must never escalate to a process
+		// crash. net/http would recover a handler panic anyway, but this turns
+		// it into a clean 500 (and the same hazedb *DB is also reachable via the
+		// cgo PHP path, which has no such net — see hazedb_ext.go).
+		defer func() {
+			if rec := recover(); rec != nil {
+				writeJSON(w, http.StatusInternalServerError, hazedb.ErrorJSON("internal error"))
+			}
+		}()
 		handler.ServeHTTP(w, r)
 		return nil
 	}

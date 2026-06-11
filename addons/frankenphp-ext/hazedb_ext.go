@@ -116,6 +116,8 @@ static zend_array *hzd_zval_arr(zval *z) { return Z_ARRVAL_P(z); }
 import "C"
 
 import (
+	"fmt"
+	"os"
 	"sync"
 	"unsafe"
 
@@ -333,8 +335,28 @@ func (sc *rowScratch) rowToAssoc(row hazedb.Row) *C.zend_array {
 // hazedb_fetch returns one row as a flat assoc PHP array, or null (no row / no
 // DB / error). ≈ PDOStatement::fetch(PDO::FETCH_ASSOC).
 //
+// cgoRecoverPtr / cgoRecoverInt translate a recovered panic into the entry
+// point's error sentinel (nil / -1) instead of letting it unwind across the cgo
+// boundary back into C/PHP, which aborts the whole FrankenPHP process. The panic
+// is logged to stderr so the underlying bug still surfaces. Unlike the Caddy
+// HTTP path (net/http recovers each request), this cgo path has no other net.
+func cgoRecoverPtr(fn string, ret *unsafe.Pointer) {
+	if r := recover(); r != nil {
+		fmt.Fprintf(os.Stderr, "hazedb: recovered panic in %s: %v\n", fn, r)
+		*ret = nil
+	}
+}
+
+func cgoRecoverInt(fn string, ret *int64) {
+	if r := recover(); r != nil {
+		fmt.Fprintf(os.Stderr, "hazedb: recovered panic in %s: %v\n", fn, r)
+		*ret = -1
+	}
+}
+
 // export_php:function hazedb_fetch(string $sql, mixed $args = null): ?array
-func hazedb_fetch(sql *C.zend_string, args *C.zval) unsafe.Pointer {
+func hazedb_fetch(sql *C.zend_string, args *C.zval) (ret unsafe.Pointer) {
+	defer cgoRecoverPtr("hazedb_fetch", &ret)
 	db := defaultSlot.Load()
 	if db == nil {
 		return nil
@@ -359,7 +381,8 @@ func hazedb_fetch(sql *C.zend_string, args *C.zval) unsafe.Pointer {
 // ≈ PDOStatement::fetchAll(PDO::FETCH_ASSOC).
 //
 // export_php:function hazedb_fetchall(string $sql, mixed $args = null): ?array
-func hazedb_fetchall(sql *C.zend_string, args *C.zval) unsafe.Pointer {
+func hazedb_fetchall(sql *C.zend_string, args *C.zval) (ret unsafe.Pointer) {
+	defer cgoRecoverPtr("hazedb_fetchall", &ret)
 	db := defaultSlot.Load()
 	if db == nil {
 		return nil
@@ -399,7 +422,8 @@ func hazedb_fetchall(sql *C.zend_string, args *C.zval) unsafe.Pointer {
 // [{...},...] — for forwarding to an HTTP/JSON response without a PHP decode.
 //
 // export_php:function hazedb_fetchall_json(string $sql, mixed $args = null): ?string
-func hazedb_fetchall_json(sql *C.zend_string, args *C.zval) unsafe.Pointer {
+func hazedb_fetchall_json(sql *C.zend_string, args *C.zval) (ret unsafe.Pointer) {
+	defer cgoRecoverPtr("hazedb_fetchall_json", &ret)
 	db := defaultSlot.Load()
 	if db == nil {
 		return nil
@@ -430,7 +454,8 @@ func hazedb_fetchall_json(sql *C.zend_string, args *C.zval) unsafe.Pointer {
 // no DB. ≈ PDOStatement::execute(...) + rowCount().
 //
 // export_php:function hazedb_exec(string $sql, mixed $args = null): int
-func hazedb_exec(sql *C.zend_string, args *C.zval) int64 {
+func hazedb_exec(sql *C.zend_string, args *C.zval) (ret int64) {
+	defer cgoRecoverInt("hazedb_exec", &ret)
 	db := defaultSlot.Load()
 	if db == nil {
 		return -1
