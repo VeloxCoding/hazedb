@@ -5,12 +5,13 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // UUID is a 128-bit identifier (RFC 9562). It is a fixed array so it is
-// comparable and usable directly as a map key with no allocation — the
-// primary key index is map[UUID]uint64.
+// comparable and usable directly as a key with no allocation — the
+// primary key index is the open-addressed pkMap (pkmap.go) keyed by UUID.
 type UUID [16]byte
 
 // zeroUUID is the all-zero value; treated as "absent".
@@ -107,7 +108,18 @@ func ParseUUID(s string) (UUID, error) {
 
 // --- monotonic UUIDv7 generator (RFC 9562 §5.7 + monotonic counter) ---
 
-var uuidGen = newUUIDGenerator()
+// uuidStamp is the generator clock packed into one atomic word: bits 16..63
+// hold the 48-bit unix-ms timestamp, bits 0..15 the per-ms counter (12 bits
+// used, so the low word never exceeds 0x0FFF). Every successful transition
+// strictly increases the packed value, so each (ms, counter) pair is
+// process-unique and totally time-ordered on its own — in-process uniqueness
+// and monotonicity do not depend on rand_b. (Sharding the counter instead
+// would rest in-process uniqueness on birthday bounds over rand_b's 62 bits
+// and lose within-ms ordering across shards; the single CAS word keeps both
+// guarantees unconditional and is cheaper than the mutex it replaced.)
+// rand_b stays crypto-random for cross-process collision resistance and so
+// IDs are not guessable from prior IDs.
+var uuidStamp atomic.Uint64
 
 // NewUUIDv7 returns a fresh UUIDv7 with within-millisecond monotonicity: IDs
 // from this process sort by creation time, including inside one millisecond,
@@ -117,51 +129,20 @@ var uuidGen = newUUIDGenerator()
 // bulk-load above that rate the stamp drifts ahead of the wall clock (it
 // self-corrects once the rate drops; uniqueness and ordering always hold).
 //
-// Auto-PK inserts (id omitted) are the only callers, so they alone pay the
-// generator's mutex + periodic crypto/rand refill. Client-supplied UUIDs skip
-// this path entirely — no monotonicity guarantee, but also no serialisation.
-func NewUUIDv7() UUID { return uuidGen.next(time.Now().UnixMilli()) }
+// Auto-PK inserts (id omitted) are the only callers. The stamp advances by a
+// single lock-free CAS, so parallel inserts never queue behind a generator
+// mutex; rand_b is copied from one of uuidRandShards independently locked
+// buffers. Client-supplied UUIDs skip this path entirely — no monotonicity
+// guarantee, but also no shared state touched.
+func NewUUIDv7() UUID {
+	ms, c := nextUUIDStamp(time.Now().UnixMilli())
 
-type uuidGenerator struct {
-	mu      sync.Mutex
-	lastMs  int64
-	counter uint16 // 12-bit, within lastMs
-
-	// Bulk-buffered randomness for rand_b: one crypto/rand read serves many
-	// UUIDs, so the hot path is a copy under the lock, not a syscall. 4080 bytes
-	// = 510 UUIDs per refill, amortising the getrandom syscall 8× further than a
-	// 504-byte (63-UUID) buffer; the cost is held memory, which is negligible.
-	randBuf [4080]byte
-	randPos int
-}
-
-func newUUIDGenerator() *uuidGenerator {
-	return &uuidGenerator{randPos: 4080} // force a refill on first use
-}
-
-func (g *uuidGenerator) next(ms int64) UUID {
-	g.mu.Lock()
-	switch {
-	case ms > g.lastMs:
-		g.lastMs = ms
-		g.counter = 0
-	default:
-		// Same millisecond, or the clock went backwards: stay on lastMs and
-		// increment so IDs never regress. On counter exhaustion borrow from
-		// the next millisecond.
-		ms = g.lastMs
-		g.counter++
-		if g.counter > 0x0FFF {
-			g.lastMs++
-			ms = g.lastMs
-			g.counter = 0
-		}
-	}
-	c := g.counter
-
+	// Shard pick by counter: same-ms concurrent claims hold consecutive
+	// counters, so the mask spreads exactly the calls that are close enough
+	// in time to contend. (At low rates every call lands on shard 0 — and
+	// contention is nil there by definition.)
 	var rb [8]byte
-	g.fillRandLocked(rb[:])
-	g.mu.Unlock()
+	uuidRand[c&(uuidRandShards-1)].read8(&rb)
 
 	var u UUID
 	// 48-bit big-endian unix-ms timestamp.
@@ -186,16 +167,59 @@ func (g *uuidGenerator) next(ms int64) UUID {
 	return u
 }
 
-// fillRandLocked copies len(dst) random bytes from the buffer, refilling in
-// bulk when exhausted. Caller holds g.mu. randBuf is sized to a multiple of
-// 8 so an 8-byte request never straddles a refill boundary.
-func (g *uuidGenerator) fillRandLocked(dst []byte) {
-	if g.randPos+len(dst) > len(g.randBuf) {
-		if _, err := rand.Read(g.randBuf[:]); err != nil {
+// nextUUIDStamp advances uuidStamp past the current wall clock (unix ms) and
+// returns the claimed (ms, counter). Lock-free: a failed CAS means another
+// goroutine claimed the candidate stamp, so retry against its result.
+func nextUUIDStamp(now int64) (ms int64, counter uint16) {
+	for {
+		cur := uuidStamp.Load()
+		var nxt uint64
+		if now > int64(cur>>16) {
+			nxt = uint64(now) << 16 // fresh millisecond: counter restarts at 0
+		} else {
+			// Same millisecond, or the clock went backwards: stay on the
+			// stamped ms and increment so IDs never regress. On counter
+			// exhaustion borrow from the next millisecond.
+			nxt = cur + 1
+			if nxt&0xFFFF > 0x0FFF {
+				nxt = (cur>>16 + 1) << 16
+			}
+		}
+		if uuidStamp.CompareAndSwap(cur, nxt) {
+			return int64(nxt >> 16), uint16(nxt & 0xFFFF)
+		}
+	}
+}
+
+// uuidRandShards must be a power of two so the shard pick is a mask.
+const uuidRandShards = 8
+
+// uuidRandShard bulk-buffers randomness for rand_b: one crypto/rand read
+// serves many UUIDs, so the hot path is an 8-byte copy under the shard lock,
+// not a syscall. 4080 bytes = 510 UUIDs per refill (all shards together hold
+// 32 KB, negligible); the buffer is a multiple of 8 so a request never
+// straddles a refill boundary. Sharding keeps one shard's refill syscall
+// from stalling the others, and each struct spans multiple cache lines so
+// the shard locks never false-share.
+type uuidRandShard struct {
+	mu  sync.Mutex
+	pos int // counts down; the zero value forces a refill on first use
+	buf [4080]byte
+}
+
+var uuidRand [uuidRandShards]uuidRandShard
+
+// read8 copies 8 random bytes into dst, refilling the shard buffer in bulk
+// when drained.
+func (p *uuidRandShard) read8(dst *[8]byte) {
+	p.mu.Lock()
+	if p.pos < 8 {
+		if _, err := rand.Read(p.buf[:]); err != nil {
 			panic("hazedb: crypto/rand failed: " + err.Error())
 		}
-		g.randPos = 0
+		p.pos = len(p.buf)
 	}
-	copy(dst, g.randBuf[g.randPos:g.randPos+len(dst)])
-	g.randPos += len(dst)
+	p.pos -= 8
+	copy(dst[:], p.buf[p.pos:p.pos+8])
+	p.mu.Unlock()
 }

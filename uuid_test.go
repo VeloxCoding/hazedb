@@ -111,6 +111,35 @@ func TestUUIDv7ConcurrentUnique(t *testing.T) {
 	}
 }
 
+// TestUUIDStampAdvance pins the packed-stamp transitions: fresh-ms reset,
+// same-ms increment, backwards clock, and the borrow into the next ms on
+// 12-bit counter exhaustion. Drives nextUUIDStamp with a synthetic clock a
+// little ahead of the live stamp, so each branch is taken deterministically
+// (package tests run sequentially — nothing else generates UUIDs meanwhile).
+func TestUUIDStampAdvance(t *testing.T) {
+	base := int64(uuidStamp.Load()>>16) + 10
+
+	ms, c := nextUUIDStamp(base)
+	if ms != base || c != 0 {
+		t.Fatalf("fresh ms: got (%d,%d), want (%d,0)", ms, c, base)
+	}
+	ms, c = nextUUIDStamp(base)
+	if ms != base || c != 1 {
+		t.Fatalf("same ms: got (%d,%d), want (%d,1)", ms, c, base)
+	}
+	ms, c = nextUUIDStamp(base - 5) // clock went backwards: never regress
+	if ms != base || c != 2 {
+		t.Fatalf("backwards clock: got (%d,%d), want (%d,2)", ms, c, base)
+	}
+	for i := 0; i < 0x0FFD; i++ { // burn counters 3..0x0FFF
+		nextUUIDStamp(base)
+	}
+	ms, c = nextUUIDStamp(base) // exhausted: borrow from the next ms
+	if ms != base+1 || c != 0 {
+		t.Fatalf("counter borrow: got (%d,%d), want (%d,0)", ms, c, base+1)
+	}
+}
+
 func BenchmarkNewUUIDv7(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {

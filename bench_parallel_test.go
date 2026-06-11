@@ -42,8 +42,8 @@ func BenchmarkInsert_Parallel_Mem(b *testing.B) {
 }
 
 // BenchmarkInsertAutoPK_Parallel_Mem: concurrent auto-PK inserts (id omitted)
-// all funnel through the single UUIDv7 generator mutex — the contention point
-// the client-PK parallel benchmark never touches.
+// all hammer the shared UUIDv7 generator state (CAS stamp + rand shards) —
+// the contention point the client-PK parallel benchmark never touches.
 func BenchmarkInsertAutoPK_Parallel_Mem(b *testing.B) {
 	db, _ := Open(Options{Schema: benchSchema(), sizeHint: 2 * 1024 * 1024})
 	defer db.Close()
