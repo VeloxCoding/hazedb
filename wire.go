@@ -16,6 +16,20 @@
 // which case→UUID. The UUID rule lets the string-only PHP/HTTP surface address
 // and insert UUID columns; the canonical 36-char hyphenated form is specific
 // enough that a real text value rarely collides.
+//
+// KNOWN LIMITATION (adapter builders, ArgsFromJSON + QueryArgs): this is a
+// format GUESS, not schema-driven coercion — the column type is unknown at
+// arg-decode. So a STRING column holding a value in exact canonical-UUID form
+// is offered to a WHERE/lookup as a UUID on these text surfaces, and because
+// `=`/`!=` compare by Kind (Value.Equal, never matches a STRING column) while
+// range / ORDER BY compare by text (Value.Compare, matches), results are
+// INCONSISTENT for that edge value: `col = ?` misses it, `col != ?` over-
+// includes the row. It is a parameter-smuggling edge, not RCE. The native
+// []any / typed-Value path (toValue) does NOT guess — pass a UUID for a UUID
+// column; a string stays STRING. The principled fix is to coerce by the target
+// column's type, as buildRowFromTmpl already does for INSERT; until then,
+// treat canonical-UUID-form text in STRING columns as unsupported on the text
+// adapters.
 
 package hazedb
 
