@@ -78,12 +78,16 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// Provision opens the *DB, runs init_sql, wires the routes, and registers the
-// instance. Called once per module instance at Caddy start / config reload.
-// defaultMaxBodyBytes caps a /query or /exec POST body when MaxBodyBytes is 0.
-const defaultMaxBodyBytes = 4 << 20 // 4 MiB
+// Defaults for the handler's tunable fields, in one place (mirrors the core's
+// options.go defaults block).
+const (
+	defaultMaxBodyBytes = 4 << 20 // 4 MiB — /query and /exec POST body cap
+	defaultRegistryName = "default"
+)
 
-func (h *Handler) Provision(ctx caddy.Context) error {
+// applyDefaults validates and fills every unset config field — one place for
+// all handler defaults, called at the top of Provision.
+func (h *Handler) applyDefaults() error {
 	if h.WALRotateMillis < 0 {
 		return fmt.Errorf("hazedb: wal_rotate_ms must be >= 0")
 	}
@@ -92,6 +96,19 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}
 	if h.MaxBodyBytes == 0 {
 		h.MaxBodyBytes = defaultMaxBodyBytes
+	}
+	if h.RegistryName == "" {
+		h.RegistryName = defaultRegistryName
+	}
+	h.name = h.RegistryName
+	return nil
+}
+
+// Provision opens the *DB, runs init_sql, wires the routes, and registers the
+// instance. Called once per module instance at Caddy start / config reload.
+func (h *Handler) Provision(ctx caddy.Context) error {
+	if err := h.applyDefaults(); err != nil {
+		return err
 	}
 	opts := hazedb.Options{
 		Schema:     hazedb.Schema{}, // tables created at runtime (init_sql / POST /exec)
@@ -122,10 +139,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	h.mux.HandleFunc("/query", h.handleQuery)
 	h.mux.HandleFunc("/exec", h.handleExec)
 
-	h.name = h.RegistryName
-	if h.name == "" {
-		h.name = "default"
-	}
 	hazedb.RegisterDB(h.name, db)
 	return nil
 }
