@@ -42,8 +42,13 @@ returns `-1`.
 | `hazedb_fetchall(string $sql, mixed $args = null): ?array` | multi-row `SELECT` | a list of assoc rows `[['col'=>val,...],...]`; `[]` if none; `null` on error |
 | `hazedb_fetchall_json(string $sql, mixed $args = null): ?string` | multi-row `SELECT` | the same data as a JSON string `[{...},...]` for pass-through; `null` on error |
 | `hazedb_exec(string $sql, mixed $args = null): int` | `INSERT` / `UPDATE` / `DELETE` / `CREATE TABLE` / `DROP TABLE` | affected row count, or `-1` on error / no DB |
-| `hazedb_meta(): ?string` | store-size overview | a JSON string `{"tables":N,"total_rows":R,"total_approx_bytes":B,"table_stats":[...]}` (same bytes as Caddy `GET /meta`); `json_decode` it. `null` only when no DB is registered |
+| `hazedb_meta(): ?string` | store-size overview | a JSON string `{"tables":N,"max_bytes":M,"total_rows":R,"total_approx_bytes":B,"table_stats":[...]}` (same bytes as Caddy `GET /meta`); `json_decode` it. `null` only when no DB is registered |
 | `hazedb_ping(): string` | — | `pong` if a Caddy module registered a DB, `pong (no db)` otherwise |
+
+When the store has a `max_bytes` cap and it is full, an insert via `hazedb_exec`
+returns `-1` (like any error) — read `hazedb_meta`'s `total_approx_bytes` vs
+`max_bytes` to tell a full store from a malformed statement, and free space with
+`DELETE` / `DROP TABLE`.
 
 PDO mapping: `hazedb_fetch` ≈ `fetch(PDO::FETCH_ASSOC)`, `hazedb_fetchall` ≈
 `fetchAll(PDO::FETCH_ASSOC)`, `hazedb_exec` ≈ `execute(...)` + `rowCount()`. The

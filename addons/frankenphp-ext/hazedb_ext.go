@@ -33,8 +33,8 @@
 //
 //	hazedb_meta(): ?string
 //	    Store-size overview as a JSON string — the same bytes the Caddy GET
-//	    /meta route returns ({"tables":N,"total_rows":R,"total_approx_bytes":B,
-//	    "table_stats":[...]}). For dashboards /
+//	    /meta route returns ({"tables":N,"max_bytes":M,"total_rows":R,
+//	    "total_approx_bytes":B,"table_stats":[...]}). For dashboards /
 //	    health checks; sizes are estimates. null only when no DB is registered.
 //
 //	hazedb_ping(): string

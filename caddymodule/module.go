@@ -64,6 +64,12 @@ type Handler struct {
 	// since the SQL string and the positional-arg array both live in that body,
 	// it bounds their sizes too.
 	MaxBodyBytes int64 `json:"max_body_bytes,omitempty"`
+	// MaxBytes caps the store's total in-RAM size, in bytes. 0 = unlimited. An
+	// INSERT that would push the store past it is rejected with HTTP 507; the
+	// store never auto-evicts, so the client frees space with DELETE / DROP TABLE.
+	// Distinct from MaxBodyBytes (a per-request limit) — this bounds the whole
+	// dataset.
+	MaxBytes int64 `json:"max_bytes,omitempty"`
 
 	db   *hazedb.DB
 	mux  *http.ServeMux
@@ -95,6 +101,9 @@ func (h *Handler) applyDefaults() error {
 	if h.MaxBodyBytes < 0 {
 		return fmt.Errorf("hazedb: max_body_bytes must be >= 0")
 	}
+	if h.MaxBytes < 0 {
+		return fmt.Errorf("hazedb: max_bytes must be >= 0")
+	}
 	if h.MaxBodyBytes == 0 {
 		h.MaxBodyBytes = defaultMaxBodyBytes
 	}
@@ -116,6 +125,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		WALLevel:   h.WALLevel,
 		WALPath:    h.WALPath,
 		SQLitePath: h.SQLitePath,
+		MaxBytes:   h.MaxBytes,
 	}
 	if h.WALRotateMillis > 0 {
 		opts.WALRotateInterval = time.Duration(h.WALRotateMillis) * time.Millisecond
@@ -255,6 +265,11 @@ func (h *Handler) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 	n, err := h.db.Exec(req.SQL, args...)
 	if err != nil {
+		// A full store is 507 (the client must free space), not 400 (bad request).
+		if errors.Is(err, hazedb.ErrCapacity) {
+			writeJSON(w, http.StatusInsufficientStorage, hazedb.ErrorJSON(err.Error()))
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, hazedb.ErrorJSON(err.Error()))
 		return
 	}
@@ -262,8 +277,9 @@ func (h *Handler) handleExec(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleMeta is the store-size overview: GET /meta → the MetaSnapshot JSON
-// ({"tables":N,"total_rows":R,"total_approx_bytes":B,
-// "table_stats":[{name,rows,columns,indexes,approx_bytes},...]}).
+// ({"tables":N,"max_bytes":M,"total_rows":R,"total_approx_bytes":B,
+// "table_stats":[{name,rows,columns,indexes,approx_bytes},...]}). max_bytes is
+// the configured cap (0 = unlimited) that total_approx_bytes is measured against.
 // No body, no args — a lock-light read for dashboards and health checks. Sizes
 // are deliberate estimates (see hazedb.StoreMeta), not byte-exact accounting.
 func (h *Handler) handleMeta(w http.ResponseWriter, r *http.Request) {
@@ -450,6 +466,7 @@ func writeJSON(w http.ResponseWriter, status int, body []byte) {
 //	    sqlite_path     /var/lib/hazedb/hazedb.db
 //	    init_sql        /etc/hazedb/schema.sql
 //	    registry_name   default
+//	    max_bytes       1073741824
 //	}
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
@@ -477,6 +494,12 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("%s: %v", key, err)
 				}
 				h.MaxBodyBytes = n
+			case "max_bytes":
+				n, err := strconv.ParseInt(value, 10, 64)
+				if err != nil {
+					return d.Errf("%s: %v", key, err)
+				}
+				h.MaxBytes = n
 			case "wal_level":
 				n, err := strconv.Atoi(value)
 				if err != nil {

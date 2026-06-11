@@ -136,7 +136,7 @@ func TestMetaJSON(t *testing.T) {
 
 	// Snake_case keys are the documented contract — assert on the bytes, not just
 	// the decoded struct, so a tag rename can't pass silently.
-	for _, key := range []string{`"tables"`, `"total_rows"`, `"total_approx_bytes"`, `"table_stats"`, `"name"`, `"rows"`, `"columns"`, `"indexes"`, `"approx_bytes"`} {
+	for _, key := range []string{`"tables"`, `"max_bytes"`, `"total_rows"`, `"total_approx_bytes"`, `"table_stats"`, `"name"`, `"rows"`, `"columns"`, `"indexes"`, `"approx_bytes"`} {
 		if !strings.Contains(string(raw), key) {
 			t.Fatalf("MetaJSON missing key %s: %s", key, raw)
 		}

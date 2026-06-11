@@ -13,13 +13,20 @@ It exposes five endpoints. `POST /query` and `POST /exec` take a JSON body
 | `POST /exec`  | `INSERT` / `UPDATE` / `DELETE` / `CREATE TABLE` / `DROP TABLE` | `{"affected":N}` |
 | `GET /get?table=T&id=UUID` (or `&col=C&val=V`) `[&cols=a,b]` | one-row read (PK or indexed-column fast path) | one JSON object, or `null` |
 | `GET /list?table=T` `[&cols=a,b][&col=C&val=V][&limit=N]` | multi-row read | `[{...},...]` |
-| `GET /meta` | store-size overview | `{"tables":N,"total_rows":R,"total_approx_bytes":B,"table_stats":[{name,rows,columns,indexes,approx_bytes},...]}` |
+| `GET /meta` | store-size overview | `{"tables":N,"max_bytes":M,"total_rows":R,"total_approx_bytes":B,"table_stats":[{name,rows,columns,indexes,approx_bytes},...]}` |
 
-`GET /meta` takes no parameters; it reports the table count, the store-wide
-`total_rows` / `total_approx_bytes`, and per table the row / column / index
-counts and an approximate in-RAM byte size — for dashboards and health checks.
-The byte sizes are deliberate estimates (sampled, biased slightly high), not
+`GET /meta` takes no parameters; it reports the table count, the configured
+`max_bytes` cap (0 = unlimited), the store-wide `total_rows` /
+`total_approx_bytes`, and per table the row / column / index counts and an
+approximate in-RAM byte size — for dashboards and health checks. The byte sizes
+are estimates (cell payloads plus modeled overhead, biased slightly high), not
 exact accounting.
+
+**Byte cap.** Set `max_bytes` (below) to bound the store's RAM. An `INSERT` that
+would push `total_approx_bytes` past the cap is rejected with **HTTP 507**
+(Insufficient Storage); the store never auto-evicts, so the client frees space
+with `DELETE` / `DROP TABLE`. `total_approx_bytes` vs `max_bytes` from `/meta` is
+the headroom gauge.
 
 `args` is an optional positional list for `?` placeholders. JSON → SQL value
 mapping: number → INT, bool → BOOL, null → NULL, string → STRING, **except** a
@@ -58,6 +65,7 @@ xcaddy build --with github.com/VeloxCoding/hazedb/caddymodule
             init_sql       /etc/hazedb/schema.sql   # CREATE TABLE + seed, run once at startup
             registry_name  default                  # name the *DB is published under for the PHP extension
             max_body_bytes 4194304                  # POST body cap for /query and /exec (default 4 MiB)
+            max_bytes      1073741824               # cap the store's RAM (1 GiB); over-cap INSERT → HTTP 507. 0/unset = unlimited
         }
     }
 }

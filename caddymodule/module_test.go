@@ -135,6 +135,36 @@ func TestModuleMeta(t *testing.T) {
 	}
 }
 
+// With MaxBytes set, an INSERT that fills the store returns HTTP 507
+// (Insufficient Storage), not 400 — the client must free space, not fix a bad
+// request.
+func TestModuleMaxBytes507(t *testing.T) {
+	h := &Handler{MaxBytes: 600} // a few (uuid,int) rows fit, then it is full
+	if err := h.Provision(caddy.Context{}); err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	defer h.Cleanup()
+	if w, _ := do(t, h, "/exec", `{"sql":"CREATE TABLE t (id uuid primary key, n int)"}`); w.Code != 200 {
+		t.Fatalf("create: %d", w.Code)
+	}
+
+	got507 := false
+	for i := 0; i < 100 && !got507; i++ {
+		body := `{"sql":"INSERT INTO t (id, n) VALUES (?, ?)","args":["` + hazedb.NewUUIDv7().String() + `",1]}`
+		w, _ := do(t, h, "/exec", body)
+		switch w.Code {
+		case http.StatusOK:
+		case http.StatusInsufficientStorage:
+			got507 = true
+		default:
+			t.Fatalf("insert %d: unexpected %d %s", i, w.Code, w.Body.String())
+		}
+	}
+	if !got507 {
+		t.Fatal("never hit 507 despite a tiny MaxBytes cap")
+	}
+}
+
 // Cleanup must clear the registry slot so a removed handler leaves no instance.
 func TestModuleCleanupDeregisters(t *testing.T) {
 	h := &Handler{}

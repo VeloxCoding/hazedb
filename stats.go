@@ -20,6 +20,10 @@ import (
 // the write path rather than calling this.
 type StoreMeta struct {
 	Tables int `json:"tables"`
+	// MaxBytes is the configured byte cap (Options.MaxBytes); 0 means unlimited.
+	// TotalApproxBytes is what it is measured against — an insert is rejected once
+	// the total would exceed it.
+	MaxBytes int64 `json:"max_bytes"`
 	// TotalRows / TotalApproxBytes roll up every table's line, so a caller gets
 	// the store-wide footprint without summing TableStats itself. TotalApproxBytes
 	// is the sum of the per-table estimates and inherits their slight over-bias.
@@ -115,6 +119,9 @@ func (db *DB) MetaSnapshot() StoreMeta {
 	out := StoreMeta{
 		Tables:     len(cat.byName),
 		TableStats: make([]TableStat, 0, len(cat.byName)),
+	}
+	if db.budget != nil {
+		out.MaxBytes = db.budget.max
 	}
 	for _, rt := range cat.byName {
 		t := rt.table
