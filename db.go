@@ -277,6 +277,35 @@ func (pl *plan) checkArgs(n int) error {
 	return nil
 }
 
+// pkKeyFromArgs resolves a PK-lookup key straight from the raw args, converting
+// only the key arg — skipping the []Value slice toValues allocates per call.
+// ok=false sends the caller down the generic toValues path, which must own
+// every mismatch so errors keep their exact text and order (toValues' type
+// error before checkArgs' count error).
+func (pl *plan) pkKeyFromArgs(args []any) (key Value, ok bool, err error) {
+	if len(args) != pl.nparams {
+		return Value{}, false, nil
+	}
+	switch src := pl.pkSource.(type) {
+	case *paramRef:
+		// A SELECT PK lookup is the bare `pk = ?` equality (detectPKEq), so the
+		// key is the statement's only parameter. More params would mean another
+		// arg could fail conversion — only the generic path orders those errors
+		// right, so any other shape falls back.
+		if pl.nparams != 1 || src.index != 0 {
+			return Value{}, false, nil
+		}
+		key, err = toValue(args[0], 0)
+		return key, true, err
+	case *litValue:
+		if pl.nparams != 0 {
+			return Value{}, false, nil
+		}
+		return src.v, true, nil
+	}
+	return Value{}, false, nil
+}
+
 func (db *DB) execWrite(pl *plan, vargs []Value) (int, error) {
 	if err := pl.checkArgs(len(vargs)); err != nil {
 		return 0, err
@@ -308,9 +337,20 @@ func (db *DB) Query(sql string, args ...any) ([]string, []Row, error) {
 }
 
 // queryPlan runs a SELECT plan against raw args. Shared by Query and *Stmt.Query.
+// A PK lookup converts only the key arg (pkKeyFromArgs), skipping the []Value
+// slice toValues allocates per call.
 func (db *DB) queryPlan(pl *plan, args []any) ([]string, []Row, error) {
 	if _, ok := pl.st.(*selectStmt); !ok {
 		return nil, nil, fmt.Errorf("hazedb: Query used with non-SELECT — use Exec instead")
+	}
+	if pl.pkLookup {
+		keyVal, ok, err := pl.pkKeyFromArgs(args)
+		if err != nil {
+			return nil, nil, err
+		}
+		if ok {
+			return db.execSelectPK(pl, keyVal)
+		}
 	}
 	vargs, err := toValues(args)
 	if err != nil {
@@ -352,10 +392,20 @@ func (db *DB) QueryRow(sql string, args ...any) ([]string, Row, error) {
 }
 
 // queryRowPlan runs a single-row SELECT plan against raw args. Shared by
-// QueryRow and *Stmt.QueryRow.
+// QueryRow and *Stmt.QueryRow. PK lookups take the same single-arg lane as
+// queryPlan.
 func (db *DB) queryRowPlan(pl *plan, args []any) ([]string, Row, error) {
 	if _, ok := pl.st.(*selectStmt); !ok {
 		return nil, nil, fmt.Errorf("hazedb: QueryRow used with non-SELECT — use Exec instead")
+	}
+	if pl.pkLookup {
+		keyVal, ok, err := pl.pkKeyFromArgs(args)
+		if err != nil {
+			return nil, nil, err
+		}
+		if ok {
+			return db.execSelectPKOne(pl, keyVal)
+		}
 	}
 	vargs, err := toValues(args)
 	if err != nil {
