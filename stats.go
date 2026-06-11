@@ -1,6 +1,7 @@
 package hazedb
 
 import (
+	"encoding/json"
 	"sort"
 	"unsafe"
 )
@@ -18,18 +19,18 @@ import (
 // It answers "how big, roughly" and sizes a future byte cap — it is not
 // byte-exact, and is biased to slightly over-estimate so a cap trips early.
 type StoreMeta struct {
-	Tables     int
-	TableStats []TableStat
+	Tables     int         `json:"tables"`
+	TableStats []TableStat `json:"table_stats"`
 }
 
 // TableStat is one table's line in a StoreMeta. ApproxBytes is an estimate (see
 // StoreMeta); a display layer formats it to MiB.
 type TableStat struct {
-	Name        string
-	Rows        int
-	Columns     int
-	Indexes     int
-	ApproxBytes int64
+	Name        string `json:"name"`
+	Rows        int    `json:"rows"`
+	Columns     int    `json:"columns"`
+	Indexes     int    `json:"indexes"`
+	ApproxBytes int64  `json:"approx_bytes"`
 }
 
 const (
@@ -121,4 +122,14 @@ func (db *DB) MetaSnapshot() StoreMeta {
 		return out.TableStats[i].Name < out.TableStats[j].Name
 	})
 	return out
+}
+
+// MetaJSON renders MetaSnapshot as a JSON object for the out-of-core adapters
+// (Caddy GET /meta, PHP hazedb_meta) — one wire-shape definition both share, so
+// the HTTP and cgo surfaces always emit identical bytes. Cold operator path, so
+// it uses stdlib json.Marshal (like ExecResultJSON/ErrorJSON) rather than the
+// hand-rolled row encoder. Never errors — the struct is plain data.
+func (db *DB) MetaJSON() []byte {
+	b, _ := json.Marshal(db.MetaSnapshot())
+	return b
 }

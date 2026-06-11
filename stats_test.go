@@ -1,6 +1,7 @@
 package hazedb
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -77,5 +78,35 @@ func TestMetaSnapshotEmptyAndDelete(t *testing.T) {
 
 	if ts := db.MetaSnapshot().TableStats[0]; ts.Rows != 1 {
 		t.Fatalf("after one delete: rows=%d, want 1", ts.Rows)
+	}
+}
+
+// MetaJSON is the wire shape the Caddy /meta route and the PHP hazedb_meta
+// function both emit: it must round-trip back to the same StoreMeta and use the
+// snake_case keys the adapters document.
+func TestMetaJSON(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE t (id uuid primary key, body text, INDEX (body))")
+	db.Exec("INSERT INTO t (id, body) VALUES (?, ?)", tid(1), "hello")
+
+	raw := db.MetaJSON()
+
+	// Snake_case keys are the documented contract — assert on the bytes, not just
+	// the decoded struct, so a tag rename can't pass silently.
+	for _, key := range []string{`"tables"`, `"table_stats"`, `"name"`, `"rows"`, `"columns"`, `"indexes"`, `"approx_bytes"`} {
+		if !strings.Contains(string(raw), key) {
+			t.Fatalf("MetaJSON missing key %s: %s", key, raw)
+		}
+	}
+
+	var got StoreMeta
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("MetaJSON not valid JSON: %v", err)
+	}
+	if got.Tables != 1 || len(got.TableStats) != 1 {
+		t.Fatalf("decoded %d tables / %d stats, want 1/1", got.Tables, len(got.TableStats))
+	}
+	if ts := got.TableStats[0]; ts.Name != "t" || ts.Rows != 1 || ts.Columns != 2 || ts.Indexes != 1 {
+		t.Fatalf("decoded stat = %+v", ts)
 	}
 }
