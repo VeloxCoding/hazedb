@@ -175,7 +175,7 @@ func (t *table) shardOf(u UUID) *tableShard { return &t.shards[t.shardIdxOf(u)] 
 // already exists (live or tombstone-replaced rows take new slots).
 func (t *table) insert(row Row) error {
 	if t.pkDir != nil {
-		return t.insertPartitioned(row, nil)
+		return t.insertPartitioned(row, mutJournal{})
 	}
 	pk := row[t.def.pkOrdinal].UUID()
 	s := t.shardOf(pk)
@@ -193,22 +193,22 @@ func (t *table) insert(row Row) error {
 }
 
 // insertJournaled is the live-write insert path: it checks PK uniqueness,
-// runs journal() (the WAL append), and adds the row — all under one shard
+// runs j.insert (the WAL append), and adds the row — all under one shard
 // lock, in that order. This enforces the RFC pipeline (validate → WAL →
 // apply) atomically:
 //
-//   - a duplicate PK returns ErrDuplicatePK BEFORE journal runs, so a
+//   - a duplicate PK returns ErrDuplicatePK BEFORE the journal runs, so a
 //     rejected insert never reaches the WAL (otherwise replay re-hits the
 //     duplicate and Open fails permanently);
-//   - if journal returns an error the row is NOT added, so RAM never holds
-//     a mutation absent from the WAL;
+//   - if the journal returns an error the row is NOT added, so RAM never
+//     holds a mutation absent from the WAL;
 //   - holding the shard lock across journal+append makes WAL order and
 //     in-memory order identical for inserts on the same shard.
 //
-// journal may be nil (memory-only DB).
-func (t *table) insertJournaled(row Row, journal func() error) error {
+// j is the zero value for a memory-only DB (journals nothing).
+func (t *table) insertJournaled(row Row, j mutJournal) error {
 	if t.pkDir != nil {
-		return t.insertPartitioned(row, journal)
+		return t.insertPartitioned(row, j)
 	}
 	pk := row[t.def.pkOrdinal].UUID()
 	s := t.shardOf(pk)
@@ -217,10 +217,8 @@ func (t *table) insertJournaled(row Row, journal func() error) error {
 	if _, exists := s.pk[pk]; exists {
 		return ErrDuplicatePK
 	}
-	if journal != nil {
-		if err := journal(); err != nil {
-			return err
-		}
+	if err := j.insert(row); err != nil {
+		return err
 	}
 	rowID := uint64(len(s.rows))
 	s.rows = append(s.rows, row)
@@ -236,11 +234,11 @@ func (t *table) insertJournaled(row Row, journal func() error) error {
 // WAL failure reverts — so a row is never applied without a durable record.
 // The hot path allocates nothing: the pre-update values of the touched
 // columns are saved in a small stack array (heap only if >8 columns are
-// set, which is rare). journal may be nil (memory-only), in which case the
-// values are simply applied with no save/revert overhead.
-func (t *table) updateByPKJournaled(pk UUID, ords []int, compute func(Row) ([]Value, error), journal func(Row) error) (bool, error) {
+// set, which is rare). j may be the zero value (memory-only), in which case
+// the values are simply applied with no save/revert overhead.
+func (t *table) updateByPKJournaled(pk UUID, ords []int, compute func(Row) ([]Value, error), j mutJournal) (bool, error) {
 	if t.pkDir != nil {
-		return t.updateByPKJournaledPartitioned(pk, ords, compute, journal)
+		return t.updateByPKJournaledPartitioned(pk, ords, compute, j)
 	}
 	s := t.shardOf(pk)
 	s.mu.Lock()
@@ -254,7 +252,7 @@ func (t *table) updateByPKJournaled(pk UUID, ords []int, compute func(Row) ([]Va
 	if err != nil {
 		return false, err
 	}
-	if journal == nil {
+	if !j.live() {
 		for i, ord := range ords {
 			r[ord] = vals[i]
 		}
@@ -269,7 +267,7 @@ func (t *table) updateByPKJournaled(pk UUID, ords []int, compute func(Row) ([]Va
 	for i, ord := range ords {
 		r[ord] = vals[i]
 	}
-	if err := journal(r); err != nil {
+	if err := j.update(r); err != nil {
 		for i, ord := range ords {
 			r[ord] = old[i]
 		}
@@ -281,9 +279,9 @@ func (t *table) updateByPKJournaled(pk UUID, ords []int, compute func(Row) ([]Va
 
 // updateByPKOneJournaled is the one-column variant of updateByPKJournaled.
 // It avoids building a temporary []Value for the common point-update path.
-func (t *table) updateByPKOneJournaled(pk UUID, ord int, compute func(Row) (Value, error), journal func(Row) error) (bool, error) {
+func (t *table) updateByPKOneJournaled(pk UUID, ord int, compute func(Row) (Value, error), j mutJournal) (bool, error) {
 	if t.pkDir != nil {
-		return t.updateByPKOneJournaledPartitioned(pk, ord, compute, journal)
+		return t.updateByPKOneJournaledPartitioned(pk, ord, compute, j)
 	}
 	s := t.shardOf(pk)
 	s.mu.Lock()
@@ -297,14 +295,14 @@ func (t *table) updateByPKOneJournaled(pk UUID, ord int, compute func(Row) (Valu
 	if err != nil {
 		return false, err
 	}
-	if journal == nil {
+	if !j.live() {
 		r[ord] = val
 		t.markDirtyLocked(s, pk)
 		return true, nil
 	}
 	old := r[ord]
 	r[ord] = val
-	if err := journal(r); err != nil {
+	if err := j.update(r); err != nil {
 		r[ord] = old
 		return false, err
 	}
@@ -313,11 +311,11 @@ func (t *table) updateByPKOneJournaled(pk UUID, ord int, compute func(Row) (Valu
 }
 
 // deleteByPKJournaled is the live PK-pinned delete: under the one shard lock
-// it journals (via journal) before tombstoning, so a WAL failure aborts
-// before the row is removed. journal may be nil (memory-only).
-func (t *table) deleteByPKJournaled(pk UUID, journal func() error) (bool, error) {
+// it journals (via j.delete) before tombstoning, so a WAL failure aborts
+// before the row is removed. j may be the zero value (memory-only).
+func (t *table) deleteByPKJournaled(pk UUID, j mutJournal) (bool, error) {
 	if t.pkDir != nil {
-		return t.deleteByPKJournaledPartitioned(pk, journal)
+		return t.deleteByPKJournaledPartitioned(pk, j)
 	}
 	s := t.shardOf(pk)
 	s.mu.Lock()
@@ -326,10 +324,8 @@ func (t *table) deleteByPKJournaled(pk UUID, journal func() error) (bool, error)
 	if !ok {
 		return false, nil
 	}
-	if journal != nil {
-		if err := journal(); err != nil {
-			return false, err
-		}
+	if err := j.delete(); err != nil {
+		return false, err
 	}
 	s.rows[rowID] = nil
 	delete(s.pk, pk)
@@ -691,7 +687,7 @@ func (t *table) updateByCandidates(pks []UUID, match func(Row) bool, ords []int,
 // stale index hit or an unrelated dirty PK). Mirrors updateByPKOneJournaled with
 // a WHERE gate; journal-before-apply with revert on WAL failure. Returns 1 if
 // updated, 0 if the candidate is gone or no longer matches.
-func (t *table) updateOneByCandidate(pk UUID, ord int, match func(Row) bool, computeOne func(Row) (Value, error), journal func(Row) error) (int, error) {
+func (t *table) updateOneByCandidate(pk UUID, ord int, match func(Row) bool, computeOne func(Row) (Value, error), j mutJournal) (int, error) {
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -708,7 +704,7 @@ func (t *table) updateOneByCandidate(pk UUID, ord int, match func(Row) bool, com
 		return 0, err
 	}
 	touch := t.ordIsIndexed(ord)
-	if journal == nil {
+	if !j.live() {
 		r[ord] = val
 		if touch {
 			t.markDirtyLocked(s, pk)
@@ -717,7 +713,7 @@ func (t *table) updateOneByCandidate(pk UUID, ord int, match func(Row) bool, com
 	}
 	old := r[ord]
 	r[ord] = val
-	if err := journal(r); err != nil {
+	if err := j.update(r); err != nil {
 		r[ord] = old
 		return 0, err
 	}

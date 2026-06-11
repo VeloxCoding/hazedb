@@ -250,9 +250,10 @@ func (tx *Tx) commit() error {
 	}
 
 	if tx.db.wal != nil {
-		body := encodeTxn(tx.db.scratch.get(), resolved)
-		werr := tx.db.wal.writeRecord(recTxn, body)
-		tx.db.scratch.put(body)
+		bp := tx.db.scratch.get()
+		*bp = encodeTxn(*bp, resolved)
+		werr := tx.db.wal.writeRecord(recTxn, *bp)
+		tx.db.scratch.put(bp)
 		if werr != nil {
 			return werr // nothing applied yet
 		}

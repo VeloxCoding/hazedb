@@ -2,6 +2,63 @@ package hazedb
 
 import "fmt"
 
+// mutJournal journals one mutation for the PK-pinned live write lanes. It is
+// passed BY VALUE through the store's journaled methods — a stack copy, so a
+// WAL-on write builds no per-call closure (the old func() error shape heap-
+// allocated one per insert/update/delete). The zero value (db nil) journals
+// nothing: memory-only DBs and the replay path use it. The store invokes the
+// op method under the shard lock, preserving journal-before-apply.
+type mutJournal struct {
+	db      *DB
+	tableID uint16
+	// UPDATE lane: the changed ordinals (plan-owned, read-only) and the PK
+	// ordinal to read from the post-update row image.
+	ords  []int
+	pkOrd int
+	// DELETE lane: the resolved PK cell (the UUID, never the raw arg).
+	pkVal Value
+}
+
+// live reports whether mutations must be journaled. The update lanes use it to
+// skip the save/revert bookkeeping when there is no WAL.
+func (j mutJournal) live() bool { return j.db != nil }
+
+// insert appends an opInsert record for row. No-op on the zero value.
+func (j mutJournal) insert(row Row) error {
+	if j.db == nil {
+		return nil
+	}
+	bp := j.db.scratch.get()
+	*bp = encodeInsertMutation(*bp, j.tableID, row)
+	werr := j.db.wal.writeRecord(recMutation, *bp)
+	j.db.scratch.put(bp)
+	return werr
+}
+
+// update appends an opUpdate record carrying nr's PK + the j.ords cells.
+func (j mutJournal) update(nr Row) error {
+	if j.db == nil {
+		return nil
+	}
+	bp := j.db.scratch.get()
+	*bp = encodeUpdateMutation(*bp, j.tableID, nr[j.pkOrd], j.ords, nr)
+	werr := j.db.wal.writeRecord(recMutation, *bp)
+	j.db.scratch.put(bp)
+	return werr
+}
+
+// delete appends an opDelete record for j.pkVal.
+func (j mutJournal) delete() error {
+	if j.db == nil {
+		return nil
+	}
+	bp := j.db.scratch.get()
+	*bp = encodeDeleteMutation(*bp, j.tableID, j.pkVal)
+	werr := j.db.wal.writeRecord(recMutation, *bp)
+	j.db.scratch.put(bp)
+	return werr
+}
+
 // buildRowFromTmpl materialises one row from a tuple's plan-time cell template:
 // copies params from args (with API-boundary string→UUID coercion + validation),
 // drops pre-validated literals straight in, and auto-generates the PK when
@@ -91,15 +148,11 @@ func (db *DB) execInsert(pl *plan, args []Value) (int, error) {
 	// lock (see insertJournaled). Ordering matters: a duplicate PK must be
 	// rejected before anything is journaled, and a WAL failure must abort
 	// before the row is applied.
-	if err := tbl.insertJournaled(row, func() error {
-		if db.wal == nil {
-			return nil
-		}
-		body := encodeInsertMutation(db.scratch.get(), tbl.tableID, row)
-		werr := db.wal.writeRecord(recMutation, body)
-		db.scratch.put(body)
-		return werr
-	}); err != nil {
+	var j mutJournal
+	if db.wal != nil {
+		j = mutJournal{db: db, tableID: tbl.tableID}
+	}
+	if err := tbl.insertJournaled(row, j); err != nil {
 		return 0, err
 	}
 	return 1, nil
@@ -174,20 +227,15 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		if keyVal.IsNull() {
 			return 0, nil
 		}
-		var journal func(Row) error
+		var j mutJournal
 		if db.wal != nil {
-			journal = func(nr Row) error {
-				body := encodeUpdateMutation(db.scratch.get(), tbl.tableID, nr[tbl.def.pkOrdinal], pl.updateOrdinals, nr)
-				werr := db.wal.writeRecord(recMutation, body)
-				db.scratch.put(body)
-				return werr
-			}
+			j = mutJournal{db: db, tableID: tbl.tableID, ords: pl.updateOrdinals, pkOrd: tbl.def.pkOrdinal}
 		}
 		pk, err := coerceToUUID(keyVal)
 		if err != nil {
 			return 0, err
 		}
-		ok, err := tbl.updateByPKOneJournaled(pk, ord, computeOne, journal)
+		ok, err := tbl.updateByPKOneJournaled(pk, ord, computeOne, j)
 		if err != nil {
 			return 0, err
 		}
@@ -229,8 +277,8 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 	}
 
 	// Fast path: PK equality — single shard, journal-before-apply under that
-	// shard's lock (updateByPKJournaled). nil journal for memory-only keeps
-	// this hot path allocation-free.
+	// shard's lock (updateByPKJournaled). The zero journal for memory-only
+	// keeps this hot path allocation-free.
 	if pl.pkLookup {
 		keyVal, err := evalExpr(pl.pkSource, &evalCtx{args: args})
 		if err != nil {
@@ -239,20 +287,15 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		if keyVal.IsNull() {
 			return 0, nil
 		}
-		var journal func(Row) error
+		var j mutJournal
 		if db.wal != nil {
-			journal = func(nr Row) error {
-				body := encodeUpdateMutation(db.scratch.get(), tbl.tableID, nr[tbl.def.pkOrdinal], pl.updateOrdinals, nr)
-				werr := db.wal.writeRecord(recMutation, body)
-				db.scratch.put(body)
-				return werr
-			}
+			j = mutJournal{db: db, tableID: tbl.tableID, ords: pl.updateOrdinals, pkOrd: tbl.def.pkOrdinal}
 		}
 		pk, err := coerceToUUID(keyVal)
 		if err != nil {
 			return 0, err
 		}
-		ok, err := tbl.updateByPKJournaled(pk, pl.updateOrdinals, compute, journal)
+		ok, err := tbl.updateByPKJournaled(pk, pl.updateOrdinals, compute, j)
 		if err != nil {
 			return 0, err
 		}
@@ -319,16 +362,11 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 				}
 				return v[0], nil
 			}
-			var journal func(Row) error
+			var j mutJournal
 			if db.wal != nil {
-				journal = func(nr Row) error {
-					body := encodeUpdateMutation(db.scratch.get(), tbl.tableID, nr[tbl.def.pkOrdinal], pl.updateOrdinals, nr)
-					werr := db.wal.writeRecord(recMutation, body)
-					db.scratch.put(body)
-					return werr
-				}
+				j = mutJournal{db: db, tableID: tbl.tableID, ords: pl.updateOrdinals, pkOrd: tbl.def.pkOrdinal}
 			}
-			return tbl.updateOneByCandidate(pks[0], ord, match, computeOne, journal)
+			return tbl.updateOneByCandidate(pks[0], ord, match, computeOne, j)
 		}
 		return tbl.updateByCandidates(pks, match, pl.updateOrdinals, compute, encode, journalAll)
 	}
@@ -367,17 +405,12 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		pkVal := UUIDVal(pk) // journal the resolved UUID, not the raw arg
-		var journal func() error
+		var j mutJournal
 		if db.wal != nil {
-			journal = func() error {
-				body := encodeDeleteMutation(db.scratch.get(), tbl.tableID, pkVal)
-				werr := db.wal.writeRecord(recMutation, body)
-				db.scratch.put(body)
-				return werr
-			}
+			// journal the resolved UUID, not the raw arg
+			j = mutJournal{db: db, tableID: tbl.tableID, pkVal: UUIDVal(pk)}
 		}
-		ok, err := tbl.deleteByPKJournaled(pk, journal)
+		ok, err := tbl.deleteByPKJournaled(pk, j)
 		if err != nil {
 			return 0, err
 		}

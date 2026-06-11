@@ -35,10 +35,10 @@ const pkRetryBudget = 8
 
 // insertPartitioned routes by PartitionKey value, rejects a duplicate PK via
 // the directory, journals, appends the row, and records its location — under
-// the directory lock then the shard lock (then walMu inside journal). A
+// the directory lock then the shard lock (then walMu inside the journal). A
 // duplicate is rejected before journaling; a WAL failure aborts before the
-// row is applied. journal may be nil (replay / memory-only).
-func (t *table) insertPartitioned(row Row, journal func() error) error {
+// row is applied. j may be the zero value (replay / memory-only).
+func (t *table) insertPartitioned(row Row, j mutJournal) error {
 	pk := row[t.def.pkOrdinal].UUID()
 	part := row[t.def.partitionOrdinal].UUID()
 	idx := t.shardIdxOf(part)
@@ -51,10 +51,8 @@ func (t *table) insertPartitioned(row Row, journal func() error) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if journal != nil {
-		if err := journal(); err != nil {
-			return err
-		}
+	if err := j.insert(row); err != nil {
+		return err
 	}
 	rowID := uint64(len(s.rows))
 	s.rows = append(s.rows, row)
@@ -216,9 +214,9 @@ func (t *table) getByPKProjectPartitioned(pk UUID, ords []int) (Row, bool) {
 // directory read lock across the shard write so a concurrent move (which needs
 // the directory write lock) cannot invalidate the location mid-update. PK and
 // PartitionKey are immutable, so the row never changes shard. Hot path is
-// allocation-free (stack-saved revert on WAL failure); journal nil = no
+// allocation-free (stack-saved revert on WAL failure); a zero j = no
 // save/revert.
-func (t *table) updateByPKJournaledPartitioned(pk UUID, ords []int, compute func(Row) ([]Value, error), journal func(Row) error) (bool, error) {
+func (t *table) updateByPKJournaledPartitioned(pk UUID, ords []int, compute func(Row) ([]Value, error), j mutJournal) (bool, error) {
 	t.pkDir.mu.RLock()
 	defer t.pkDir.mu.RUnlock()
 	loc, ok := t.pkDir.idx[pk]
@@ -239,7 +237,7 @@ func (t *table) updateByPKJournaledPartitioned(pk UUID, ords []int, compute func
 	if err != nil {
 		return false, err
 	}
-	if journal == nil {
+	if !j.live() {
 		for i, ord := range ords {
 			r[ord] = vals[i]
 		}
@@ -253,7 +251,7 @@ func (t *table) updateByPKJournaledPartitioned(pk UUID, ords []int, compute func
 	for i, ord := range ords {
 		r[ord] = vals[i]
 	}
-	if err := journal(r); err != nil {
+	if err := j.update(r); err != nil {
 		for i, ord := range ords {
 			r[ord] = old[i]
 		}
@@ -262,7 +260,7 @@ func (t *table) updateByPKJournaledPartitioned(pk UUID, ords []int, compute func
 	return true, nil
 }
 
-func (t *table) updateByPKOneJournaledPartitioned(pk UUID, ord int, compute func(Row) (Value, error), journal func(Row) error) (bool, error) {
+func (t *table) updateByPKOneJournaledPartitioned(pk UUID, ord int, compute func(Row) (Value, error), j mutJournal) (bool, error) {
 	t.pkDir.mu.RLock()
 	defer t.pkDir.mu.RUnlock()
 	loc, ok := t.pkDir.idx[pk]
@@ -283,13 +281,13 @@ func (t *table) updateByPKOneJournaledPartitioned(pk UUID, ord int, compute func
 	if err != nil {
 		return false, err
 	}
-	if journal == nil {
+	if !j.live() {
 		r[ord] = val
 		return true, nil
 	}
 	old := r[ord]
 	r[ord] = val
-	if err := journal(r); err != nil {
+	if err := j.update(r); err != nil {
 		r[ord] = old
 		return false, err
 	}
@@ -323,7 +321,7 @@ func (t *table) updatePartitioned(pk UUID, mutate func(Row) Row) bool {
 // deleteByPKJournaledPartitioned holds the directory WRITE lock across the
 // whole op (so the location is stable: a move needs the same lock), journals,
 // tombstones the row, and removes the directory entry.
-func (t *table) deleteByPKJournaledPartitioned(pk UUID, journal func() error) (bool, error) {
+func (t *table) deleteByPKJournaledPartitioned(pk UUID, j mutJournal) (bool, error) {
 	t.pkDir.mu.Lock()
 	defer t.pkDir.mu.Unlock()
 	loc, ok := t.pkDir.idx[pk]
@@ -333,10 +331,8 @@ func (t *table) deleteByPKJournaledPartitioned(pk UUID, journal func() error) (b
 	s := &t.shards[loc.shard]
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if journal != nil {
-		if err := journal(); err != nil {
-			return false, err
-		}
+	if err := j.delete(); err != nil {
+		return false, err
 	}
 	if loc.rowID < uint64(len(s.rows)) {
 		s.rows[loc.rowID] = nil
@@ -348,7 +344,7 @@ func (t *table) deleteByPKJournaledPartitioned(pk UUID, journal func() error) (b
 
 // deleteByPKPartitioned is the replay-path delete (no journal).
 func (t *table) deleteByPKPartitioned(pk UUID) bool {
-	ok, _ := t.deleteByPKJournaledPartitioned(pk, nil)
+	ok, _ := t.deleteByPKJournaledPartitioned(pk, mutJournal{})
 	return ok
 }
 

@@ -756,16 +756,18 @@ func toValue(a any, index int) (Value, error) {
 // applied (a WAL failure leaves nothing applied), and a torn envelope is
 // discarded whole on replay. Caller guarantees db.wal != nil.
 func (db *DB) journalTxnBodies(bodies [][]byte) error {
-	buf := db.scratch.get()
-	buf = encodeTxn(buf, bodies)
-	err := db.wal.writeRecord(recTxn, buf)
-	db.scratch.put(buf)
+	bp := db.scratch.get()
+	*bp = encodeTxn(*bp, bodies)
+	err := db.wal.writeRecord(recTxn, *bp)
+	db.scratch.put(bp)
 	return err
 }
 
 // scratchPool hands out small []byte buffers for WAL record encoding.
 // sync.Pool gives per-P caching with no contention; the GC reclaims
-// pooled items on its own schedule.
+// pooled items on its own schedule. The box (*[]byte) travels with the
+// buffer through get/put — a Put with a fresh &b per call would heap-
+// allocate one slice header per WAL record on the write hot path.
 type scratchPool struct {
 	p sync.Pool
 }
@@ -777,15 +779,16 @@ func newScratchPool() *scratchPool {
 	}}}
 }
 
-func (p *scratchPool) get() []byte {
+func (p *scratchPool) get() *[]byte {
 	bp := p.p.Get().(*[]byte)
-	return (*bp)[:0]
+	*bp = (*bp)[:0]
+	return bp
 }
 
-func (p *scratchPool) put(b []byte) {
-	if cap(b) > 64<<10 {
+func (p *scratchPool) put(bp *[]byte) {
+	if cap(*bp) > 64<<10 {
 		// drop oversize buffers so a one-off huge row doesn't pin memory
 		return
 	}
-	p.p.Put(&b)
+	p.p.Put(bp)
 }

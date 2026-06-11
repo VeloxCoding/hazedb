@@ -96,9 +96,10 @@ func (db *DB) createTable(td TableDef) error {
 	}
 	rt := &tableRT{table: newTable(resolved[td.Name], db.sizeHint), tableID: uint16(len(cur.byID))}
 	if db.wal != nil {
-		body := encodeCreateTable(db.scratch.get(), rt.tableID, td)
-		werr := db.wal.writeRecord(recCreateTable, body)
-		db.scratch.put(body)
+		bp := db.scratch.get()
+		*bp = encodeCreateTable(*bp, rt.tableID, td)
+		werr := db.wal.writeRecord(recCreateTable, *bp)
+		db.scratch.put(bp)
 		if werr != nil {
 			return werr
 		}
@@ -118,9 +119,10 @@ func (db *DB) dropTable(name string) error {
 		return fmt.Errorf("%w: %q", ErrUnknownTable, name)
 	}
 	if db.wal != nil {
-		body := encodeDropTable(db.scratch.get(), name)
-		werr := db.wal.writeRecord(recDropTable, body)
-		db.scratch.put(body)
+		bp := db.scratch.get()
+		*bp = encodeDropTable(*bp, name)
+		werr := db.wal.writeRecord(recDropTable, *bp)
+		db.scratch.put(bp)
 		if werr != nil {
 			return werr
 		}
