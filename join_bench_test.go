@@ -422,3 +422,36 @@ func BenchmarkJoinOrderedNoWhere_SQLiteMem(b *testing.B) {
 		scanSQLiteJoin(b, stmt, 10)
 	}
 }
+
+// BenchmarkJoinDirtyOverlay drives many rows against an indexed probe table whose
+// dirty overlay is fully populated (merge disabled), the shape that made the
+// per-probe dirtyPKs() re-snapshot cost O(driver × dirty): a LEFT JOIN drives all
+// `users` rows and probes posts.author (a secondary index, so the overlay path)
+// once per driver row. With the snapshot hoisted out of the probe loop the
+// overlay is copied once, not per probe.
+func BenchmarkJoinDirtyOverlay(b *testing.B) {
+	const (
+		users = 1000
+		posts = 5000
+	)
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1}) // merge off → overlay stays full
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec("CREATE TABLE users (id uuid primary key, name text)")
+	db.Exec("CREATE TABLE posts (id uuid primary key, author uuid, INDEX (author))")
+	for i := 0; i < users; i++ {
+		db.Exec("INSERT INTO users (id, name) VALUES (?, ?)", tid(i), "u")
+	}
+	for i := 0; i < posts; i++ {
+		db.Exec("INSERT INTO posts (id, author) VALUES (?, ?)", tid(1_000_000+i), tid(i%users))
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for n := 0; n < b.N; n++ {
+		if _, _, err := db.Query("SELECT users.name FROM users LEFT JOIN posts ON posts.author = users.id"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

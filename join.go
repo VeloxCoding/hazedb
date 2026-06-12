@@ -569,7 +569,12 @@ func colAndLit(b *binOp) (*colRef, expr) {
 // live re-check, exactly like idxCandidates). A NULL key matches nothing (SQL
 // join semantics). fn returns true to stop. Rows handed to fn are owned clones
 // (getByPK), so the caller may retain them.
-func (db *DB) probeRows(tbl *tableRT, onOrd int, byPK bool, key Value, fn func(Row) bool) {
+//
+// dirty is the table's dirty-PK overlay, snapshotted ONCE by the caller (every
+// probe in a join shares it) — re-snapshotting per probe row would RLock all
+// shards and copy the whole overlay on each of O(driver) probes. Ignored on the
+// byPK path. nil is fine (no overlay).
+func (db *DB) probeRows(tbl *tableRT, onOrd int, byPK bool, key Value, dirty []UUID, fn func(Row) bool) {
 	if key.IsNull() {
 		return
 	}
@@ -587,7 +592,7 @@ func (db *DB) probeRows(tbl *tableRT, onOrd int, byPK bool, key Value, fn func(R
 	if si == nil {
 		return
 	}
-	cand := idxCandidateSet{pks: si.lookupLeading(key), dirty: tbl.dirtyPKs()}
+	cand := idxCandidateSet{pks: si.lookupLeading(key), dirty: dirty}
 	cand.emit(func(pk UUID) bool {
 		r, ok := tbl.getByPK(pk)
 		if !ok {
@@ -655,7 +660,7 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		db.probeRows(jp.driverRT, jp.driverIdxOrd, jp.driverIdxByPK, key, func(dr Row) bool {
+		db.probeRows(jp.driverRT, jp.driverIdxOrd, jp.driverIdxByPK, key, jp.driverRT.dirtyPKs(), func(dr Row) bool {
 			if passDriver(dr) { // dr is an owned clone (getByPK)
 				drivers = append(drivers, dr)
 			}
@@ -672,6 +677,12 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 
 	// Phase 2: probe + assemble, holding no driver lock.
 	eff := fetchBound(st.limit, st.offset)
+
+	// Snapshot the probe table's dirty overlay ONCE for the whole probe phase.
+	// Every per-driver-row probe shares it; without this, each probe re-RLocks all
+	// shards and copies the overlay (O(driver × dirty)). Consistent with the join's
+	// per-shard, not-point-in-time contract (the driver is already materialised).
+	probeDirty := jp.probeRT.dirtyPKs()
 
 	// passResidual applies the WHERE conjuncts NOT already pushed into the driver
 	// (probe-side / cross-table / constant). Driver conjuncts ran in passDriver, so
@@ -706,7 +717,7 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 	drive := func(emit func(left, right Row) bool) {
 		probeAndEmit := func(drow Row) bool { // returns true to stop the whole join
 			matched, stop := false, false
-			db.probeRows(jp.probeRT, jp.probeOnOrd, jp.probeByPK, drow[jp.driverOnOrd], func(prow Row) bool {
+			db.probeRows(jp.probeRT, jp.probeOnOrd, jp.probeByPK, drow[jp.driverOnOrd], probeDirty, func(prow Row) bool {
 				matched = true
 				left, right := drow, prow
 				if !jp.driverIsLeft {
@@ -859,7 +870,7 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 			concat := make(Row, nLeft+nRight)
 			appendJoined := func(drow Row) {
 				matched := false
-				db.probeRows(jp.probeRT, jp.probeOnOrd, jp.probeByPK, drow[jp.driverOnOrd], func(prow Row) bool {
+				db.probeRows(jp.probeRT, jp.probeOnOrd, jp.probeByPK, drow[jp.driverOnOrd], probeDirty, func(prow Row) bool {
 					matched = true
 					left, right := drow, prow
 					if !jp.driverIsLeft {
