@@ -308,3 +308,38 @@ func TestWALRejectsForeignVersion(t *testing.T) {
 		t.Fatalf("Open with a stale-version WAL: want ErrWALCorrupt, got %v", err)
 	}
 }
+
+// A tampered/corrupt-but-CRC-valid mutation record must fail closed with
+// ErrWALCorrupt during apply, never panic — a slice out-of-range in replay runs
+// inside Open (no recover), so a panic would crash-loop the process on every
+// boot until the WAL is removed. Mirrors the drain path's validation.
+func TestReplayRejectsCorruptMutation(t *testing.T) {
+	db := openEmpty(t)
+	if _, err := db.Exec("CREATE TABLE t (id uuid primary key, n int)"); err != nil { // 2 cols, pkOrdinal 0
+		t.Fatal(err)
+	}
+	rt := db.cat.Load().byName["t"]
+	pk := UUIDVal(tid(1))
+
+	// opUpdate whose decoded ordinal is past the row width → r[ord] would panic.
+	wide := make(Row, 100)
+	for i := range wide {
+		wide[i] = Int(0)
+	}
+	rec := encodeUpdateMutation(nil, rt.tableID, pk, []int{99}, wide)
+	if err := db.applyMutation(rt, opUpdate, rec[3:]); !errors.Is(err, ErrWALCorrupt) { // rec[3:] strips op|tableID
+		t.Fatalf("out-of-range update ordinal: got %v, want ErrWALCorrupt", err)
+	}
+
+	// opInsert decoding to a row too short for the table → row[pkOrdinal] would panic.
+	short := encodeRow(nil, Row{}) // 0 cells; table has 2 columns
+	if err := db.applyMutation(rt, opInsert, short); !errors.Is(err, ErrWALCorrupt) {
+		t.Fatalf("short insert row: got %v, want ErrWALCorrupt", err)
+	}
+
+	// A correct-width row still applies (the guard does not clip valid replay).
+	good := encodeRow(nil, Row{pk, Int(7)})
+	if err := db.applyMutation(rt, opInsert, good); err != nil {
+		t.Fatalf("valid replay row rejected: %v", err)
+	}
+}

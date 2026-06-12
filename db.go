@@ -666,17 +666,31 @@ func (db *DB) applyMutationRecord(payload []byte) error {
 
 // applyMutation re-applies one decoded mutation to a table during replay.
 func (db *DB) applyMutation(rt *tableRT, op uint8, body []byte) error {
+	ncols := len(rt.def.def.Columns)
 	switch op {
 	case opInsert:
 		row, err := decodeRow(body)
 		if err != nil {
 			return err
 		}
+		// A tampered/corrupt record can decode to a row of the wrong width; insert
+		// indexes row[pkOrdinal] (and row[partitionOrdinal]) unchecked, so a short
+		// row would panic at boot — which recover() cannot catch for a slice
+		// out-of-range during replay-in-Open, crash-looping the process. Fail
+		// closed instead, mirroring the drain path's validation.
+		if len(row) != ncols {
+			return fmt.Errorf("%w: insert row width %d != table column count %d", ErrWALCorrupt, len(row), ncols)
+		}
 		return rt.insert(row)
 	case opUpdate:
 		var ords []int
 		var vals []Value
 		pk, err := decodeUpdateMutation(body, func(ord int, v Value) error {
+			// Range-check the decoded ordinal before it is used as r[ord] in the
+			// apply below — the same guard drain.go applies, absent here until now.
+			if ord < 0 || ord >= ncols {
+				return fmt.Errorf("%w: update ordinal %d out of range [0,%d)", ErrWALCorrupt, ord, ncols)
+			}
 			ords = append(ords, ord)
 			vals = append(vals, v)
 			return nil
