@@ -1,6 +1,9 @@
 package hazedb
 
-import "fmt"
+import (
+	"encoding/binary"
+	"fmt"
+)
 
 // Transactions — v1 scope (deliberately narrow; see the RFC "Transactions"
 // section). A transaction is a Go closure handed a *Tx; statements are staged,
@@ -154,6 +157,7 @@ type txAct struct {
 	kind uint8
 	pk   UUID
 	row  Row   // opInsert: full row; opUpdate: full post-update row
+	ords []int // opUpdate: the SET column ordinals, for the WAL update encoding
 	cost int64 // signed byte delta (see txAct doc)
 }
 
@@ -213,7 +217,6 @@ func (tx *Tx) commit() error {
 		return t.txGetLocked(pk)
 	}
 
-	resolved := make([][]byte, 0, len(tx.staged))
 	acts := make([]txAct, 0, len(tx.staged))
 	pkOrd := t.def.pkOrdinal
 	nIdx := len(t.indexes)
@@ -228,7 +231,6 @@ func (tx *Tx) commit() error {
 			overlay[m.pk] = m.row
 			cost := rowCost(m.row, nIdx)
 			byteDelta += cost
-			resolved = append(resolved, encodeInsertMutation(nil, tx.rt.tableID, m.row))
 			acts = append(acts, txAct{kind: opInsert, pk: m.pk, row: m.row, cost: cost})
 		case opUpdate:
 			cur, ok := present(m.pk)
@@ -246,8 +248,7 @@ func (tx *Tx) commit() error {
 			overlay[m.pk] = nr
 			cost := rowCost(nr, nIdx) - rowCost(cur, nIdx)
 			byteDelta += cost
-			resolved = append(resolved, encodeUpdateMutation(nil, tx.rt.tableID, nr[pkOrd], m.pl.updateOrdinals, nr))
-			acts = append(acts, txAct{kind: opUpdate, pk: m.pk, row: nr, cost: cost})
+			acts = append(acts, txAct{kind: opUpdate, pk: m.pk, row: nr, ords: m.pl.updateOrdinals, cost: cost})
 		case opDelete:
 			cur, ok := present(m.pk)
 			if !ok {
@@ -256,11 +257,10 @@ func (tx *Tx) commit() error {
 			overlay[m.pk] = nil
 			cost := -rowCost(cur, nIdx)
 			byteDelta += cost
-			resolved = append(resolved, encodeDeleteMutation(nil, tx.rt.tableID, UUIDVal(m.pk)))
 			acts = append(acts, txAct{kind: opDelete, pk: m.pk, cost: cost})
 		}
 	}
-	if len(resolved) == 0 {
+	if len(acts) == 0 {
 		return nil // every statement no-op'd
 	}
 
@@ -279,9 +279,28 @@ func (tx *Tx) commit() error {
 	}
 
 	if tx.db.wal != nil {
+		// Encode the TXN envelope directly into one pooled buffer — nmut, then each
+		// sub-mutation as a length-prefixed op|tableID|body, backpatching the length
+		// after encoding in place. Avoids the old per-row encode-into-nil ([]byte
+		// per act) plus a second copy into the envelope, and is skipped entirely
+		// when there is no WAL (memory-only built the bodies for nothing).
 		bp := tx.db.scratch.get()
-		*bp = encodeTxn(*bp, resolved)
-		werr := tx.db.wal.writeRecord(recTxn, *bp)
+		buf := appendU16LE((*bp)[:0], uint16(len(acts)))
+		for _, a := range acts {
+			lenAt := len(buf)
+			buf = appendU32LE(buf, 0) // sub-mutation length placeholder
+			switch a.kind {
+			case opInsert:
+				buf = encodeInsertMutation(buf, tx.rt.tableID, a.row)
+			case opUpdate:
+				buf = encodeUpdateMutation(buf, tx.rt.tableID, a.row[pkOrd], a.ords, a.row)
+			case opDelete:
+				buf = encodeDeleteMutation(buf, tx.rt.tableID, UUIDVal(a.pk))
+			}
+			binary.LittleEndian.PutUint32(buf[lenAt:], uint32(len(buf)-lenAt-4))
+		}
+		*bp = buf
+		werr := tx.db.wal.writeRecord(recTxn, buf)
 		tx.db.scratch.put(bp)
 		if werr != nil {
 			return werr // nothing applied yet
