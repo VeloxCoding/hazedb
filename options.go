@@ -75,7 +75,7 @@ type Options struct {
 	// Zero = 50ms; negative disables it (manual merge, for pre-merge assertions).
 	indexMergeInterval time.Duration
 	// compactInterval is how often the background arena-compaction sweeper runs.
-	// Zero = 1s; negative disables it (manual compactShard only, for tests). The
+	// Zero = 200ms; negative disables it (manual compactShard only, for tests). The
 	// sweeper reclaims dead arena slots from shards that have gone more-than-half
 	// dead, off the write path — see compact.go.
 	compactInterval time.Duration

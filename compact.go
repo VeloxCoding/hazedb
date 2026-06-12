@@ -15,8 +15,13 @@ import "time"
 // for genuinely dense ones, so clean shards (the common case) cost a brief RLock.
 
 const (
-	// defaultCompactInterval is how often the sweeper looks for dense shards.
-	defaultCompactInterval = time.Second
+	// defaultCompactInterval is how often the sweeper looks for dense shards. An
+	// idle sweep is ~9 ns/shard (BenchmarkSweepCompactIdle), so the interval costs
+	// nothing when there is nothing to do; it mainly bounds reclaim latency (how
+	// long dead slots linger after a shard crosses the dead>live threshold). 200ms
+	// keeps that transient small without waking pointlessly often; the dead>live
+	// gate prevents re-compacting a clean shard, so a short interval never thrashes.
+	defaultCompactInterval = 200 * time.Millisecond
 	// compactMinSlots skips small shards — their few dead slots cost less than the
 	// rebuild, and the dead>live ratio is noisy at tiny sizes.
 	compactMinSlots = 64
