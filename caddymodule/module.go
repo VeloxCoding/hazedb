@@ -278,10 +278,12 @@ func (h *Handler) handleExec(w http.ResponseWriter, r *http.Request) {
 
 // handleMeta is the store-size overview: GET /meta → the MetaSnapshot JSON
 // ({"tables":N,"max_bytes":M,"total_rows":R,"total_approx_bytes":B,
-// "table_stats":[{name,rows,columns,indexes,approx_bytes},...]}). max_bytes is
-// the configured cap (0 = unlimited) that total_approx_bytes is measured against.
-// No body, no args — a lock-light read for dashboards and health checks. Sizes
-// are deliberate estimates (see hazedb.StoreMeta), not byte-exact accounting.
+// "total_tombstones":T,"table_stats":[{name,rows,columns,indexes,approx_bytes,
+// tombstones},...]}). max_bytes is the configured cap (0 = unlimited) that
+// total_approx_bytes is measured against; tombstones is deleted-but-unreclaimed
+// arena slots (a high tombstones/(rows+tombstones) fraction means scans + memory
+// carry dead weight until a restart). No body, no args — a lock-light read for
+// dashboards and health checks. Sizes are estimates, not byte-exact accounting.
 func (h *Handler) handleMeta(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, hazedb.ErrorJSON("use GET"))

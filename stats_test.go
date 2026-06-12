@@ -122,6 +122,10 @@ func TestMetaSnapshotEmptyAndDelete(t *testing.T) {
 	if ts.ApproxBytes != twoRows/2 {
 		t.Fatalf("after delete: bytes=%d, want %d (half of %d)", ts.ApproxBytes, twoRows/2, twoRows)
 	}
+	// The deleted row is a tombstone: 1 live + 1 dead arena slot, not reclaimed.
+	if ts.Tombstones != 1 {
+		t.Fatalf("after one delete: tombstones=%d, want 1", ts.Tombstones)
+	}
 }
 
 // MetaJSON is the wire shape the Caddy /meta route and the PHP hazedb_meta
@@ -136,7 +140,7 @@ func TestMetaJSON(t *testing.T) {
 
 	// Snake_case keys are the documented contract — assert on the bytes, not just
 	// the decoded struct, so a tag rename can't pass silently.
-	for _, key := range []string{`"tables"`, `"max_bytes"`, `"total_rows"`, `"total_approx_bytes"`, `"table_stats"`, `"name"`, `"rows"`, `"columns"`, `"indexes"`, `"approx_bytes"`} {
+	for _, key := range []string{`"tables"`, `"max_bytes"`, `"total_rows"`, `"total_approx_bytes"`, `"total_tombstones"`, `"table_stats"`, `"name"`, `"rows"`, `"columns"`, `"indexes"`, `"approx_bytes"`, `"tombstones"`} {
 		if !strings.Contains(string(raw), key) {
 			t.Fatalf("MetaJSON missing key %s: %s", key, raw)
 		}

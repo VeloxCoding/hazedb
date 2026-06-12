@@ -24,23 +24,34 @@ type StoreMeta struct {
 	// TotalApproxBytes is what it is measured against — an insert is rejected once
 	// the total would exceed it.
 	MaxBytes int64 `json:"max_bytes"`
-	// TotalRows / TotalApproxBytes roll up every table's line, so a caller gets
-	// the store-wide footprint without summing TableStats itself. TotalApproxBytes
-	// is the sum of the per-table estimates and inherits their slight over-bias.
+	// TotalRows / TotalApproxBytes / TotalTombstones roll up every table's line, so
+	// a caller gets the store-wide figures without summing TableStats itself.
+	// TotalApproxBytes is the sum of the per-table estimates and inherits their
+	// slight over-bias.
 	TotalRows        int         `json:"total_rows"`
 	TotalApproxBytes int64       `json:"total_approx_bytes"`
+	TotalTombstones  int         `json:"total_tombstones"`
 	TableStats       []TableStat `json:"table_stats"`
 }
 
 // TableStat is one table's line in a StoreMeta. ApproxBytes sums exact cell
 // payloads plus modeled overhead (see StoreMeta); a display layer formats it to
 // MiB.
+//
+// Tombstones is the count of dead arena slots — rows deleted but not yet
+// reclaimed (the store never compacts a running arena; only a restart-from-
+// checkpoint does). It is also the count of stale entries lingering in a
+// partitioned table's tails index, which a scan still walks. A high
+// Tombstones/(Rows+Tombstones) fraction on an insert+delete workload means scans
+// and memory are carrying dead weight until the next restart. Surfaced so that
+// growth is visible.
 type TableStat struct {
 	Name        string `json:"name"`
 	Rows        int    `json:"rows"`
 	Columns     int    `json:"columns"`
 	Indexes     int    `json:"indexes"`
 	ApproxBytes int64  `json:"approx_bytes"`
+	Tombstones  int    `json:"tombstones"`
 }
 
 const (
@@ -96,19 +107,20 @@ func cellDelta(oldv, newv Value) int64 {
 	return d
 }
 
-// liveStats returns the live row count and the in-RAM byte size for t by reading
-// the per-shard running counters under a brief RLock — O(shards), not O(rows).
-// The counters are maintained by every row mutation (see rowCost), so this never
-// walks the arena.
-func (t *table) liveStats() (rows int, approxBytes int64) {
+// liveStats returns the live row count, dead-slot (tombstone) count, and in-RAM
+// byte size for t by reading the per-shard counters under a brief RLock —
+// O(shards), not O(rows). live/bytes are running counters; tombstones is the
+// arena length minus live, i.e. deleted-but-not-reclaimed slots.
+func (t *table) liveStats() (rows, tombstones int, approxBytes int64) {
 	for i := range t.shards {
 		s := &t.shards[i]
 		s.mu.RLock()
 		rows += s.live
+		tombstones += len(s.rows) - s.live
 		approxBytes += s.bytes
 		s.mu.RUnlock()
 	}
-	return rows, approxBytes
+	return rows, tombstones, approxBytes
 }
 
 // MetaSnapshot returns the current StoreMeta. It loads the catalog atomically
@@ -125,16 +137,18 @@ func (db *DB) MetaSnapshot() StoreMeta {
 	}
 	for _, rt := range cat.byName {
 		t := rt.table
-		rows, bytes := t.liveStats()
+		rows, tombstones, bytes := t.liveStats()
 		out.TableStats = append(out.TableStats, TableStat{
 			Name:        rt.name(),
 			Rows:        rows,
 			Columns:     len(t.def.def.Columns),
 			Indexes:     len(t.indexes),
 			ApproxBytes: bytes,
+			Tombstones:  tombstones,
 		})
 		out.TotalRows += rows
 		out.TotalApproxBytes += bytes
+		out.TotalTombstones += tombstones
 	}
 	sort.Slice(out.TableStats, func(i, j int) bool {
 		return out.TableStats[i].Name < out.TableStats[j].Name
