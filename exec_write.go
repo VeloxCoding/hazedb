@@ -170,6 +170,17 @@ func (db *DB) execInsertBatch(pl *plan, args []Value) (int, error) {
 			ErrBatchTooLarge, len(pl.insertTmpl), maxTxnMutations)
 	}
 	pkOrd := tbl.def.pkOrdinal
+	// If the INSERT column list omits the PK, every row's PK is auto-generated
+	// (UUIDv7) and thus unique — no intra-batch duplicate is possible — so commit
+	// can skip the read-your-writes overlay and its per-row dup-check. The template
+	// columns are identical across tuples, so tuple 0 decides it.
+	autoPK := true
+	for i := range pl.insertTmpl[0] {
+		if pl.insertTmpl[0][i].ord == pkOrd {
+			autoPK = false
+			break
+		}
+	}
 	staged := make([]stagedMut, len(pl.insertTmpl))
 	for r := range pl.insertTmpl {
 		row, err := db.buildRowFromTmpl(pl, pl.insertTmpl[r], args)
@@ -178,7 +189,7 @@ func (db *DB) execInsertBatch(pl *plan, args []Value) (int, error) {
 		}
 		staged[r] = stagedMut{kind: opInsert, pk: row[pkOrd].UUID(), row: row}
 	}
-	tx := &Tx{db: db, rt: tbl, staged: staged}
+	tx := &Tx{db: db, rt: tbl, staged: staged, skipDup: autoPK}
 	if err := tx.commit(); err != nil {
 		return 0, err
 	}

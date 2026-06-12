@@ -34,6 +34,13 @@ type Tx struct {
 	rt     *tableRT // the single table; set on the first staged statement
 	staged []stagedMut
 	err    error // sticky: the first tx.Exec error poisons the whole tx
+	// skipDup is set ONLY by execInsertBatch for an all-INSERT batch whose PKs are
+	// all auto-generated (the INSERT omits the PK column). Those PKs are unique by
+	// construction (UUIDv7), so commit can skip the read-your-writes overlay and
+	// its per-row dup-check + live lookup. Never set when any UPDATE/DELETE or a
+	// client-supplied PK is staged (where a duplicate is possible and the overlay
+	// provides read-your-writes).
+	skipDup bool
 }
 
 // stagedMut is one buffered statement. INSERT carries the fully resolved row
@@ -208,8 +215,16 @@ func (tx *Tx) commit() error {
 		}
 	}()
 
-	overlay := make(map[UUID]Row, len(tx.staged)) // present row, or nil = deleted in-tx
-	// present resolves a PK against the overlay first, then the live store.
+	// overlay gives read-your-writes + intra-tx dup detection. Skipped for an
+	// auto-PK insert-only batch (skipDup): those PKs are unique by construction, so
+	// the map alloc + per-row dup-check + live lookup are pure overhead.
+	var overlay map[UUID]Row // present row, or nil = deleted in-tx
+	if !tx.skipDup {
+		overlay = make(map[UUID]Row, len(tx.staged))
+	}
+	// present resolves a PK against the overlay first, then the live store. A nil
+	// overlay (skipDup) reads as empty, so it always falls through to the store —
+	// but the insert path below skips present() entirely in that case.
 	present := func(pk UUID) (Row, bool) {
 		if r, ok := overlay[pk]; ok {
 			return r, r != nil
@@ -225,10 +240,12 @@ func (tx *Tx) commit() error {
 	for _, m := range tx.staged {
 		switch m.kind {
 		case opInsert:
-			if _, ok := present(m.pk); ok {
-				return fmt.Errorf("%w: %v", ErrDuplicatePK, m.pk)
+			if !tx.skipDup {
+				if _, ok := present(m.pk); ok {
+					return fmt.Errorf("%w: %v", ErrDuplicatePK, m.pk)
+				}
+				overlay[m.pk] = m.row
 			}
-			overlay[m.pk] = m.row
 			cost := rowCost(m.row, nIdx)
 			byteDelta += cost
 			acts = append(acts, txAct{kind: opInsert, pk: m.pk, row: m.row, cost: cost})
