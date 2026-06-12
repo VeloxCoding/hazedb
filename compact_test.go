@@ -183,3 +183,25 @@ func TestCompactConcurrentReads(t *testing.T) {
 	stop.Store(true)
 	compactor.Wait()
 }
+
+// BenchmarkSweepCompactIdle measures one sweep over a clean store (no dense
+// shards): the cost paid every tick regardless of churn — an RLock + check per
+// shard. Sets the floor on how short the interval can sensibly be.
+func BenchmarkSweepCompactIdle(b *testing.B) {
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, compactInterval: -1})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec("CREATE TABLE u (id uuid primary key, n int)")
+	for i := 0; i < 100000; i++ {
+		db.Exec("INSERT INTO u (id, n) VALUES (?, ?)", tid(i), i)
+	}
+	rt := db.cat.Load().byName["u"]
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		db.sweepCompact()
+	}
+	b.ReportMetric(float64(len(rt.shards)), "shards")
+}
