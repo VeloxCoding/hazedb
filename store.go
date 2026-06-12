@@ -216,6 +216,13 @@ func (t *table) shardOf(u UUID) *tableShard { return &t.shards[t.shardIdxOf(u)] 
 
 // insert places a row under its PK. Returns ErrDuplicatePK if the key
 // already exists (live or tombstone-replaced rows take new slots).
+//
+// This is the BOOT path only — WAL replay (applyMutation) and SQLite recovery
+// (loadTableRows). It deliberately does NOT mark the row dirty: Open rebuilds
+// every secondary index from a full scan (rebuildAllIndexes) once replay and
+// recovery finish, which clears and regenerates the overlay wholesale, so a
+// per-row dirty mark here is work that is immediately discarded. Live writes use
+// insertJournaled, which does mark dirty. Do not call insert on a live path.
 func (t *table) insert(row Row) error {
 	if t.pkDir != nil {
 		return t.insertPartitioned(row, mutJournal{})
@@ -234,7 +241,6 @@ func (t *table) insert(row Row) error {
 	}
 	rowID := s.addRowLocked(row, cost)
 	s.pk.commit(slot, pk, rowID)
-	t.markDirtyLocked(s, pk)
 	return nil
 }
 
