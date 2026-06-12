@@ -681,8 +681,12 @@ func (t *table) mergeIndexes() {
 	}
 	for _, d := range drops {
 		d.s.mu.Lock()
-		d.s.dirtyRead = d.s.dirtyRead[d.nr:] // drop processed prefixes; later appends remain
-		d.s.dirtyDel = d.s.dirtyDel[d.nd:]
+		// Copy the un-merged tail down to the front rather than reslicing forward:
+		// s[nr:] advances the start so the consumed prefix is dead capacity until a
+		// realloc, and a steady write/merge cycle keeps growing the backing. Copying
+		// down reuses it from index 0.
+		d.s.dirtyRead = append(d.s.dirtyRead[:0], d.s.dirtyRead[d.nr:]...)
+		d.s.dirtyDel = append(d.s.dirtyDel[:0], d.s.dirtyDel[d.nd:]...)
 		d.s.mu.Unlock()
 		t.readDirtyCount.Add(-int64(d.nr))
 		t.delDirtyCount.Add(-int64(d.nd))

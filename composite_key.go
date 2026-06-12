@@ -76,12 +76,17 @@ func appendOrderedColumn(buf []byte, v Value) []byte {
 // 0x00 0x00 terminator, so variable-length fields stay self-delimiting and
 // order-preserving across a column boundary.
 func appendEscapedTerminated(buf []byte, s string) []byte {
+	// Chunked copy: bulk-append the spans between NUL bytes (rare in real keys),
+	// escaping only at each NUL — the common no-NUL string is one append, not a
+	// byte-at-a-time loop. Same shape as appendJSONString.
+	last := 0
 	for i := 0; i < len(s); i++ {
-		c := s[i]
-		buf = append(buf, c)
-		if c == 0x00 {
-			buf = append(buf, 0xFF)
+		if s[i] == 0x00 {
+			buf = append(buf, s[last:i]...)
+			buf = append(buf, 0x00, 0xFF)
+			last = i + 1
 		}
 	}
+	buf = append(buf, s[last:]...)
 	return append(buf, 0x00, 0x00)
 }

@@ -180,7 +180,7 @@ func valueFromZval(z *C.zval) (hazedb.Value, bool) {
 		return hazedb.Int(int64(C.hzd_zval_long(z))), true
 	case 4:
 		s := C.GoStringN(C.hzd_zval_strptr(z), C.int(C.hzd_zval_strlen(z)))
-		if u, err := hazedb.ParseUUID(s); err == nil {
+		if u, ok := hazedb.ParseUUIDOk(s); ok {
 			return hazedb.UUIDVal(u), true
 		}
 		return hazedb.Str(s), true

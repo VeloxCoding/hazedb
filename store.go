@@ -626,20 +626,37 @@ func (t *table) unlockAllShards() {
 // (ascending, deadlock-safe, same order); narrowing buys little there and
 // avoids per-call bookkeeping. A single held lock never waits while holding
 // another, so it cannot deadlock with the ascending all-shard path.
-func (t *table) lockCandidateShards(pks []UUID) func() {
+// shardUnlock releases what lockCandidateShards took: one shard (mu set) or all
+// shards (all set). Returned by value so the common single-shard case allocates
+// nothing — a returned method value (s.mu.Unlock / t.unlockAllShards) heap-escapes
+// the receiver, which this avoids on every indexed UPDATE/DELETE.
+type shardUnlock struct {
+	mu  *sync.RWMutex
+	all *table
+}
+
+func (u shardUnlock) unlock() {
+	if u.mu != nil {
+		u.mu.Unlock()
+	} else if u.all != nil {
+		u.all.unlockAllShards()
+	}
+}
+
+func (t *table) lockCandidateShards(pks []UUID) shardUnlock {
 	if len(pks) == 0 {
-		return func() {}
+		return shardUnlock{}
 	}
 	oi := t.shardIdxOf(pks[0])
 	for _, pk := range pks[1:] {
 		if t.shardIdxOf(pk) != oi {
 			t.lockAllShards()
-			return t.unlockAllShards
+			return shardUnlock{all: t}
 		}
 	}
 	s := &t.shards[oi]
 	s.mu.Lock()
-	return s.mu.Unlock
+	return shardUnlock{mu: &s.mu}
 }
 
 // updateWhereAll applies a predicate UPDATE across the whole table while
@@ -710,7 +727,7 @@ func (t *table) updateWhereAll(match func(Row) bool, ords []int, compute func(Ro
 // single-TXN atomicity. Non-partitioned only (secondary indexes are not on
 // partitioned tables, so idxLookup never fires for them).
 func (t *table) updateByCandidates(pks []UUID, match func(Row) bool, ords []int, compute func(Row) ([]Value, error), encode func(Row) []byte, journalAll func([][]byte) error) (int, error) {
-	defer t.lockCandidateShards(pks)()
+	defer t.lockCandidateShards(pks).unlock()
 	type pendingUpdate struct {
 		s  *tableShard
 		j  uint64
@@ -870,7 +887,7 @@ func (t *table) deleteWhereAll(match func(Row) bool, encode func(pk Value) []byt
 // scanning. Same all-shard-lock + single-TXN atomicity. Non-partitioned only.
 func (t *table) deleteByCandidates(pks []UUID, match func(Row) bool, encode func(pk Value) []byte, journalAll func([][]byte) error) (int, error) {
 	pkOrd := t.def.pkOrdinal
-	defer t.lockCandidateShards(pks)()
+	defer t.lockCandidateShards(pks).unlock()
 	type pendingDelete struct {
 		s  *tableShard
 		j  uint64

@@ -91,19 +91,33 @@ var uuidByteOff = [16]int{0, 2, 4, 6, 9, 11, 14, 16, 19, 21, 24, 26, 28, 30, 32,
 // hex.Decode call and no string→[]byte conversion (a hot read-path cost since
 // every string PK arg lands here).
 func ParseUUID(s string) (UUID, error) {
+	u, ok := ParseUUIDOk(s)
+	if !ok {
+		return UUID{}, fmt.Errorf("%w: invalid UUID %q", ErrParse, s)
+	}
+	return u, nil
+}
+
+// ParseUUIDOk is ParseUUID without the error: it returns ok=false instead of
+// formatting an error. The text adapters guess UUID-ness by trying to parse
+// every string arg (the WHERE email=? case parses-and-fails on the hot path), so
+// the discarded error string in ParseUUID was an allocation per non-UUID arg.
+// Callers that only branch on success use this; callers that surface the error
+// (DDL/coercion) use ParseUUID.
+func ParseUUIDOk(s string) (UUID, bool) {
 	var u UUID
 	if len(s) != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
-		return u, fmt.Errorf("%w: invalid UUID %q", ErrParse, s)
+		return u, false
 	}
 	for i := 0; i < 16; i++ {
 		o := uuidByteOff[i]
 		hi, lo := hexNibble[s[o]], hexNibble[s[o+1]]
 		if hi == 0xFF || lo == 0xFF {
-			return UUID{}, fmt.Errorf("%w: invalid UUID %q", ErrParse, s)
+			return UUID{}, false
 		}
 		u[i] = hi<<4 | lo
 	}
-	return u, nil
+	return u, true
 }
 
 // --- monotonic UUIDv7 generator (RFC 9562 §5.7 + monotonic counter) ---

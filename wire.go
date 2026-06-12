@@ -248,12 +248,14 @@ func appendJSONRows(b []byte, cols []string, rows []Row) []byte {
 	return append(b, ']', '}')
 }
 
-// ExecResultJSON renders a write result as {"affected":n}.
+// ExecResultJSON renders a write result as {"affected":n}. Hand-appended — the
+// shape is fixed, so the reflection-based json.Marshal it used was pure overhead
+// on every HTTP write response.
 func ExecResultJSON(affected int) []byte {
-	b, _ := json.Marshal(struct {
-		Affected int `json:"affected"`
-	}{affected})
-	return b
+	b := make([]byte, 0, 24)
+	b = append(b, `{"affected":`...)
+	b = strconv.AppendInt(b, int64(affected), 10)
+	return append(b, '}')
 }
 
 // ErrorJSON renders an error as {"error":"msg"}.
@@ -283,7 +285,7 @@ func QueryArgs(s string) ([]any, error) {
 	if t[0] == '[' {
 		return ArgsFromJSON([]byte(t))
 	}
-	if u, err := ParseUUID(t); err == nil {
+	if u, ok := ParseUUIDOk(t); ok {
 		return []any{u}, nil
 	}
 	return []any{t}, nil
@@ -310,7 +312,7 @@ func ArgsFromJSON(raw []byte) ([]any, error) {
 		case bool:
 			out[i] = x
 		case string:
-			if u, err := ParseUUID(x); err == nil {
+			if u, ok := ParseUUIDOk(x); ok {
 				out[i] = u
 			} else {
 				out[i] = x
