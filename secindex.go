@@ -132,23 +132,36 @@ func (si *secIndex) keyFromCellsInto(cells []Value, buf []byte) (indexKey, bool,
 
 // apply records pk's current indexed key. indexable=false means the row is gone
 // or its value is NULL: any prior entry is removed. The reverse map supplies the
-// old key, so callers never need to remember the pre-change value.
-func (si *secIndex) apply(pk UUID, newKey indexKey, indexable bool) {
+// old key, so callers never need to remember the pre-change value. Returns
+// whether this index actually changed — false for a no-op (same key re-set, or a
+// drop of a PK that was not indexed). For an ordered index the caller uses that
+// to skip the sorted-view merge when nothing moved (mergeSorted is O(n) even with
+// an empty change set).
+func (si *secIndex) apply(pk UUID, newKey indexKey, indexable bool) (changed bool) {
 	si.mu.Lock()
 	if si.ordered {
-		// rev is authoritative; the sorted view is rebuilt once per merge.
+		// rev is authoritative; the sorted view is folded once per merge.
+		old, had := si.rev[pk]
 		if indexable {
+			if had && old == newKey {
+				si.mu.Unlock()
+				return false // key unchanged: sorted view unaffected
+			}
 			si.rev[pk] = newKey
 		} else {
+			if !had {
+				si.mu.Unlock()
+				return false // was not indexed (e.g. NULL value): nothing to drop
+			}
 			delete(si.rev, pk)
 		}
 		si.mu.Unlock()
-		return
+		return true
 	}
 	old, had := si.rev[pk]
 	if had && indexable && old == newKey {
 		si.mu.Unlock()
-		return // key unchanged: fwd already holds pk under it — skip the remove+append churn
+		return false // key unchanged: fwd already holds pk under it — skip the remove+append churn
 	}
 	if had {
 		si.removeFwdLocked(old, pk)
@@ -159,6 +172,7 @@ func (si *secIndex) apply(pk UUID, newKey indexKey, indexable bool) {
 		si.rev[pk] = newKey
 	}
 	si.mu.Unlock()
+	return true
 }
 
 // ordCmp is the total order on the sorted view: by key, then PK as a stable
@@ -613,7 +627,11 @@ func (t *table) mergeIndexes() {
 		nr, nd int
 	}
 	var drops []pending
-	var dirtyPKs []UUID // every PK applied this merge, for the incremental sorted-view fold
+	// changedPerIdx[k] collects only the PKs whose key actually moved in ordered
+	// index k this merge — so an index untouched by the batch (writes hit a
+	// hash-indexed or NULL-valued column, or a no-op SET) skips its O(n) sorted-view
+	// fold entirely, and the folds that do run get the minimal change set.
+	changedPerIdx := make([][]UUID, len(t.indexes))
 	for i := range t.shards {
 		s := &t.shards[i]
 		s.mu.RLock()
@@ -635,16 +653,19 @@ func (t *table) mergeIndexes() {
 			scratch = pr // reuse the buffer next iteration
 			for k, si := range t.indexes {
 				if !ok {
-					si.apply(pk, indexKey{}, false)
+					if si.apply(pk, indexKey{}, false) && si.ordered {
+						changedPerIdx[k] = append(changedPerIdx[k], pk)
+					}
 					continue
 				}
 				cells := pr[spans[k].off : spans[k].off+spans[k].n]
 				key, indexable, b := si.keyFromCellsInto(cells, encBuf)
 				encBuf = b
-				si.apply(pk, key, indexable)
+				if si.apply(pk, key, indexable) && si.ordered {
+					changedPerIdx[k] = append(changedPerIdx[k], pk)
+				}
 			}
 		}
-		dirtyPKs = append(dirtyPKs, batch...)
 		drops = append(drops, pending{s, nr, nd})
 	}
 	if len(drops) == 0 {
@@ -653,9 +674,9 @@ func (t *table) mergeIndexes() {
 	// Fold ordered indexes' changed PKs into the sorted view BEFORE dropping
 	// dirty, so a reader sees a row via the dirty overlay until it lands in the
 	// sorted view (no gap). Incremental: O(n + d log d), not a full re-sort.
-	for _, si := range t.indexes {
-		if si.ordered {
-			si.mergeSorted(dirtyPKs)
+	for k, si := range t.indexes {
+		if si.ordered && len(changedPerIdx[k]) > 0 {
+			si.mergeSorted(changedPerIdx[k])
 		}
 	}
 	for _, d := range drops {

@@ -406,3 +406,29 @@ func BenchmarkIndexIntersect_50k(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkMergeUnchangedOrderedIndex measures a merge tick when the ordered
+// index did NOT change: writes hit a hash-indexed column (marking the rows dirty)
+// while the ORDERED INDEX (seq) is untouched. The old code folded the whole
+// sorted view (O(n) alloc+copy) every tick regardless; now an unchanged ordered
+// index skips its fold entirely.
+func BenchmarkMergeUnchangedOrderedIndex(b *testing.B) {
+	const n = 100000
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec("CREATE TABLE t (id uuid primary key, status int, seq int, INDEX (status), ORDERED INDEX (seq))")
+	for i := 0; i < n; i++ {
+		db.Exec("INSERT INTO t (id, status, seq) VALUES (?, ?, ?)", tid(i), 0, i)
+	}
+	rt := db.cat.Load().byName["t"]
+	rt.mergeIndexes() // drain the insert overlay; the seq sorted view is now built
+	b.ResetTimer()
+	b.ReportAllocs()
+	for k := 0; k < b.N; k++ {
+		db.Exec("UPDATE t SET status = ? WHERE id = ?", k%3, tid(k%n)) // touches status index only
+		rt.mergeIndexes()
+	}
+}

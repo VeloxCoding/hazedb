@@ -1019,3 +1019,47 @@ func benchSortedFold(b *testing.B, n int, incremental bool) {
 
 func BenchmarkSortedFold_Incremental_100k(b *testing.B) { benchSortedFold(b, 100_000, true) }
 func BenchmarkSortedFold_FullRebuild_100k(b *testing.B) { benchSortedFold(b, 100_000, false) }
+
+// A merge that does NOT touch an ordered index must skip its sorted-view fold
+// WITHOUT corrupting it, and a merge that DOES touch it must still reflect the
+// new key. Guards the per-index change-tracking that gates mergeSorted.
+func TestMergeSkipPreservesOrderedView(t *testing.T) {
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec("CREATE TABLE t (id uuid primary key, status int, seq int, INDEX (status), ORDERED INDEX (seq))")
+	for i := 0; i < 20; i++ {
+		if _, err := db.Exec("INSERT INTO t (id, status, seq) VALUES (?, ?, ?)", tid(i), 0, 20-i); err != nil {
+			t.Fatal(err) // tid(i) carries seq = 20-i, so seqs are 1..20
+		}
+	}
+	rt := db.cat.Load().byName["t"]
+	rt.mergeIndexes()
+
+	wantFirst5 := func(want ...int64) {
+		t.Helper()
+		_, rows, err := db.Query("SELECT seq FROM t ORDER BY seq LIMIT 5")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, w := range want {
+			if got := rows[i][0].Int(); got != w {
+				t.Fatalf("ORDER BY seq[%d]=%d, want %d (rows=%v)", i, got, w, rows)
+			}
+		}
+	}
+	wantFirst5(1, 2, 3, 4, 5)
+
+	// Touch only the hash-indexed column → the ordered (seq) index is unchanged,
+	// so its fold is skipped. The sorted view must remain intact.
+	db.Exec("UPDATE t SET status = 9 WHERE id = ?", tid(0))
+	rt.mergeIndexes()
+	wantFirst5(1, 2, 3, 4, 5)
+
+	// Touch the ordered column → the fold must run and reflect the new key.
+	db.Exec("UPDATE t SET seq = 0 WHERE id = ?", tid(5)) // tid(5) was seq 15 → now 0, sorts first
+	rt.mergeIndexes()
+	wantFirst5(0, 1, 2, 3, 4)
+}
