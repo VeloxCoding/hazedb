@@ -279,6 +279,30 @@ func TestByteTallyReconcilesAfterReopen(t *testing.T) {
 	}
 }
 
+// A transaction's apply path (txInsertLocked / txReplaceLocked / txDeleteLocked)
+// must keep the per-shard byte tally exact too — it bypassed the tally before.
+// Insert + grow-update + delete inside one tx, then reconcile against a walk.
+func TestByteTallyReconcilesTransaction(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE t (id uuid primary key, body text)")
+	for i := 0; i < 10; i++ {
+		db.Exec("INSERT INTO t (id, body) VALUES (?, ?)", tid(i), strings.Repeat("x", 10))
+	}
+	err := db.Transaction(func(tx *Tx) error {
+		tx.Exec("INSERT INTO t (id, body) VALUES (?, ?)", tid(100), strings.Repeat("y", 50))
+		tx.Exec("UPDATE t SET body = ? WHERE id = ?", strings.Repeat("z", 200), tid(0)) // grow
+		tx.Exec("DELETE FROM t WHERE id = ?", tid(1))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconcileBytes(t, db) // tally == full walk → txn apply maintained s.bytes
+	if got := db.MetaSnapshot().TotalRows; got != 10 {
+		t.Fatalf("rows=%d, want 10 (10 - 1 delete + 1 insert)", got)
+	}
+}
+
 // BenchmarkMetaSnapshot sizes the snapshot read cost. It reads the per-shard
 // running counters, so it is O(shards), independent of row count — /meta stays
 // cheap no matter how large the store grows.

@@ -145,10 +145,16 @@ func (tx *Tx) resolvePK(pl *plan, args []Value) (UUID, error) {
 }
 
 // txAct is a resolved, ready-to-apply effect produced by the commit walk.
+// cost is the signed byte-tally change this effect makes (insert +rowCost,
+// delete -rowCost, update the new−old delta) — computed once during the walk,
+// summed for the budget reserve, and reused in apply so the tally and the cap
+// counter both move with the transaction (the single-row paths do this; the txn
+// path used to bypass both).
 type txAct struct {
 	kind uint8
 	pk   UUID
-	row  Row // opInsert: full row; opUpdate: full post-update row
+	row  Row   // opInsert: full row; opUpdate: full post-update row
+	cost int64 // signed byte delta (see txAct doc)
 }
 
 // commit applies every staged mutation atomically. It holds the table's
@@ -210,6 +216,8 @@ func (tx *Tx) commit() error {
 	resolved := make([][]byte, 0, len(tx.staged))
 	acts := make([]txAct, 0, len(tx.staged))
 	pkOrd := t.def.pkOrdinal
+	nIdx := len(t.indexes)
+	var byteDelta int64 // net change to the store's byte total this commit
 
 	for _, m := range tx.staged {
 		switch m.kind {
@@ -218,8 +226,10 @@ func (tx *Tx) commit() error {
 				return fmt.Errorf("%w: %v", ErrDuplicatePK, m.pk)
 			}
 			overlay[m.pk] = m.row
+			cost := rowCost(m.row, nIdx)
+			byteDelta += cost
 			resolved = append(resolved, encodeInsertMutation(nil, tx.rt.tableID, m.row))
-			acts = append(acts, txAct{kind: opInsert, pk: m.pk, row: m.row})
+			acts = append(acts, txAct{kind: opInsert, pk: m.pk, row: m.row, cost: cost})
 		case opUpdate:
 			cur, ok := present(m.pk)
 			if !ok {
@@ -234,19 +244,38 @@ func (tx *Tx) commit() error {
 				nr[ord] = vals[i]
 			}
 			overlay[m.pk] = nr
+			cost := rowCost(nr, nIdx) - rowCost(cur, nIdx)
+			byteDelta += cost
 			resolved = append(resolved, encodeUpdateMutation(nil, tx.rt.tableID, nr[pkOrd], m.pl.updateOrdinals, nr))
-			acts = append(acts, txAct{kind: opUpdate, pk: m.pk, row: nr})
+			acts = append(acts, txAct{kind: opUpdate, pk: m.pk, row: nr, cost: cost})
 		case opDelete:
-			if _, ok := present(m.pk); !ok {
+			cur, ok := present(m.pk)
+			if !ok {
 				continue // DELETE of an absent row: 0 rows, not an error
 			}
 			overlay[m.pk] = nil
+			cost := -rowCost(cur, nIdx)
+			byteDelta += cost
 			resolved = append(resolved, encodeDeleteMutation(nil, tx.rt.tableID, UUIDVal(m.pk)))
-			acts = append(acts, txAct{kind: opDelete, pk: m.pk})
+			acts = append(acts, txAct{kind: opDelete, pk: m.pk, cost: cost})
 		}
 	}
 	if len(resolved) == 0 {
 		return nil // every statement no-op'd
+	}
+
+	// Admission control, BEFORE the WAL write so an over-cap batch is rejected
+	// with nothing applied — the txn path's counterpart to insertJournaled's
+	// reserve. A net-positive batch reserves against MaxBytes (rejects on
+	// overflow); a net-negative one (mostly deletes) just releases. budget.total
+	// moves by byteDelta either way, and the apply below moves each shard's tally
+	// by the same per-act costs, so the two stay equal.
+	if byteDelta > 0 {
+		if !t.budget.reserve(byteDelta) {
+			return ErrCapacity
+		}
+	} else if byteDelta < 0 {
+		t.budget.release(-byteDelta)
 	}
 
 	if tx.db.wal != nil {
@@ -264,11 +293,11 @@ func (tx *Tx) commit() error {
 	for _, a := range acts {
 		switch a.kind {
 		case opInsert:
-			t.txInsertLocked(a.row)
+			t.txInsertLocked(a.row, a.cost)
 		case opUpdate:
-			t.txReplaceLocked(a.pk, a.row)
+			t.txReplaceLocked(a.pk, a.row, a.cost)
 		case opDelete:
-			t.txDeleteLocked(a.pk)
+			t.txDeleteLocked(a.pk, a.cost)
 		}
 	}
 	return nil
@@ -385,7 +414,7 @@ func (t *table) txGetLocked(pk UUID) (Row, bool) {
 
 // txInsertLocked appends a row and indexes it (per-table directory + tails for
 // partitioned, per-shard pk map otherwise).
-func (t *table) txInsertLocked(row Row) {
+func (t *table) txInsertLocked(row Row, cost int64) {
 	if t.pkDir != nil {
 		pk := row[t.def.pkOrdinal].UUID()
 		part := row[t.def.partitionOrdinal].UUID()
@@ -394,6 +423,7 @@ func (t *table) txInsertLocked(row Row) {
 		rowID := uint64(len(s.rows))
 		s.rows = append(s.rows, row)
 		s.live++
+		s.bytes += cost
 		s.tails[part] = append(s.tails[part], rowID)
 		t.pkDir.idx[pk] = rowLocation{shard: idx, rowID: rowID}
 		return
@@ -404,30 +434,35 @@ func (t *table) txInsertLocked(row Row) {
 	s.rows = append(s.rows, row)
 	s.pk.put(pk, rowID)
 	s.live++
+	s.bytes += cost
 	t.markDirtyLocked(s, pk)
 }
 
 // txReplaceLocked overwrites the row at pk with nr in place (PK + PartitionKey
 // are immutable, so the location never changes).
-func (t *table) txReplaceLocked(pk UUID, nr Row) {
+func (t *table) txReplaceLocked(pk UUID, nr Row, cost int64) {
 	if t.pkDir != nil {
 		loc := t.pkDir.idx[pk]
-		t.shards[loc.shard].rows[loc.rowID] = nr
+		s := &t.shards[loc.shard]
+		s.rows[loc.rowID] = nr
+		s.bytes += cost
 		return
 	}
 	s := t.shardOf(pk)
 	rowID, _ := s.pk.get(pk) // present by commit's overlay-walk contract
 	s.rows[rowID] = nr
+	s.bytes += cost
 	t.markDirtyLocked(s, pk)
 }
 
 // txDeleteLocked tombstones the row at pk and removes its index entry.
-func (t *table) txDeleteLocked(pk UUID) {
+func (t *table) txDeleteLocked(pk UUID, cost int64) {
 	if t.pkDir != nil {
 		loc := t.pkDir.idx[pk]
 		s := &t.shards[loc.shard]
 		s.rows[loc.rowID] = nil
 		s.live--
+		s.bytes += cost // cost is negative for a delete
 		delete(t.pkDir.idx, pk)
 		return
 	}
@@ -435,5 +470,6 @@ func (t *table) txDeleteLocked(pk UUID) {
 	rowID, _ := s.pk.del(pk) // present by commit's overlay-walk contract
 	s.rows[rowID] = nil
 	s.live--
+	s.bytes += cost // cost is negative for a delete
 	t.markDelDirtyLocked(s, pk)
 }

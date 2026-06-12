@@ -169,6 +169,56 @@ func TestMaxBytesConcurrent(t *testing.T) {
 	}
 }
 
+// multiInsertAutoPK builds an n-tuple auto-PK INSERT (id generated) and its args.
+func multiInsertAutoPK(n int) (string, []any) {
+	var b strings.Builder
+	b.WriteString("INSERT INTO t (n) VALUES ")
+	args := make([]any, 0, n)
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString("(?)")
+		args = append(args, i)
+	}
+	return b.String(), args
+}
+
+// The byte cap and the tally must cover the multi-row INSERT / transaction path
+// (txInsertLocked etc.), not just single-row inserts — that path bypassed both
+// before. A batch that fits is admitted and accounted; a batch that would exceed
+// the cap is rejected with ErrCapacity, applying nothing.
+func TestMaxBytesCoversBatchInsert(t *testing.T) {
+	const fit = 5
+	db, err := Open(Options{MaxBytes: perIntRow() * fit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec("CREATE TABLE t (id uuid primary key, n int)")
+
+	sql, args := multiInsertAutoPK(fit)
+	if _, err := db.Exec(sql, args...); err != nil {
+		t.Fatalf("batch of %d should fit: %v", fit, err)
+	}
+	// Tally + budget must reflect the batch (this path used to update neither).
+	if got := db.MetaSnapshot().TotalApproxBytes; got != perIntRow()*fit {
+		t.Fatalf("after batch: total_approx_bytes=%d, want %d", got, perIntRow()*fit)
+	}
+	if total, walk := db.budget.total.Load(), budgetTotal(db); total != walk {
+		t.Fatalf("budget total %d != tally %d after batch", total, walk)
+	}
+
+	// A second batch would push past the cap → rejected, nothing applied.
+	sql2, args2 := multiInsertAutoPK(2)
+	if _, err := db.Exec(sql2, args2...); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("over-cap batch: got %v, want ErrCapacity", err)
+	}
+	if got := db.MetaSnapshot().TotalRows; got != fit {
+		t.Fatalf("after rejected batch: rows=%d, want %d", got, fit)
+	}
+}
+
 // BenchmarkInsert_Parallel_Capped mirrors BenchmarkInsert_Parallel_Mem but with
 // the cap enabled (MaxBytes far above what the run inserts, so nothing is
 // rejected) — it measures the cost of the reserve CAS on the shared budget under
