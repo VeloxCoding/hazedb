@@ -308,11 +308,17 @@ func scanRecords(f *os.File, apply func(recType uint8, payload []byte) error) er
 		return err
 	}
 	fileSize := fi.Size()
+	// Buffer the sequential reads: each record otherwise costs two read(2) syscalls
+	// (header + payload), so a 1M-record log is ~2M syscalls at boot. bufio batches
+	// the underlying reads. Seek/Stat above stay on f; the buffer may read ahead
+	// past the last complete record, but every replay caller repositions f
+	// afterwards (seekToEnd / a fresh active segment), so the over-read is harmless.
+	r := bufio.NewReader(f)
 	var pos int64
 	var hdr [8]byte
 	var buf []byte // grown once, reused per record — decoders copy what they keep
 	for {
-		_, err := io.ReadFull(f, hdr[:])
+		_, err := io.ReadFull(r, hdr[:])
 		if err == io.EOF {
 			return nil
 		}
@@ -346,7 +352,7 @@ func scanRecords(f *os.File, apply func(recType uint8, payload []byte) error) er
 		} else {
 			buf = buf[:need]
 		}
-		if _, err := io.ReadFull(f, buf); err != nil {
+		if _, err := io.ReadFull(r, buf); err != nil {
 			if err == io.ErrUnexpectedEOF {
 				return nil // truncated payload at tail — tolerated
 			}
