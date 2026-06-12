@@ -178,6 +178,72 @@ func (s *tableShard) tailsTombstone(part UUID) {
 	s.tailsDead[part] = 0
 }
 
+// compactShardLocked reclaims dead arena slots: it rebuilds s.rows with only the
+// live rows, renumbering rowIDs to fill the gaps, and rewrites every rowID
+// reference — the pkMap for a non-partitioned table, or the pkDirectory entries
+// for this shard plus the per-partition tails lists for a partitioned one. Live
+// rows keep their relative (insert) order, so scanPartition order is preserved.
+//
+// Secondary indexes and the ordered sorted view are PK-keyed (not rowID), so they
+// need no update; rowIDs are not persisted, so the WAL/replay are unaffected. The
+// byte tally and live count are unchanged (only dead slots go away).
+//
+// Caller holds s.mu (write) and, for a partitioned table, t.pkDir.mu (write) — the
+// global lock order. Readers are excluded for the duration (they take those
+// locks); a partitioned reader that cached a now-stale rowLocation re-resolves via
+// the directory on the PK-mismatch retry, so the renumber is transparent to it.
+func (t *table) compactShardLocked(s *tableShard, shardIdx uint32) {
+	newRows := make([]Row, 0, s.live)
+	if t.pkDir != nil {
+		partOrd, pkOrd := t.def.partitionOrdinal, t.def.pkOrdinal
+		s.tails = make(map[UUID][]uint64, len(s.tails))
+		s.tailsDead = make(map[UUID]int)
+		for _, r := range s.rows {
+			if r == nil {
+				continue
+			}
+			id := uint64(len(newRows))
+			newRows = append(newRows, r)
+			part := r[partOrd].UUID()
+			s.tails[part] = append(s.tails[part], id)
+			t.pkDir.idx[r[pkOrd].UUID()] = rowLocation{shard: shardIdx, rowID: id}
+		}
+		s.rows = newRows
+		return
+	}
+	pkOrd := t.def.pkOrdinal
+	s.pk = pkMap{}
+	s.pk.init(s.live)
+	for _, r := range s.rows {
+		if r == nil {
+			continue
+		}
+		id := uint64(len(newRows))
+		newRows = append(newRows, r)
+		s.pk.put(r[pkOrd].UUID(), id)
+	}
+	s.rows = newRows
+}
+
+// compactShard acquires the write lock(s) for shard shardIdx in the global order
+// and compacts it (see compactShardLocked). Used by the dead-fraction trigger and
+// tests; the inline trigger on the delete path calls compactShardLocked directly
+// since it already holds the locks.
+func (t *table) compactShard(shardIdx int) {
+	s := &t.shards[shardIdx]
+	if t.pkDir != nil {
+		t.pkDir.mu.Lock()
+		s.mu.Lock()
+		t.compactShardLocked(s, uint32(shardIdx))
+		s.mu.Unlock()
+		t.pkDir.mu.Unlock()
+		return
+	}
+	s.mu.Lock()
+	t.compactShardLocked(s, uint32(shardIdx))
+	s.mu.Unlock()
+}
+
 // ordIsIndexed reports whether column ordinal ord is part of any secondary index
 // (any component of a composite index counts).
 func (t *table) ordIsIndexed(ord int) bool {
