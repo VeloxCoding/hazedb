@@ -38,8 +38,8 @@ github.com/Masterminds/sprig/v3 v3.3.0 h1:mQh0Yrg1XPo6vjYXgtf5OtijNAKJRNcTdOOGZe
 github.com/Masterminds/sprig/v3 v3.3.0/go.mod h1:Zy1iXRYNqNLUolqCpL4uhk6SHUMAOSCzdgBfDb35Lz0=
 github.com/OneOfOne/xxhash v1.2.2 h1:KMrpdQIwFcEqXDklaen+P1axHaj9BSKzvpUUfnHldSE=
 github.com/OneOfOne/xxhash v1.2.2/go.mod h1:HSdplMjZKSmBqAxg5vPj2TmRDmfkzw+cTzAElWljhcU=
-github.com/VeloxCoding/hazedb v0.1.55 h1:ZZ8igJgi6XRCOceFWbRDdTPNUNHpIJqYrmhJYtw6834=
-github.com/VeloxCoding/hazedb v0.1.55/go.mod h1:IGh1KMZKGbFrI0W5uHscqR+mqkc+rmDjvveFUaGZyRE=
+github.com/VeloxCoding/hazedb v0.1.56 h1:cc/gkjGb9MW7UXg33UqsMMAhPchugMM0gfCuaJtyL5U=
+github.com/VeloxCoding/hazedb v0.1.56/go.mod h1:IGh1KMZKGbFrI0W5uHscqR+mqkc+rmDjvveFUaGZyRE=
 github.com/antlr4-go/antlr/v4 v4.13.1 h1:SqQKkuVZ+zWkMMNkjy5FZe5mr5WURWnlpmOuzYWrPrQ=
 github.com/antlr4-go/antlr/v4 v4.13.1/go.mod h1:GKmUxMtwp6ZgGwZSva4eWPC5mS6vUAmOABFgjdkM7Nw=
 github.com/armon/consul-api v0.0.0-20180202201655-eb2c6b5be1b6/go.mod h1:grANhF5doyWs3UAsr3K4I6qtAmlQcZDesFNEHPZAzj8=
