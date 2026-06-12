@@ -38,14 +38,13 @@ type StoreMeta struct {
 // payloads plus modeled overhead (see StoreMeta); a display layer formats it to
 // MiB.
 //
-// Tombstones is the count of dead arena slots — rows deleted but whose arena
-// slot is not yet reclaimed (the store never compacts a running arena; only a
-// restart-from-checkpoint does). It is a MEMORY signal: a high
-// Tombstones/(Rows+Tombstones) fraction on an insert+delete workload means the
-// arena carries dead weight until the next restart. (Partitioned SCAN cost is no
-// longer tied to it — the delete path prunes a partition's scan list of dead
-// rowIDs, so scanPartition stays O(live). Reclaiming the arena slots themselves
-// is a separate, open step.)
+// Tombstones is the count of dead arena slots — rows deleted but whose arena slot
+// is not yet reclaimed. It is a gauge, not a leak: the background compaction
+// sweeper (compact.go) reclaims dense shards, so it rises with deletes and falls
+// as the sweeper runs. (Partitioned scan cost is independent — the delete path
+// prunes a partition's scan list, so scanPartition stays O(live) regardless.) A
+// momentarily high Tombstones/(Rows+Tombstones) fraction is normal between
+// sweeps; a persistently high one means deletes outrun the sweeper's interval.
 type TableStat struct {
 	Name        string `json:"name"`
 	Rows        int    `json:"rows"`

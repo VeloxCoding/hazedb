@@ -12,8 +12,10 @@ func openEmpty(t *testing.T) *DB {
 	t.Helper()
 	// IndexMergeInterval -1 disables the background merger so index unit tests
 	// can assert pre-merge state deterministically (they call db.mergeIndexes()
-	// explicitly). The background loop is exercised by the S5 stress test.
-	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1}) // create tables at runtime
+	// explicitly). compactInterval -1 likewise disables the arena-compaction
+	// sweeper so tombstone-count assertions are deterministic. Both background
+	// loops are exercised by their own tests.
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, compactInterval: -1}) // create tables at runtime
 	if err != nil {
 		t.Fatal(err)
 	}

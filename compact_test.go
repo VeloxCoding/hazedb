@@ -4,7 +4,47 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
+
+// The background sweeper reclaims a shard that has gone mostly dead, on its own,
+// without any manual call — and leaves the live rows intact.
+func TestCompactSweeperReclaims(t *testing.T) {
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, compactInterval: 20 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec("CREATE TABLE q (id uuid primary key, thread uuid partition key, n int)")
+	thread := tid(1)
+	const n, keep = 2000, 50
+	for i := 0; i < n; i++ {
+		db.Exec("INSERT INTO q (id, thread, n) VALUES (?, ?, ?)", tid(100+i), thread, i)
+	}
+	for i := 0; i < n-keep; i++ { // delete all but the last `keep` → the shard goes mostly dead
+		db.Exec("DELETE FROM q WHERE id = ?", tid(100+i))
+	}
+
+	var tomb int
+	for i := 0; i < 200; i++ { // poll up to ~2s for the sweeper to act
+		tomb = db.MetaSnapshot().TableStats[0].Tombstones
+		if tomb == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if tomb != 0 {
+		t.Fatalf("sweeper did not reclaim tombstones: %d remain", tomb)
+	}
+	if r := db.MetaSnapshot().TotalRows; r != keep {
+		t.Fatalf("after sweep: rows=%d, want %d", r, keep)
+	}
+	// The survivors are intact and scan correctly.
+	_, rows, _ := db.Query("SELECT n FROM q WHERE thread = ?", thread)
+	if len(rows) != keep {
+		t.Fatalf("scan after sweep=%d, want %d", len(rows), keep)
+	}
+}
 
 // Compacting a non-partitioned shard reclaims every dead slot, and afterwards
 // every live PK still resolves to its row, deleted PKs stay gone, full + indexed

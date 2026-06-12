@@ -74,6 +74,11 @@ type Options struct {
 	// indexMergeInterval is how often secondary indexes reconcile dirty rows.
 	// Zero = 50ms; negative disables it (manual merge, for pre-merge assertions).
 	indexMergeInterval time.Duration
+	// compactInterval is how often the background arena-compaction sweeper runs.
+	// Zero = 1s; negative disables it (manual compactShard only, for tests). The
+	// sweeper reclaims dead arena slots from shards that have gone more-than-half
+	// dead, off the write path — see compact.go.
+	compactInterval time.Duration
 	// indexMergeThreshold is the size-trigger: the merger fires early (before
 	// indexMergeInterval elapses) when the dirty overlay grows dense, bounding
 	// overlay growth under a write burst. Zero (the default) is ADAPTIVE — a
@@ -123,6 +128,9 @@ func (o *Options) applyDefaults() {
 	}
 	if o.indexMergeInterval == 0 {
 		o.indexMergeInterval = defaultIndexMergeInterval
+	}
+	if o.compactInterval == 0 {
+		o.compactInterval = defaultCompactInterval
 	}
 	if !o.walEnabled() {
 		return

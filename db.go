@@ -68,6 +68,11 @@ type DB struct {
 	mergeStop chan struct{}
 	mergeDone chan struct{}
 
+	// compactStop/compactDone drive the background arena-compaction sweeper (nil
+	// when disabled). See compact.go.
+	compactStop chan struct{}
+	compactDone chan struct{}
+
 	// sq is the on-disk SQLite mirror (nil when SQLitePath is unset). The drain
 	// loop feeds sealed WAL segments into it; drainStop/drainDone drive that
 	// goroutine, mirroring the merger. See docs/durability.md.
@@ -184,6 +189,9 @@ func Open(opts Options) (*DB, error) {
 	if opts.indexMergeInterval > 0 {
 		db.startMergeLoop(opts.indexMergeInterval, opts.indexMergeThreshold)
 	}
+	if opts.compactInterval > 0 {
+		db.startCompactLoop(opts.compactInterval)
+	}
 	return db, nil
 }
 
@@ -194,6 +202,7 @@ func Open(opts Options) (*DB, error) {
 func (db *DB) Close() error {
 	db.stopDrainLoop()
 	db.stopMergeLoop()
+	db.stopCompactLoop()
 	var err error
 	if db.wal != nil {
 		err = db.wal.close()
