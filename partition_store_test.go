@@ -244,3 +244,79 @@ func BenchmarkPartitionScan(b *testing.B) {
 		db.Query("SELECT id FROM messages WHERE thread = ? ORDER BY seq DESC LIMIT 10", threads[i%100])
 	}
 }
+
+// A partitioned insert+delete queue must keep scanPartition O(live): the tails
+// list is pruned of dead rowIDs as deletes accumulate, so it stays bounded near
+// the live count instead of growing with every row ever inserted. The scan must
+// still return exactly the live rows.
+func TestPartitionTailsPruned(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE q (id uuid primary key, thread uuid partition key, body text)")
+	thread := tid(1)
+	const (
+		total = 5000
+		depth = 50
+	)
+	live := make([]UUID, 0, depth+1)
+	for i := 0; i < total; i++ {
+		id := tid(1000 + i)
+		if _, err := db.Exec("INSERT INTO q (id, thread, body) VALUES (?, ?, ?)", id, thread, "x"); err != nil {
+			t.Fatal(err)
+		}
+		live = append(live, id)
+		if len(live) > depth {
+			db.Exec("DELETE FROM q WHERE id = ?", live[0])
+			live = live[1:]
+		}
+	}
+
+	// Functional: the partition scan returns exactly the live rows.
+	_, rows, err := db.Query("SELECT id FROM q WHERE thread = ?", thread)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != len(live) {
+		t.Fatalf("scan returned %d rows, want %d live", len(rows), len(live))
+	}
+
+	// Pruned: the tails list is bounded near the live count, not ~total.
+	rt := db.cat.Load().byName["q"]
+	s := rt.shardOf(thread)
+	s.mu.RLock()
+	tailLen := len(s.tails[thread])
+	s.mu.RUnlock()
+	if tailLen > 4*len(live) {
+		t.Fatalf("tails not pruned: len=%d, live=%d (want bounded near live, not ~%d)", tailLen, len(live), total)
+	}
+}
+
+// BenchmarkPartitionScanAfterChurn measures a partition scan after a long
+// insert+delete queue churn: with the tails prune the scan is O(live); without
+// it the list still holds every ever-inserted rowID and the scan walks them all.
+func BenchmarkPartitionScanAfterChurn(b *testing.B) {
+	db, err := Open(Options{Schema: Schema{}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec("CREATE TABLE q (id uuid primary key, thread uuid partition key, body text)")
+	thread := tid(1)
+	const total, depth = 50000, 50
+	live := make([]UUID, 0, depth+1)
+	for i := 0; i < total; i++ {
+		id := tid(1000 + i)
+		db.Exec("INSERT INTO q (id, thread, body) VALUES (?, ?, ?)", id, thread, "x")
+		live = append(live, id)
+		if len(live) > depth {
+			db.Exec("DELETE FROM q WHERE id = ?", live[0])
+			live = live[1:]
+		}
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, _, err := db.Query("SELECT id FROM q WHERE thread = ?", thread); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

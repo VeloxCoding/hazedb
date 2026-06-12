@@ -353,7 +353,9 @@ func (t *table) deleteByPKJournaledPartitioned(pk UUID, j mutJournal) (bool, err
 		return false, err
 	}
 	if loc.rowID < uint64(len(s.rows)) {
+		part := s.rows[loc.rowID][t.def.partitionOrdinal].UUID()
 		s.tombstoneLocked(loc.rowID, len(t.indexes), t.budget)
+		s.tailsTombstone(part)
 	}
 	delete(t.pkDir.idx, pk)
 	return true, nil
@@ -376,10 +378,12 @@ func (t *table) deleteWhereAllPartitioned(match func(Row) bool, encode func(pk V
 	defer t.pkDir.mu.Unlock()
 	t.lockAllShards()
 	defer t.unlockAllShards()
+	partOrd := t.def.partitionOrdinal
 	type pendingDelete struct {
-		s  *tableShard
-		j  int
-		pk UUID
+		s    *tableShard
+		j    int
+		pk   UUID
+		part UUID
 	}
 	var pending []pendingDelete
 	var bodies [][]byte
@@ -389,7 +393,7 @@ func (t *table) deleteWhereAllPartitioned(match func(Row) bool, encode func(pk V
 			if r == nil || !match(r) {
 				continue
 			}
-			pending = append(pending, pendingDelete{s, j, r[pkOrd].UUID()})
+			pending = append(pending, pendingDelete{s, j, r[pkOrd].UUID(), r[partOrd].UUID()})
 			if encode != nil {
 				bodies = append(bodies, encode(r[pkOrd]))
 			}
@@ -402,6 +406,7 @@ func (t *table) deleteWhereAllPartitioned(match func(Row) bool, encode func(pk V
 	}
 	for _, p := range pending {
 		p.s.tombstoneLocked(uint64(p.j), len(t.indexes), t.budget)
+		p.s.tailsTombstone(p.part)
 		delete(t.pkDir.idx, p.pk)
 	}
 	return len(pending), nil

@@ -73,8 +73,12 @@ type tableShard struct {
 	// instead of every row, so it is O(partition size), not O(table). Deleted
 	// rowIDs stay in the list (rows[rowID] is nil) and the scan skips them.
 	tails map[UUID][]uint64
-	live  int   // count of non-tombstoned rows
-	bytes int64 // running in-RAM byte tally of the live rows (see rowCost); the
+	// tailsDead counts tombstoned rowIDs still lingering in tails[part] (partitioned
+	// tables only). When it reaches half a partition's list, the delete path prunes
+	// the dead entries so scanPartition stays O(live), not O(ever-inserted).
+	tailsDead map[UUID]int
+	live      int   // count of non-tombstoned rows
+	bytes     int64 // running in-RAM byte tally of the live rows (see rowCost); the
 	// O(1) source MetaSnapshot reads and a future byte cap checks, maintained
 	// under s.mu by every row mutation so it never walks the arena.
 	// dirtyRead / dirtyDel list PKs mutated on this shard since the last merge
@@ -141,6 +145,39 @@ func (s *tableShard) tombstoneLocked(rowID uint64, nIdx int, b *byteBudget) {
 	b.release(cost)
 }
 
+// minTailPrune is the smallest tails list worth pruning — below it the dead
+// entries cost less than the rebuild.
+const minTailPrune = 16
+
+// tailsTombstone records that one row of partition `part` was just tombstoned and
+// prunes the partition's tails list once dead rowIDs reach half of it. Pruning
+// drops only the dead entries (arena slots and rowIDs are untouched, so pkDir
+// locations stay valid) and resets the dead count, so the next prune fires only
+// after ~half the survivors die again — amortized O(1) per delete, keeping
+// scanPartition O(live) instead of O(ever-inserted). Caller holds s.mu. No-op for
+// non-partitioned shards (tailsDead is nil; this is only called on the
+// partitioned delete paths).
+func (s *tableShard) tailsTombstone(part UUID) {
+	s.tailsDead[part]++
+	ids := s.tails[part]
+	if s.tailsDead[part]*2 < len(ids) || len(ids) < minTailPrune {
+		return
+	}
+	live := ids[:0] // filter in place: kept rowIDs only ever move toward the front
+	for _, rid := range ids {
+		if rid < uint64(len(s.rows)) && s.rows[rid] != nil {
+			live = append(live, rid)
+		}
+	}
+	if len(live) == 0 {
+		delete(s.tails, part)
+		delete(s.tailsDead, part)
+		return
+	}
+	s.tails[part] = live
+	s.tailsDead[part] = 0
+}
+
 // ordIsIndexed reports whether column ordinal ord is part of any secondary index
 // (any component of a composite index counts).
 func (t *table) ordIsIndexed(ord int) bool {
@@ -184,6 +221,7 @@ func newTable(def *resolvedTable, sizeHint int, budget *byteBudget) *table {
 		t.shards[i].rows = make([]Row, 0, per)
 		if def.partitioned() {
 			t.shards[i].tails = make(map[UUID][]uint64)
+			t.shards[i].tailsDead = make(map[UUID]int)
 		} else {
 			t.shards[i].pk.init(per)
 		}

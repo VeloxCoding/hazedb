@@ -22,11 +22,13 @@ counts, an approximate in-RAM byte size, and `tombstones` — for dashboards and
 health checks. The byte sizes are estimates (cell payloads plus modeled
 overhead, biased slightly high), not exact accounting.
 
-**Tombstones** are rows deleted but not yet reclaimed: the store does not compact
-a running arena (only a restart does), and on a partitioned table they also
-linger in the per-partition scan index. A high `tombstones / (rows + tombstones)`
-fraction on a heavy insert+delete workload means scans and memory carry dead
-weight until the next restart — watch it via `/meta`.
+**Tombstones** are rows deleted but whose arena slot is not yet reclaimed: the
+store does not compact a running arena (only a restart does). It is a **memory**
+signal — a high `tombstones / (rows + tombstones)` fraction on a heavy
+insert+delete workload means the arena carries dead weight until the next
+restart. Partitioned **scan** cost is no longer affected: the delete path prunes
+each partition's scan list of dead entries, so scans stay proportional to live
+rows. Watch the fraction via `/meta`.
 
 **Byte cap.** Set `max_bytes` (below) to bound the store's RAM. An `INSERT` that
 would push `total_approx_bytes` past the cap is rejected with **HTTP 507**

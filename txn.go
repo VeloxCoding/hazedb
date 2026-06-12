@@ -496,9 +496,11 @@ func (t *table) txDeleteLocked(pk UUID, cost int64) {
 	if t.pkDir != nil {
 		loc := t.pkDir.idx[pk]
 		s := &t.shards[loc.shard]
+		part := s.rows[loc.rowID][t.def.partitionOrdinal].UUID()
 		s.rows[loc.rowID] = nil
 		s.live--
 		s.bytes += cost // cost is negative for a delete
+		s.tailsTombstone(part)
 		delete(t.pkDir.idx, pk)
 		return
 	}
