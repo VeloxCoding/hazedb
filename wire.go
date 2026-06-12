@@ -213,7 +213,12 @@ func appendValueJSON(b []byte, v Value) []byte {
 	case KindString:
 		return appendJSONString(b, v.Str())
 	case KindBytes:
-		return appendJSONString(b, base64.StdEncoding.EncodeToString(v.Bytes()))
+		// base64 output is all [A-Za-z0-9+/=] — no JSON escaping needed — so append
+		// it straight into b between quotes, skipping both the intermediate string
+		// and appendJSONString's escape scan.
+		b = append(b, '"')
+		b = base64.StdEncoding.AppendEncode(b, v.Bytes())
+		return append(b, '"')
 	case KindUUID:
 		return appendUUIDJSON(b, v.UUID())
 	}

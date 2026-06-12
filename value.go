@@ -3,6 +3,7 @@
 package hazedb
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -190,6 +191,11 @@ func (v Value) Compare(o Value) (int, bool) {
 			return 1, true
 		}
 		return 0, true
+	}
+	if v.Kind == KindBytes && o.Kind == KindBytes {
+		// bytes.Compare is byte-lexicographic — same order as the string fallthrough
+		// would give, without allocating a string per side.
+		return bytes.Compare(v.Bytes(), o.Bytes()), true
 	}
 	// Fall through to string compare. Lexicographic is correct for strings;
 	// for mixed int/string callers should not rely on the result.

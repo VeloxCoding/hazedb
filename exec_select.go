@@ -672,12 +672,15 @@ func (db *DB) orderedWalk(pl *plan, args []Value, snap []ordEntry, dirtyKey func
 			}
 			return
 		}
-		if r, ok := tbl.getByPK(pk); ok && passResidual(r) { // residual needs the full row
-			if st.starAll {
-				out = append(out, r)
-			} else {
-				out = append(out, projectClone(r, pl.projOrdinals))
-			}
+		// Residual present: filter under the shard lock and clone only the
+		// projection in one pass (appendMatchProject), instead of cloning the whole
+		// row (getByPK) and then cloning the projection again.
+		n := len(pl.projOrdinals)
+		if st.starAll {
+			n = len(tbl.def.def.Columns)
+		}
+		if cells, ok := tbl.appendMatchProject(pk, passResidual, pl.projOrdinals, st.starAll, make([]Value, 0, n)); ok {
+			out = append(out, cells)
 		}
 	}
 	emitDirty := func(row Row) { // dc rows are owned clones, already matched
