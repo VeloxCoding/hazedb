@@ -27,9 +27,33 @@ func parseSQL(sql string) (stmt, error) {
 }
 
 type parser struct {
-	toks []token
-	pos  int
+	toks  []token
+	pos   int
+	depth int // current expression-nesting depth; guarded by enter/leave
 }
+
+// maxExprDepth bounds expression nesting (parentheses and NOT) so a crafted query
+// cannot drive the recursive-descent parser past the goroutine stack limit. A
+// stack overflow is a fatal runtime error — recover() cannot catch it — so an
+// unbounded parse is a one-request remote kill of the whole process (and the
+// in-memory DB). Real queries nest only a handful deep; AND/OR/arithmetic chains
+// iterate rather than recurse, so they cost no depth. 256 is far above any
+// genuine query and far below the overflow point. The cap lives in the parser
+// (not an adapter) so the cgo PHP path — which has no net against a fatal error
+// either — is protected too.
+const maxExprDepth = 256
+
+// enter deepens the nesting counter and rejects beyond maxExprDepth with a normal
+// parse error (→ 400 / PHP -1), never a crash. Pair every enter with a leave.
+func (p *parser) enter() error {
+	p.depth++
+	if p.depth > maxExprDepth {
+		return fmt.Errorf("%w: expression nesting too deep (limit %d)", ErrParse, maxExprDepth)
+	}
+	return nil
+}
+
+func (p *parser) leave() { p.depth-- }
 
 func (p *parser) peek() token { return p.toks[p.pos] }
 func (p *parser) advance() token {
@@ -564,7 +588,11 @@ func (p *parser) parseAnd() (expr, error) {
 func (p *parser) parseNot() (expr, error) {
 	if p.peek().kind == tkNot {
 		p.advance()
+		if err := p.enter(); err != nil { // chained NOT recurses here
+			return nil, err
+		}
 		inner, err := p.parseNot()
+		p.leave()
 		if err != nil {
 			return nil, err
 		}
@@ -638,7 +666,11 @@ func (p *parser) parseAtom() (expr, error) {
 	switch t.kind {
 	case tkLParen:
 		p.advance()
+		if err := p.enter(); err != nil { // nested parens recurse into parseExpr here
+			return nil, err
+		}
 		e, err := p.parseExpr()
+		p.leave()
 		if err != nil {
 			return nil, err
 		}
