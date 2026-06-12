@@ -2,7 +2,6 @@ package spike_test
 
 import (
 	"encoding/binary"
-	"fmt"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -10,8 +9,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"go.etcd.io/bbolt"
 
 	"github.com/VeloxCoding/hazedb/spike"
 )
@@ -87,89 +84,6 @@ func buildLinearMessages(n int) []spike.Message {
 		seqByThread[t]++
 	}
 	return out
-}
-
-// ====================================================================
-//  BoltDB tail-scan — honest pure-Go baseline
-//
-//  Bolt is a B+tree with cursors and reverse iteration. The fair
-//  comparison: "how fast can a typical Go embedded DB do this query?"
-// ====================================================================
-
-func setupBoltMessages(b *testing.B) (*bbolt.DB, [][16]byte) {
-	b.Helper()
-	path := filepath.Join(b.TempDir(), "bolt.db")
-	db, err := bbolt.Open(path, 0644, nil)
-	if err != nil {
-		b.Fatal(err)
-	}
-	_, tids := preGenMessages()
-	// Bolt strategy: one bucket per thread, keys = big-endian seq for
-	// natural sort order. This is how you'd index "messages by thread,
-	// ordered by seq" in BoltDB.
-	msgs, _ := preGenMessages()
-	db.Update(func(tx *bbolt.Tx) error {
-		for t := 0; t < tsThreads; t++ {
-			tid := tids[t]
-			bkt, _ := tx.CreateBucket(append([]byte("t:"), tid[:]...))
-			for s := 0; s < tsPerThread; s++ {
-				m := msgs[t*tsPerThread+s]
-				var seqKey [8]byte
-				binary.BigEndian.PutUint64(seqKey[:], uint64(m.Seq))
-				bkt.Put(seqKey[:], []byte(m.Body))
-			}
-		}
-		return nil
-	})
-	return db, tids
-}
-
-func Benchmark_Messages_LastN_Bolt(b *testing.B) {
-	db, tids := setupBoltMessages(b)
-	defer db.Close()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		tid := tids[i%len(tids)]
-		err := db.View(func(tx *bbolt.Tx) error {
-			bkt := tx.Bucket(append([]byte("t:"), tid[:]...))
-			c := bkt.Cursor()
-			count := 0
-			for k, _ := c.Last(); k != nil && count < 20; k, _ = c.Prev() {
-				count++
-			}
-			if count != 20 {
-				return fmt.Errorf("got %d", count)
-			}
-			return nil
-		})
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-func Benchmark_Messages_LastN_Bolt_Parallel(b *testing.B) {
-	db, tids := setupBoltMessages(b)
-	defer db.Close()
-	b.ReportAllocs()
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		i := 0
-		for pb.Next() {
-			tid := tids[i%len(tids)]
-			db.View(func(tx *bbolt.Tx) error {
-				bkt := tx.Bucket(append([]byte("t:"), tid[:]...))
-				c := bkt.Cursor()
-				count := 0
-				for k, _ := c.Last(); k != nil && count < 20; k, _ = c.Prev() {
-					count++
-				}
-				return nil
-			})
-			i++
-		}
-	})
 }
 
 // ====================================================================

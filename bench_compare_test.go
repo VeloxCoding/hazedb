@@ -2,31 +2,29 @@ package hazedb
 
 import (
 	"database/sql"
-	"encoding/binary"
 	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3" // cgo driver: "sqlite3"
-	bolt "go.etcd.io/bbolt"
-	_ "modernc.org/sqlite" // pure-Go driver: "sqlite"
+	_ "modernc.org/sqlite"          // pure-Go driver: "sqlite"
 )
 
-// These benchmarks compare FASTSQL's interpreter path to two pure
-// alternatives: SQLite (via database/sql + cgo) and BoltDB (pure-Go
-// B+tree). Same logical operation: INSERT one user, SELECT one user
-// by PK, UPDATE by PK, DELETE by PK. Same row shape (id, name, age).
+// These benchmarks compare FASTSQL's interpreter path to SQLite (via
+// database/sql, both the cgo and pure-Go drivers). Same logical operation:
+// INSERT one user, SELECT one user by PK, UPDATE by PK, DELETE by PK. Same row
+// shape (id, name, age).
 //
-// Goal: honest interpreter-path numbers vs the two stores anyone would
-// realistically reach for. The codegen target would shave parser+plan
-// dispatch cost; these benchmarks describe today's path, not tomorrow's.
+// Goal: honest interpreter-path numbers vs the store anyone would realistically
+// reach for. The codegen target would shave parser+plan dispatch cost; these
+// benchmarks describe today's path, not tomorrow's.
 //
-// All three stores use the same 16-byte UUID key (key16) so the comparison is
-// fair on key width. Remaining caveats to read these numbers honestly:
+// Both stores use the same 16-byte UUID key (key16) so the comparison is fair
+// on key width. Remaining caveats to read these numbers honestly:
 //   - Reads are the cleanest comparison. For WRITES, hazedb-Mem is in-memory
-//     only while Bolt fsyncs per transaction and SQLite syncs per its journal
-//     mode — different durability, so write rows are not like-for-like.
+//     only while SQLite syncs per its journal mode — different durability, so
+//     write rows are not like-for-like.
 //   - hazedb's interpreter path still carries per-row overhead that the
 //     planned codegen step removes; treat hazedb's numbers as a floor.
 
@@ -194,36 +192,6 @@ func BenchmarkUpdateByPK_SQLitePureMem(b *testing.B) {
 	}
 }
 
-func setupBolt(b *testing.B) (*bolt.DB, func()) {
-	b.Helper()
-	dir := b.TempDir()
-	path := filepath.Join(dir, "cmp.bolt")
-	d, err := bolt.Open(path, 0644, nil)
-	if err != nil {
-		b.Fatal(err)
-	}
-	if err := d.Update(func(tx *bolt.Tx) error {
-		_, e := tx.CreateBucketIfNotExists([]byte("users"))
-		return e
-	}); err != nil {
-		b.Fatal(err)
-	}
-	if err := d.Update(func(tx *bolt.Tx) error {
-		bkt := tx.Bucket([]byte("users"))
-		for i := 0; i < compareN; i++ {
-			val := append([]byte{}, "name|"...)
-			val = binary.LittleEndian.AppendUint64(val, uint64(i%100))
-			if err := bkt.Put(key16(i), val); err != nil {
-				return err
-			}
-		}
-		return nil
-	}); err != nil {
-		b.Fatal(err)
-	}
-	return d, func() { d.Close() }
-}
-
 // -------- INSERT --------
 
 func BenchmarkInsert_FASTSQL_Mem(b *testing.B) {
@@ -245,21 +213,6 @@ func BenchmarkInsert_SQLite(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		stmt.Exec(key16(compareN+i), "name", i%100)
-	}
-}
-
-func BenchmarkInsert_Bolt(b *testing.B) {
-	d, cleanup := setupBolt(b)
-	defer cleanup()
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		d.Update(func(tx *bolt.Tx) error {
-			bkt := tx.Bucket([]byte("users"))
-			val := append([]byte{}, "name|"...)
-			val = binary.LittleEndian.AppendUint64(val, uint64(i%100))
-			return bkt.Put(key16(compareN+i), val)
-		})
 	}
 }
 
@@ -288,21 +241,6 @@ func BenchmarkSelectByPK_SQLite(b *testing.B) {
 	}
 }
 
-func BenchmarkSelectByPK_Bolt(b *testing.B) {
-	d, cleanup := setupBolt(b)
-	defer cleanup()
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		d.View(func(tx *bolt.Tx) error {
-			bkt := tx.Bucket([]byte("users"))
-			v := bkt.Get(key16(i % compareN))
-			_ = v
-			return nil
-		})
-	}
-}
-
 // -------- UPDATE BY PK --------
 
 func BenchmarkUpdateByPK_FASTSQL_Mem(b *testing.B) {
@@ -323,22 +261,6 @@ func BenchmarkUpdateByPK_SQLite(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		stmt.Exec((i%100)+1, key16(i%compareN))
-	}
-}
-
-func BenchmarkUpdateByPK_Bolt(b *testing.B) {
-	d, cleanup := setupBolt(b)
-	defer cleanup()
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		d.Update(func(tx *bolt.Tx) error {
-			bkt := tx.Bucket([]byte("users"))
-			k := key16(i % compareN)
-			v := bkt.Get(k)
-			nv := append([]byte{}, v...) // mutate-safe copy
-			return bkt.Put(k, nv)
-		})
 	}
 }
 
@@ -376,27 +298,6 @@ func BenchmarkDeleteByPK_SQLite(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		del.Exec(key16(i))
-	}
-}
-
-func BenchmarkDeleteByPK_Bolt(b *testing.B) {
-	dir := b.TempDir()
-	d, _ := bolt.Open(filepath.Join(dir, "cmp.bolt"), 0644, nil)
-	defer d.Close()
-	d.Update(func(tx *bolt.Tx) error {
-		bkt, _ := tx.CreateBucketIfNotExists([]byte("users"))
-		for i := 0; i < b.N; i++ {
-			bkt.Put(key16(i), []byte("v"))
-		}
-		return nil
-	})
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		d.Update(func(tx *bolt.Tx) error {
-			bkt := tx.Bucket([]byte("users"))
-			return bkt.Delete(key16(i))
-		})
 	}
 }
 

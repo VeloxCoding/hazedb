@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
-	"go.etcd.io/bbolt"
 
 	"github.com/VeloxCoding/hazedb/spike"
 )
@@ -379,59 +378,4 @@ func Benchmark_go_sqldb_GetParallel(b *testing.B) {
 			i++
 		}
 	})
-}
-
-// ----- BoltDB benchmarks -----
-
-func BenchmarkBolt_Insert(b *testing.B) {
-	path := filepath.Join(b.TempDir(), "bolt.db")
-	db, err := bbolt.Open(path, 0644, nil)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer db.Close()
-	db.Update(func(tx *bbolt.Tx) error {
-		_, err := tx.CreateBucket([]byte("users"))
-		return err
-	})
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		id := fmt.Sprintf("u%d", i)
-		err := db.Update(func(tx *bbolt.Tx) error {
-			return tx.Bucket([]byte("users")).Put([]byte(id), []byte(id+"|"+id+"@x|"+id))
-		})
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-func BenchmarkBolt_Get(b *testing.B) {
-	path := filepath.Join(b.TempDir(), "bolt.db")
-	db, _ := bbolt.Open(path, 0644, nil)
-	defer db.Close()
-	db.Update(func(tx *bbolt.Tx) error {
-		bkt, _ := tx.CreateBucketIfNotExists([]byte("users"))
-		for i := 0; i < 100_000; i++ {
-			id := fmt.Sprintf("u%d", i)
-			bkt.Put([]byte(id), []byte(id+"|"+id+"@x|"+id))
-		}
-		return nil
-	})
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		id := fmt.Sprintf("u%d", i%100_000)
-		err := db.View(func(tx *bbolt.Tx) error {
-			v := tx.Bucket([]byte("users")).Get([]byte(id))
-			if v == nil {
-				return fmt.Errorf("missing")
-			}
-			return nil
-		})
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
 }
