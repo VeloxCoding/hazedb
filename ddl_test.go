@@ -49,7 +49,7 @@ func TestRuntimeCreateTable(t *testing.T) {
 func TestRuntimeCreateSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ddl.wal")
-	db, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: Schema{}, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func TestRuntimeCreateSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	db2, err := Open(Options{Schema: Schema{}, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestRuntimeCreateSurvivesRestart(t *testing.T) {
 func TestRuntimeDropTable(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "drop.wal")
-	db, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: Schema{}, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestRuntimeDropTable(t *testing.T) {
 	}
 	db.Close()
 
-	db2, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	db2, err := Open(Options{Schema: Schema{}, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestRuntimeCreateConcurrent(t *testing.T) {
 func TestRuntimeRecreateTable(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "recreate.wal")
-	db, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: Schema{}, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +208,7 @@ func TestRuntimeRecreateTable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	db2, err := Open(Options{Schema: Schema{}, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +245,7 @@ func TestStalePlanAfterDrop(t *testing.T) {
 func TestRuntimePartitionedSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "part.wal")
-	db, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: Schema{}, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +258,7 @@ func TestRuntimePartitionedSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	db2, err := Open(Options{Schema: Schema{}, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,7 +354,7 @@ func TestIndexValidationErrors(t *testing.T) {
 func TestIndexSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "idx.wal")
-	db, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: Schema{}, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +362,7 @@ func TestIndexSurvivesRestart(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db2, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	db2, err := Open(Options{Schema: Schema{}, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}

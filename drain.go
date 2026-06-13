@@ -455,9 +455,9 @@ func (db *DB) startDrainLoop(interval time.Duration) {
 		for {
 			select {
 			case <-db.drainStop:
-				// Final drain: seal the active segment so its records reach the
+				// Final drain: seal the pending buffer so its records reach the
 				// mirror, then drain every sealed segment.
-				db.wal.rotate()
+				_ = db.wal.flush()
 				_ = db.drainOnce()
 				return
 			case <-t.C:

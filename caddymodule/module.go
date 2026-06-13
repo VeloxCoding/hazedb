@@ -29,7 +29,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/VeloxCoding/hazedb"
 	"github.com/caddyserver/caddy/v2"
@@ -40,17 +39,12 @@ import (
 
 // Handler is the Caddy HTTP handler that embeds hazedb.
 type Handler struct {
-	// WALLevel is the durability switch: 0 = memory only, 1 = background fsync
-	// (~1s window), 2 = fsync every write (slowest, safest). Above 0, WALPath
-	// is required.
-	WALLevel int `json:"wal_level,omitempty"`
-	// WALPath is the directory holding the write-ahead log segments. Required
-	// when wal_level > 0.
+	// WALPath is the directory holding the write-ahead log segments. Setting it
+	// turns the WAL ON (a write is sealed to disk within ~0.5s, so a crash loses
+	// at most that window); leaving it empty is memory-only.
 	WALPath string `json:"wal_path,omitempty"`
-	// WALRotateMillis is how often the active segment is sealed, in ms. 0 = 5s.
-	WALRotateMillis int `json:"wal_rotate_ms,omitempty"`
-	// SQLitePath enables the on-disk SQLite mirror at this path (system of record
-	// + recovery source). Empty = no mirror. Requires wal_level > 0.
+	// SQLitePath enables the on-disk SQLite mirror at this path (queryable export
+	// + recovery base). Empty = no mirror. Requires wal_path.
 	SQLitePath string `json:"sqlite_path,omitempty"`
 	// InitSQL is an absolute path to a .sql file run once at Provision, before
 	// Caddy serves — typically CREATE TABLE + seed rows. Statements are split on
@@ -95,9 +89,6 @@ const (
 // applyDefaults validates and fills every unset config field — one place for
 // all handler defaults, called at the top of Provision.
 func (h *Handler) applyDefaults() error {
-	if h.WALRotateMillis < 0 {
-		return fmt.Errorf("hazedb: wal_rotate_ms must be >= 0")
-	}
 	if h.MaxBodyBytes < 0 {
 		return fmt.Errorf("hazedb: max_body_bytes must be >= 0")
 	}
@@ -122,13 +113,9 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}
 	opts := hazedb.Options{
 		Schema:     hazedb.Schema{}, // tables created at runtime (init_sql / POST /exec)
-		WALLevel:   h.WALLevel,
 		WALPath:    h.WALPath,
 		SQLitePath: h.SQLitePath,
 		MaxBytes:   h.MaxBytes,
-	}
-	if h.WALRotateMillis > 0 {
-		opts.WALRotateInterval = time.Duration(h.WALRotateMillis) * time.Millisecond
 	}
 	db, err := hazedb.Open(opts)
 	if err != nil {
@@ -462,9 +449,7 @@ func writeJSON(w http.ResponseWriter, status int, body []byte) {
 // UnmarshalCaddyfile parses the `hazedb` handler directive. Example:
 //
 //	hazedb {
-//	    wal_level       1
 //	    wal_path        /var/lib/hazedb/wal
-//	    wal_rotation    5s
 //	    sqlite_path     /var/lib/hazedb/hazedb.db
 //	    init_sql        /etc/hazedb/schema.sql
 //	    registry_name   default
@@ -502,18 +487,6 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("%s: %v", key, err)
 				}
 				h.MaxBytes = n
-			case "wal_level":
-				n, err := strconv.Atoi(value)
-				if err != nil {
-					return d.Errf("%s: %v", key, err)
-				}
-				h.WALLevel = n
-			case "wal_rotation":
-				dur, err := time.ParseDuration(value)
-				if err != nil {
-					return d.Errf("%s: %v", key, err)
-				}
-				h.WALRotateMillis = int(dur / time.Millisecond)
 			default:
 				return d.Errf("unrecognized option: %s", key)
 			}

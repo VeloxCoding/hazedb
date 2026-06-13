@@ -12,7 +12,7 @@ import (
 func BenchmarkInsert_WALSegmented(b *testing.B) {
 	dir := b.TempDir()
 	db, err := Open(Options{Schema: benchSchema(), sizeHint: b.N,
-		WALLevel: WALPeriodic, WALPath: dir, WALRotateInterval: 5 * time.Second})
+		WALPath: dir})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -33,8 +33,8 @@ func BenchmarkInsert_WALDrain(b *testing.B) {
 	dir := b.TempDir()
 	sqPath := filepath.Join(b.TempDir(), "m.db")
 	db, err := Open(Options{Schema: benchSchema(), sizeHint: b.N,
-		WALLevel: WALPeriodic, WALPath: dir, SQLitePath: sqPath,
-		WALRotateInterval: 100 * time.Millisecond, drainInterval: 200 * time.Millisecond})
+		WALPath: dir, SQLitePath: sqPath,
+		drainInterval: 200 * time.Millisecond})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -55,8 +55,8 @@ func BenchmarkDrainThroughput(b *testing.B) {
 	dir := b.TempDir()
 	sqPath := filepath.Join(b.TempDir(), "m.db")
 	db, err := Open(Options{Schema: benchSchema(), sizeHint: K,
-		WALLevel: WALPeriodic, WALPath: dir, SQLitePath: sqPath,
-		WALRotateInterval: time.Hour, drainInterval: -1})
+		WALPath: dir, SQLitePath: sqPath,
+		drainInterval: -1})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func BenchmarkDrainThroughput(b *testing.B) {
 				b.Fatal(err)
 			}
 		}
-		if err := db.wal.rotate(); err != nil {
+		if err := db.wal.flush(); err != nil {
 			b.Fatal(err)
 		}
 		b.StartTimer()

@@ -17,7 +17,7 @@ import (
 func TestTxnEnvelopeReplays(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "txn.wal")
-	db, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: Schema{}, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestTxnEnvelopeReplays(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	db2, err := Open(Options{Schema: Schema{}, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +59,7 @@ func TestTxnEnvelopeReplays(t *testing.T) {
 func TestTxnEnvelopeTornTailDiscarded(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "torn.wal")
-	db, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: Schema{}, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestTxnEnvelopeTornTailDiscarded(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	db2, err := Open(Options{Schema: Schema{}, WALPath: path})
 	if err != nil {
 		t.Fatalf("torn TXN tail should be tolerated, got %v", err)
 	}
@@ -116,7 +116,7 @@ func TestBroadWriteIsSingleWALRecord(t *testing.T) {
 		{"update", "UPDATE users SET age = ? WHERE age >= ?"},
 		{"delete", "DELETE FROM users WHERE age >= ?"},
 	} {
-		before := db.wal.lsn
+		before := db.wal.recs
 		var err error
 		if op.name == "update" {
 			_, err = db.Exec(op.sql, 99, 0) // matches all 6
@@ -126,7 +126,7 @@ func TestBroadWriteIsSingleWALRecord(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", op.name, err)
 		}
-		if d := db.wal.lsn - before; d != 1 {
+		if d := db.wal.recs - before; d != 1 {
 			t.Fatalf("%s wrote %d WAL records, want 1 (single TXN envelope)", op.name, d)
 		}
 	}
@@ -160,7 +160,7 @@ func TestBroadUpdateAtomicOnWALFailure(t *testing.T) {
 func TestBroadWriteSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "broad.wal")
-	db, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: testSchema(), WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestBroadWriteSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
+	db2, err := Open(Options{Schema: testSchema(), WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +252,7 @@ func TestTransactionRollback(t *testing.T) {
 func TestTransactionSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "tx.wal")
-	db, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: Schema{}, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +271,7 @@ func TestTransactionSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	db2, err := Open(Options{Schema: Schema{}, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -3,7 +3,6 @@ package hazedb
 import (
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 // After a drain, recovery must rebuild exact state from SQLite (the drained
@@ -13,8 +12,8 @@ func TestSQLiteRecoveryAfterCrash(t *testing.T) {
 	dir := t.TempDir()
 	sqPath := filepath.Join(t.TempDir(), "m.db")
 	opts := Options{
-		Schema: testSchema(), WALLevel: WALPeriodic, WALPath: dir, SQLitePath: sqPath,
-		WALRotateInterval: time.Hour, drainInterval: -1,
+		Schema: testSchema(), WALPath: dir, SQLitePath: sqPath,
+		drainInterval: -1,
 	}
 	db, err := Open(opts)
 	if err != nil {
@@ -29,7 +28,7 @@ func TestSQLiteRecoveryAfterCrash(t *testing.T) {
 	for i := 1; i <= 5; i++ {
 		db.Exec("INSERT INTO logs (id, msg) VALUES (?, ?)", tid(1000+i), "m")
 	}
-	if err := db.wal.rotate(); err != nil {
+	if err := db.wal.flush(); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.drainOnce(); err != nil {
@@ -79,8 +78,8 @@ func TestDrainReclaimsSegments(t *testing.T) {
 	dir := t.TempDir()
 	sqPath := filepath.Join(t.TempDir(), "m.db")
 	db, err := Open(Options{
-		Schema: testSchema(), WALLevel: WALPeriodic, WALPath: dir, SQLitePath: sqPath,
-		WALRotateInterval: time.Hour, drainInterval: -1,
+		Schema: testSchema(), WALPath: dir, SQLitePath: sqPath,
+		drainInterval: -1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -90,7 +89,7 @@ func TestDrainReclaimsSegments(t *testing.T) {
 		for i := 0; i < 10; i++ {
 			db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(round*10+i+1), "x", i)
 		}
-		if err := db.wal.rotate(); err != nil {
+		if err := db.wal.flush(); err != nil {
 			t.Fatal(err)
 		}
 		if err := db.drainOnce(); err != nil {

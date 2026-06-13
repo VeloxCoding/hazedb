@@ -116,7 +116,7 @@ func TestPartitionedMultiShardDelete(t *testing.T) {
 func TestPartitionedWALRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "p.wal")
-	db, err := Open(Options{Schema: msgsSchema(), WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: msgsSchema(), WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestPartitionedWALRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: msgsSchema(), WALLevel: WALPeriodic, WALPath: path})
+	db2, err := Open(Options{Schema: msgsSchema(), WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -7,7 +7,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 )
 
 // renderVal / renderAny render an engine cell and a SQLite-scanned value to the
@@ -117,11 +116,11 @@ func TestDrainMirrorMatchesEngine(t *testing.T) {
 	dir := t.TempDir()
 	sqPath := filepath.Join(t.TempDir(), "mirror.db")
 	db, err := Open(Options{
-		Schema:   testSchema(),
-		WALLevel: WALPeriodic, WALPath: dir,
-		SQLitePath:        sqPath,
-		WALRotateInterval: time.Hour, // rotate manually
-		drainInterval:     -1,        // drain manually
+		Schema:     testSchema(),
+		WALPath:    dir,
+		SQLitePath: sqPath,
+		// rotate manually
+		drainInterval: -1, // drain manually
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -148,7 +147,7 @@ func TestDrainMirrorMatchesEngine(t *testing.T) {
 		}
 	}
 
-	if err := db.wal.rotate(); err != nil { // seal all writes
+	if err := db.wal.flush(); err != nil { // seal all writes
 		t.Fatal(err)
 	}
 	if err := db.drainOnce(); err != nil {

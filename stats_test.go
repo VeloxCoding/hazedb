@@ -252,7 +252,7 @@ func TestByteTallyReconcilesUpdate(t *testing.T) {
 func TestByteTallyReconcilesAfterReopen(t *testing.T) {
 	dir := t.TempDir()
 	open := func() *DB {
-		db, err := Open(Options{WALLevel: WALPeriodic, WALPath: dir})
+		db, err := Open(Options{WALPath: dir})
 		if err != nil {
 			t.Fatal(err)
 		}

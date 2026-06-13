@@ -78,7 +78,7 @@ func TestWideUpdateWALRoundTrip(t *testing.T) {
 	upd.WriteString(" WHERE id = ?")
 	updArgs = append(updArgs, id)
 
-	db, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: Schema{}, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestWideUpdateWALRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	db2, err := Open(Options{Schema: Schema{}, WALPath: path})
 	if err != nil {
 		t.Fatalf("reopen (replay of >255-column UPDATE) must succeed: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestRejectedDuplicateInsertDoesNotCorruptWAL(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "dup.wal")
 
-	db, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: testSchema(), WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestRejectedDuplicateInsertDoesNotCorruptWAL(t *testing.T) {
 
 	// Reopen: replay must succeed (no journaled duplicate) and show exactly
 	// the two accepted rows.
-	db2, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
+	db2, err := Open(Options{Schema: testSchema(), WALPath: path})
 	if err != nil {
 		t.Fatalf("reopen after rejected duplicate must succeed, got: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestWALCorruptTailLengthIsBounded(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "huge.wal")
 
-	db, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: testSchema(), WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestWALCorruptTailLengthIsBounded(t *testing.T) {
 	f.Write([]byte{0xF0, 0xFF, 0xFF, 0xFF, 0x01, 0x02, 0x03})
 	f.Close()
 
-	db2, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
+	db2, err := Open(Options{Schema: testSchema(), WALPath: path})
 	if err != nil {
 		t.Fatalf("corrupt oversized tail length must be tolerated, got %v", err)
 	}
@@ -195,7 +195,7 @@ func TestWALCorruptTailLengthIsBounded(t *testing.T) {
 func TestMultiShardUpdateDeleteWALRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ms.wal")
-	db, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: testSchema(), WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,7 @@ func TestMultiShardUpdateDeleteWALRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
+	db2, err := Open(Options{Schema: testSchema(), WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +236,7 @@ func TestMultiShardUpdateDeleteWALRoundTrip(t *testing.T) {
 func TestConcurrentMultiShardWritesReplayConsistent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "msc.wal")
-	db, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: testSchema(), WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +261,7 @@ func TestConcurrentMultiShardWritesReplayConsistent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
+	db2, err := Open(Options{Schema: testSchema(), WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestConcurrentMultiShardWritesReplayConsistent(t *testing.T) {
 func TestWALRejectsForeignVersion(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.wal")
-	db, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: testSchema(), WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,7 +304,7 @@ func TestWALRejectsForeignVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path}); !errors.Is(err, ErrWALCorrupt) {
+	if _, err := Open(Options{Schema: testSchema(), WALPath: path}); !errors.Is(err, ErrWALCorrupt) {
 		t.Fatalf("Open with a stale-version WAL: want ErrWALCorrupt, got %v", err)
 	}
 }

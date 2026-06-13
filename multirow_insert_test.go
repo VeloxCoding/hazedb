@@ -199,7 +199,7 @@ func TestMultiRowInsert(t *testing.T) {
 func TestMultiRowInsertWALReplay(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.wal")
-	db, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: testSchema(), WALPath: path})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestMultiRowInsertWALReplay(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	db2, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
+	db2, err := Open(Options{Schema: testSchema(), WALPath: path})
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

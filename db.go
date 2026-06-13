@@ -103,24 +103,16 @@ func Open(opts Options) (*DB, error) {
 	}
 	db.cat.Store(cat)
 	if opts.walEnabled() {
-		segmented := opts.WALRotateInterval > 0
-		var w *wal
-		var err error
-		if segmented {
-			w, err = openWALSegmented(opts.WALPath, opts.walSync(), opts.walSyncPerWrite())
-		} else {
-			w, err = openWAL(opts.WALPath, opts.walSync(), opts.walSyncPerWrite())
-		}
+		w, err := openWAL(opts.WALPath)
 		if err != nil {
 			return nil, err
 		}
-		// Replay existing records first, then position for appends and only
-		// then start the tickers — so no background goroutine (flush or rotate)
-		// races a replay reader on the append handle.
+		// Recover from existing segments before starting the flusher, so no
+		// background flush races a replay reader.
 		if opts.SQLitePath != "" {
-			// SQLite-backed recovery: the mirror is the system of record on disk.
-			// Open it first, load it into memory, then replay only the undrained
-			// WAL tail (segments past the drained cursor) on top.
+			// SQLite-backed recovery: the mirror is the base. Load it into memory,
+			// then replay only the undrained WAL tail (segments past the drained
+			// cursor) on top.
 			m, merr := newSQLiteMirror(opts.SQLitePath, db.cat.Load())
 			if merr != nil {
 				w.close()
@@ -142,42 +134,23 @@ func Open(opts Options) (*DB, error) {
 				m.close()
 				return nil, err
 			}
-			// Segment numbers must stay above the drained cursor across restarts.
-			// close() drops the empty trailing segment and the drain deletes the
-			// segments it consumes, so the highest on-disk segment can fall back
-			// below lastDrained (an empty dir resets the counter to 1). Without
-			// this, a new active segment could reuse a number <= lastDrained and
-			// drainOnce would skip it forever — post-restart writes would never
-			// reach the mirror and would be lost on the next recovery.
+			// Keep segment numbers above the drained cursor across restarts: the
+			// drain deletes the segments it consumes, so the highest on-disk segment
+			// can fall below lastDrained. Without this, a post-restart flush could
+			// reuse a number <= lastDrained that drainOnce would skip forever —
+			// those writes would never reach the mirror and be lost on next recovery.
 			if w.seg < m.lastDrained {
 				w.seg = m.lastDrained
 			}
-			if err := w.startActiveSegment(); err != nil {
-				w.close()
-				m.close()
-				return nil, err
-			}
 		} else {
-			// WAL is the recovery source: replay every segment into memory.
+			// No mirror: the WAL segments themselves replay into memory.
 			if err := db.replayWAL(w); err != nil {
 				w.close()
 				return nil, err
 			}
-			if segmented {
-				if err := w.startActiveSegment(); err != nil {
-					w.close()
-					return nil, err
-				}
-			} else {
-				if err := w.seekToEnd(); err != nil {
-					w.close()
-					return nil, err
-				}
-			}
 		}
-		w.startTicker(opts.walFlushInterval)
-		w.startRotateTicker(opts.WALRotateInterval)
 		db.wal = w
+		w.startFlusher(opts.walFlushInterval)
 		// Replay marked rows dirty but never built the indexes; rebuild them from
 		// the live rows now, so reads are index-fast before serving.
 		db.rebuildAllIndexes()

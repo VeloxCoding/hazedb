@@ -57,7 +57,7 @@ func openDBWithWAL(t *testing.T) (*DB, string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.wal")
-	db, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: testSchema(), WALPath: path})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -537,7 +537,7 @@ func TestWALRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
+	db2, err := Open(Options{Schema: testSchema(), WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -562,7 +562,7 @@ func TestWALPartialTail(t *testing.T) {
 	f.Write([]byte{0x10, 0x00, 0x00, 0x00, 0x01}) // says len=16, but body is 1 byte
 	f.Close()
 
-	db2, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
+	db2, err := Open(Options{Schema: testSchema(), WALPath: path})
 	if err != nil {
 		t.Fatalf("partial tail should be tolerated, got %v", err)
 	}

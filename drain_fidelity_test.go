@@ -17,7 +17,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 // itemsSchema is a wide table exercising every column type plus nullability:
@@ -191,7 +190,7 @@ func (w *wl) step(t *testing.T, n int) {
 // verify seals + drains everything, then asserts reference == engine == SQLite.
 func (w *wl) verify(t *testing.T, label string) {
 	t.Helper()
-	if err := w.db.wal.rotate(); err != nil {
+	if err := w.db.wal.flush(); err != nil {
 		t.Fatalf("%s: rotate: %v", label, err)
 	}
 	if err := w.db.drainOnce(); err != nil {
@@ -221,12 +220,11 @@ func refToMap(ref map[UUID]Row) map[string]string {
 func openItemsDrainDB(t *testing.T, dir, sqPath string) *DB {
 	t.Helper()
 	db, err := Open(Options{
-		Schema:            itemsSchema(),
-		WALLevel:          WALPeriodic,
-		WALPath:           dir,
-		SQLitePath:        sqPath,
-		WALRotateInterval: time.Hour, // rotate manually in verify()
-		drainInterval:     -1,        // drain manually in verify()
+		Schema:     itemsSchema(),
+		WALPath:    dir,
+		SQLitePath: sqPath,
+		// rotate manually in verify()
+		drainInterval: -1, // drain manually in verify()
 	})
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -364,7 +362,7 @@ func TestFidelity_IncrementalDrain(t *testing.T) {
 	w := newWL(db, 6)
 	for batch := 0; batch < 20; batch++ {
 		w.step(t, 600)
-		if err := db.wal.rotate(); err != nil {
+		if err := db.wal.flush(); err != nil {
 			t.Fatalf("rotate: %v", err)
 		}
 		if err := db.drainOnce(); err != nil {

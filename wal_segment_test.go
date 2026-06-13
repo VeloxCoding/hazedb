@@ -6,12 +6,13 @@ import (
 	"time"
 )
 
-// openSegmented opens a segmented-WAL DB whose rotate ticker is set long enough
-// not to fire during the test; rotation is driven explicitly via db.wal.rotate()
-// for determinism. Tests that exercise the ticker pass a short interval instead.
-func openSegmented(t *testing.T, dir string, rotate time.Duration) *DB {
+// openSegmented opens a WAL-backed DB. The flush param sets walFlushInterval:
+// pass a long interval (or -1) so the background flusher does not fire and
+// sealing is driven explicitly via db.wal.flush() for determinism; tests that
+// exercise the flusher pass a short interval instead.
+func openSegmented(t *testing.T, dir string, flush time.Duration) *DB {
 	t.Helper()
-	db, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: dir, WALRotateInterval: rotate})
+	db, err := Open(Options{Schema: testSchema(), WALPath: dir, walFlushInterval: flush})
 	if err != nil {
 		t.Fatalf("open segmented: %v", err)
 	}
@@ -37,7 +38,7 @@ func TestSegmentedWALRoundTrip(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := db.wal.rotate(); err != nil { // seal segment 1
+	if err := db.wal.flush(); err != nil { // seal segment 1
 		t.Fatal(err)
 	}
 	for i := 6; i <= 10; i++ {
@@ -66,27 +67,27 @@ func TestSegmentedWALRoundTrip(t *testing.T) {
 	}
 }
 
-// rotate() advances and seals only when the active segment holds data; an empty
-// rotate is a no-op (no zero-record segments mid-stream).
+// flush() seals into the next segment only when the buffer holds data; an empty
+// flush is a no-op (no zero-record segments).
 func TestSegmentedRotateBehavior(t *testing.T) {
 	dir := t.TempDir()
 	db := openSegmented(t, dir, time.Hour)
 	defer db.Close()
-	if db.wal.seg != 1 {
-		t.Fatalf("active seg = %d, want 1", db.wal.seg)
+	if db.wal.seg != 0 {
+		t.Fatalf("initial sealed seg = %d, want 0", db.wal.seg)
 	}
-	if err := db.wal.rotate(); err != nil { // empty → no-op
+	if err := db.wal.flush(); err != nil { // empty → no-op
 		t.Fatal(err)
 	}
-	if db.wal.seg != 1 {
-		t.Fatalf("empty rotate advanced seg to %d", db.wal.seg)
+	if db.wal.seg != 0 {
+		t.Fatalf("empty flush advanced seg to %d", db.wal.seg)
 	}
 	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "a", 1)
-	if err := db.wal.rotate(); err != nil {
+	if err := db.wal.flush(); err != nil {
 		t.Fatal(err)
 	}
-	if db.wal.seg != 2 {
-		t.Fatalf("after data rotate seg = %d, want 2", db.wal.seg)
+	if db.wal.seg != 1 {
+		t.Fatalf("after data flush seg = %d, want 1", db.wal.seg)
 	}
 	if _, err := os.Stat(db.wal.segPath(1)); err != nil {
 		t.Fatalf("sealed segment 1 missing: %v", err)
@@ -143,7 +144,7 @@ func TestSegmentedTxnReplay(t *testing.T) {
 	if _, err := db.Exec("UPDATE users SET age = ? WHERE age = ?", 20, 10); err != nil { // multi-row → recTxn
 		t.Fatal(err)
 	}
-	if err := db.wal.rotate(); err != nil {
+	if err := db.wal.flush(); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {

@@ -50,7 +50,7 @@ func TestArithmeticSetMultiShard(t *testing.T) {
 func TestArithmeticSetWALRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "a.wal")
-	db, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: testSchema(), WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestArithmeticSetWALRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
+	db2, err := Open(Options{Schema: testSchema(), WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}

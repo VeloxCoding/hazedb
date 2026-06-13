@@ -66,10 +66,8 @@ xcaddy build --with github.com/VeloxCoding/hazedb/caddymodule
 :8080 {
     handle /db/* {
         hazedb {
-            wal_level      1                        # 0 memory-only, 1 background fsync, 2 fsync-per-write
-            wal_path       /var/lib/hazedb/wal      # directory for the WAL segments (required when wal_level > 0)
-            wal_rotation   5s                       # how often the active segment is sealed (default 5s)
-            sqlite_path    /var/lib/hazedb/hazedb.db # on-disk SQLite mirror (recovery source; requires wal_level > 0)
+            wal_path       /var/lib/hazedb/wal      # WAL directory; set = durable (crash loses ≤~0.5s), unset = memory-only
+            sqlite_path    /var/lib/hazedb/hazedb.db # on-disk SQLite mirror (recovery base; requires wal_path)
             init_sql       /etc/hazedb/schema.sql   # CREATE TABLE + seed, run once at startup
             registry_name  default                  # name the *DB is published under for the PHP extension
             max_body_bytes 4194304                  # POST body cap for /query and /exec (default 4 MiB)
@@ -79,10 +77,11 @@ xcaddy build --with github.com/VeloxCoding/hazedb/caddymodule
 }
 ```
 
-All subdirectives are optional. With `wal_level` unset (or `0`) the store is
-memory-only and `wal_path` is not needed. Tables are created at runtime: put
-your `CREATE TABLE` statements in the `init_sql` file, or `POST` them to
-`/exec`.
+All subdirectives are optional. With `wal_path` unset the store is memory-only.
+The WAL has one durability story — writes seal to disk within ~0.5s, so a crash
+loses at most that window; there are no durability levels or fsync modes. Tables
+are created at runtime: put your `CREATE TABLE` statements in the `init_sql`
+file, or `POST` them to `/exec`.
 
 ## Schema / tables
 

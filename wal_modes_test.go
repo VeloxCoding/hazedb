@@ -7,47 +7,34 @@ import (
 	"time"
 )
 
-// Every durability mode must round-trip: write under the mode, close, reopen,
-// and see all records replayed.
-func TestWALDurabilityModesRoundTrip(t *testing.T) {
-	modes := []struct {
-		name string
-		opt  Options
-	}{
-		{"periodic", Options{WALLevel: WALPeriodic, walFlushInterval: 10 * time.Millisecond}},
-		{"per-write", Options{WALLevel: WALPerWrite}},
-		{"manual-flush", Options{WALLevel: WALPeriodic, walFlushInterval: -1}}, // ticker off; Close flushes
-	}
-	for _, m := range modes {
-		t.Run(m.name, func(t *testing.T) {
-			dir := t.TempDir()
-			path := filepath.Join(dir, "m.wal")
-			opt := m.opt
-			opt.Schema = testSchema()
-			opt.WALPath = path
-			db, err := Open(opt)
-			if err != nil {
-				t.Fatalf("open: %v", err)
+// WAL on must round-trip: write, close, reopen, see every record replayed.
+// Run with the background flusher on AND in manual-only mode (Close seals the
+// tail) so both sealing paths are covered.
+func TestWALFlushModesRoundTrip(t *testing.T) {
+	for _, fi := range []time.Duration{10 * time.Millisecond, -1} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "wal")
+		db, err := Open(Options{Schema: testSchema(), WALPath: path, walFlushInterval: fi})
+		if err != nil {
+			t.Fatalf("flushInterval=%v open: %v", fi, err)
+		}
+		for k := 0; k < 50; k++ {
+			if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(k), "u", k); err != nil {
+				t.Fatalf("insert %d: %v", k, err)
 			}
-			for k := 0; k < 50; k++ {
-				if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(k), "u", k); err != nil {
-					t.Fatalf("insert %d: %v", k, err)
-				}
-			}
-			if err := db.Close(); err != nil {
-				t.Fatalf("close: %v", err)
-			}
-
-			db2, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
-			if err != nil {
-				t.Fatalf("reopen: %v", err)
-			}
-			defer db2.Close()
-			_, rows, _ := db2.Query("SELECT id FROM users")
-			if len(rows) != 50 {
-				t.Errorf("expected 50 rows after replay, got %d", len(rows))
-			}
-		})
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		db2, err := Open(Options{Schema: testSchema(), WALPath: path})
+		if err != nil {
+			t.Fatalf("reopen: %v", err)
+		}
+		_, rows, _ := db2.Query("SELECT id FROM users")
+		if len(rows) != 50 {
+			t.Errorf("flushInterval=%v: expected 50 rows after replay, got %d", fi, len(rows))
+		}
+		db2.Close()
 	}
 }
 
@@ -57,7 +44,7 @@ func TestWALDurabilityModesRoundTrip(t *testing.T) {
 func TestWALErrorStateBlocksAndDoesNotApply(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "e.wal")
-	db, err := Open(Options{Schema: testSchema(), WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: testSchema(), WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}

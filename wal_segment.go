@@ -1,24 +1,18 @@
 package hazedb
 
-// Segmented WAL — opt-in (Options.WALRotateInterval > 0). The WAL becomes a
-// directory of sealed segment files (seg-<n>.wal) plus one active segment that
-// appends land in. A background ticker rotates: it seals the active segment and
-// opens the next, so a drainer can consume sealed segments without ever touching
-// the file being written. Single-file mode (dir == "") is unchanged.
-//
-// "Replay before append" is preserved: existing segments are replayed (each via
-// its own read handle) before the active segment is opened, so the append path
-// never shares a handle or a position with a replay reader. See docs/durability.md.
+// Segment files. The WAL is a directory of immutable born-sealed segments
+// (seg-<n>.wal), written by wal.flushLocked via temp-file + atomic rename. This
+// file owns segment naming, listing, and the replay / reclamation helpers the
+// recovery and drain paths use. There is no "active" segment: every seg-*.wal is
+// complete, so listing and replay never have to skip a file being written.
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 )
 
 const (
@@ -26,34 +20,14 @@ const (
 	segSuffix = ".wal"
 )
 
-// openWALSegmented opens the WAL in segmented mode. It creates dir and scans for
-// the highest existing segment so the next active segment is opened after it
-// (never re-appending into a segment replay will read). It does NOT open the
-// active file or start tickers — the caller replays first, then calls
-// startActiveSegment + the tickers, mirroring single-file openWAL.
-func openWALSegmented(dir string, sync, syncPerWrite bool) (*wal, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, fmt.Errorf("wal: mkdir %q: %w", dir, err)
-	}
-	maxSeg, err := scanMaxSeg(dir)
-	if err != nil {
-		return nil, err
-	}
-	return &wal{
-		scratch:      make([]byte, 0, 4096),
-		sync:         sync,
-		syncPerWrite: syncPerWrite,
-		dir:          dir,
-		seg:          maxSeg, // active segment opens at maxSeg+1
-	}, nil
-}
-
 // segPath returns the file path for segment number n.
 func (w *wal) segPath(n uint64) string {
 	return filepath.Join(w.dir, fmt.Sprintf("%s%010d%s", segPrefix, n, segSuffix))
 }
 
-// listSegments returns the existing segment numbers in dir, ascending.
+// listSegments returns the existing segment numbers in dir, ascending. A *.tmp
+// (a flush in progress, or a crash leftover) does not end in segSuffix and is
+// ignored.
 func listSegments(dir string) ([]uint64, error) {
 	ents, err := os.ReadDir(dir)
 	if err != nil {
@@ -90,57 +64,40 @@ func scanMaxSeg(dir string) (uint64, error) {
 	return segs[len(segs)-1], nil
 }
 
-// startActiveSegment opens a fresh active segment (seg+1) for appending. Called
-// once after replay so appends never land in a segment replay read.
-func (w *wal) startActiveSegment() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.seg++
-	// Fresh, empty segment written by a single appender under w.mu — no O_APPEND
-	// needed (it would force a kernel seek-to-end on every write).
-	f, err := os.OpenFile(w.segPath(w.seg), os.O_RDWR|os.O_CREATE, 0o644)
-	if err != nil {
-		return fmt.Errorf("wal: open segment %q: %w", w.segPath(w.seg), err)
-	}
-	w.f = f
-	if w.bw == nil {
-		w.bw = bufio.NewWriterSize(f, 64<<10)
-	} else {
-		w.bw.Reset(f)
-	}
-	w.segHasData = false
-	return nil
-}
-
-// replayAll replays every existing segment in ascending order (segmented mode)
-// or the single file (single-file mode) into apply. Each segment is read through
-// its own short-lived handle, so replay never disturbs the append handle.
-func (w *wal) replayAll(apply func(recType uint8, payload []byte) error) error {
-	if w.dir == "" {
-		return w.replay(apply)
-	}
-	segs, err := listSegments(w.dir)
+// removeStaleTemps deletes leftover *.tmp files from a flush interrupted by a
+// crash. Their bytes were never renamed into a seg-*.wal, so they belong to no
+// committed segment and are safe — required — to drop before reopening.
+func removeStaleTemps(dir string) error {
+	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return err
 	}
-	for _, n := range segs {
-		f, err := os.Open(w.segPath(n))
-		if err != nil {
-			return err
+	for _, e := range ents {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".tmp") {
+			continue
 		}
-		err = w.replayFile(f, apply)
-		f.Close()
-		if err != nil {
+		if err := os.Remove(filepath.Join(dir, e.Name())); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 	}
 	return nil
+}
+
+// replayAll replays every segment in ascending order into apply. Each segment is
+// read through its own short-lived handle.
+func (w *wal) replayAll(apply func(recType uint8, payload []byte) error) error {
+	return w.replaySegments(0, apply)
 }
 
 // replayFrom replays only segments numbered above minSeg, ascending. Used by
 // SQLite-backed recovery: segments at or below the drained cursor are already in
 // the mirror and must not be re-applied to memory.
 func (w *wal) replayFrom(minSeg uint64, apply func(recType uint8, payload []byte) error) error {
+	return w.replaySegments(minSeg, apply)
+}
+
+// replaySegments replays segments with number > minSeg, ascending.
+func (w *wal) replaySegments(minSeg uint64, apply func(recType uint8, payload []byte) error) error {
 	segs, err := listSegments(w.dir)
 	if err != nil {
 		return err
@@ -162,8 +119,8 @@ func (w *wal) replayFrom(minSeg uint64, apply func(recType uint8, payload []byte
 	return nil
 }
 
-// removeDrainedSegments deletes sealed segments at or below minSeg — boot
-// housekeeping for the crash window between a drain commit and the file delete.
+// removeDrainedSegments deletes segments at or below minSeg — boot housekeeping
+// for the crash window between a drain commit and the file delete.
 func (w *wal) removeDrainedSegments(minSeg uint64) error {
 	segs, err := listSegments(w.dir)
 	if err != nil {
@@ -179,84 +136,9 @@ func (w *wal) removeDrainedSegments(minSeg uint64) error {
 	return nil
 }
 
-// rotate seals the active segment (flush, fsync when WALSync, close) and opens
-// the next. No-op in single-file mode, on a sticky error, or when the active
-// segment holds no records (so idle ticks create no empty segments). Takes w.mu,
-// so it serialises with appends — a rotation never splits a record.
-func (w *wal) rotate() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.dir == "" || w.err != nil || !w.segHasData {
-		return w.err
-	}
-	if err := w.bw.Flush(); err != nil {
-		w.err = fmt.Errorf("wal: rotate flush: %w", err)
-		return w.err
-	}
-	if w.sync {
-		if err := w.f.Sync(); err != nil {
-			w.err = fmt.Errorf("wal: rotate sync: %w", err)
-			return w.err
-		}
-		w.dirtySinceSync = false
-	}
-	if err := w.f.Close(); err != nil {
-		w.err = fmt.Errorf("wal: rotate close: %w", err)
-		return w.err
-	}
-	w.seg++
-	f, err := os.OpenFile(w.segPath(w.seg), os.O_RDWR|os.O_CREATE, 0o644)
-	if err != nil {
-		w.err = fmt.Errorf("wal: rotate open %q: %w", w.segPath(w.seg), err)
-		return w.err
-	}
-	w.f = f
-	w.bw.Reset(f)
-	w.segHasData = false
-	return nil
-}
-
-// sealedSegments returns the numbers of segments that are sealed (closed) and
-// therefore safe to read without touching the open active segment: every
-// segment with a number strictly below the active one. Ascending order.
+// sealedSegments returns every segment safe to drain. With born-sealed segments
+// there is no active file being appended to, so that is simply all of them,
+// ascending.
 func (w *wal) sealedSegments() ([]uint64, error) {
-	w.mu.Lock()
-	active := w.seg
-	w.mu.Unlock()
-	segs, err := listSegments(w.dir)
-	if err != nil {
-		return nil, err
-	}
-	out := segs[:0:0]
-	for _, n := range segs {
-		if n < active {
-			out = append(out, n)
-		}
-	}
-	return out, nil
-}
-
-// startRotateTicker launches the background rotation goroutine. interval <= 0
-// (or single-file mode) leaves a single growing active segment.
-func (w *wal) startRotateTicker(interval time.Duration) {
-	if interval <= 0 || w.dir == "" {
-		return
-	}
-	w.rotateStop = make(chan struct{})
-	w.wg.Add(1)
-	go w.rotateLoop(interval)
-}
-
-func (w *wal) rotateLoop(interval time.Duration) {
-	defer w.wg.Done()
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-w.rotateStop:
-			return
-		case <-t.C:
-			_ = w.rotate() // a sticky error surfaces on the next append
-		}
-	}
+	return listSegments(w.dir)
 }

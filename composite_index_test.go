@@ -616,7 +616,7 @@ func join(ss []string) string {
 func TestCompositeIndexSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "comp.wal")
-	db, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: Schema{}, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -624,7 +624,7 @@ func TestCompositeIndexSurvivesRestart(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db2, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	db2, err := Open(Options{Schema: Schema{}, WALPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 // buildMultiRowSQL returns an INSERT into users with k VALUES tuples.
@@ -23,17 +22,14 @@ func buildMultiRowSQL(cols, perTuple string, k int) string {
 	return sb.String()
 }
 
-// BenchmarkInsertMultiRow: k rows per INSERT, explicit PKs, WALPeriodic.
-// Compare ns/row to BenchmarkInsert_WAL (single-row, same mode): the batch
-// amortises one TXN envelope, one wal.mu acquisition + bufio.Write, and one
-// parse across all k rows. In WALPeriodic this is ~neutral serially (buffered
-// writes are cheap, offsetting the commit overhead); the decisive win is in
-// WALPerWrite, where the batch fsyncs once instead of k times — measured ~96×
-// faster per row (≈17.6µs vs ≈1.69ms) in this environment.
+// BenchmarkInsertMultiRow: k rows per INSERT, explicit PKs, WAL on.
+// Compare ns/row to BenchmarkInsert_WAL (single-row): the batch amortises one
+// TXN envelope, one walMu acquisition + one buffer append, and one parse across
+// all k rows — ~neutral-to-faster serially, and it bounds shard-lock hold time.
 func BenchmarkInsertMultiRow(b *testing.B) {
 	const k = 100
 	sql := buildMultiRowSQL("id, name, age", "(?, ?, ?)", k)
-	db, _ := Open(Options{Schema: benchSchema(), sizeHint: b.N * k, WALLevel: WALPeriodic, WALPath: b.TempDir() + "/b.wal"})
+	db, _ := Open(Options{Schema: benchSchema(), sizeHint: b.N * k, WALPath: b.TempDir() + "/b.wal"})
 	defer db.Close()
 	args := make([]any, 0, k*3)
 	b.ResetTimer()
@@ -57,7 +53,7 @@ func BenchmarkInsertMultiRow(b *testing.B) {
 func BenchmarkInsertMultiRowAutoPK(b *testing.B) {
 	const k = 100
 	sql := buildMultiRowSQL("name, age", "(?, ?)", k)
-	db, _ := Open(Options{Schema: benchSchema(), sizeHint: b.N * k, WALLevel: WALPeriodic, WALPath: b.TempDir() + "/b.wal"})
+	db, _ := Open(Options{Schema: benchSchema(), sizeHint: b.N * k, WALPath: b.TempDir() + "/b.wal"})
 	defer db.Close()
 	args := make([]any, 0, k*2)
 	b.ResetTimer()
@@ -141,7 +137,7 @@ func BenchmarkInsertAutoPK_Mem(b *testing.B) {
 
 func BenchmarkInsert_WAL(b *testing.B) {
 	dir := b.TempDir()
-	db, err := Open(Options{Schema: benchSchema(), sizeHint: b.N, WALLevel: WALPeriodic, WALPath: filepath.Join(dir, "b.wal")})
+	db, err := Open(Options{Schema: benchSchema(), sizeHint: b.N, WALPath: filepath.Join(dir, "b.wal")})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -151,45 +147,6 @@ func BenchmarkInsert_WAL(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "name", i%100)
 		if err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-// Durability-cost ladder vs BenchmarkInsert_WAL (WALPeriodic, default ticker).
-// This bench fsyncs on a fast ticker; the per-write bench fsyncs every record.
-// Note: b.TempDir() in
-// the container sits on an overlay FS, so absolute fsync cost here is not a
-// real-disk number — read these as relative mode overhead, not latency SLAs.
-func BenchmarkInsert_WALSync(b *testing.B) {
-	dir := b.TempDir()
-	db, err := Open(Options{Schema: benchSchema(), sizeHint: b.N,
-		WALPath: filepath.Join(dir, "b.wal"), WALLevel: WALPeriodic, walFlushInterval: 5 * time.Millisecond})
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer db.Close()
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "name", i%100); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-func BenchmarkInsert_WALSyncPerWrite(b *testing.B) {
-	dir := b.TempDir()
-	db, err := Open(Options{Schema: benchSchema(), sizeHint: b.N,
-		WALPath: filepath.Join(dir, "b.wal"), WALLevel: WALPerWrite})
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer db.Close()
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "name", i%100); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -439,7 +396,7 @@ func BenchmarkOrderByNoLimitWide(b *testing.B) {
 func BenchmarkWALReplay(b *testing.B) {
 	const nrow = 20000
 	path := filepath.Join(b.TempDir(), "replay.wal")
-	db, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+	db, err := Open(Options{Schema: Schema{}, WALPath: path})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -457,7 +414,7 @@ func BenchmarkWALReplay(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for k := 0; k < b.N; k++ {
-		d, err := Open(Options{Schema: Schema{}, WALLevel: WALPeriodic, WALPath: path})
+		d, err := Open(Options{Schema: Schema{}, WALPath: path})
 		if err != nil {
 			b.Fatal(err)
 		}

@@ -44,11 +44,10 @@ func (w *wl) stepSteady(t *testing.T, target int) {
 func openItemsSoakDB(t *testing.T, dir, sqPath string) *DB {
 	t.Helper()
 	db, err := Open(Options{
-		Schema:            itemsSchema(),
-		WALLevel:          WALPeriodic,
-		WALPath:           dir,
-		SQLitePath:        sqPath,
-		WALRotateInterval: time.Second, // background rotate; drain defaults to the same
+		Schema:     itemsSchema(),
+		WALPath:    dir,
+		SQLitePath: sqPath,
+		// background rotate; drain defaults to the same
 	})
 	if err != nil {
 		t.Fatalf("open: %v", err)
