@@ -6,12 +6,16 @@ import (
 	"testing"
 )
 
-// The SQLite companion is present even in memory-only mode, and logEvent records
-// a queryable row in _hz_events.
+// With WAL on, the companion file exists and logEvent records a queryable row in
+// _hz_events.
 func TestCompanionEventsTable(t *testing.T) {
-	db := openMem(t) // memory-only: no WAL, no mirror — companion still present
+	db, err := Open(Options{Schema: testSchema(), WALPath: filepath.Join(t.TempDir(), "wal"), drainInterval: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
 	if db.sq == nil {
-		t.Fatal("companion must be present in memory-only mode")
+		t.Fatal("companion must be present when WAL is on")
 	}
 	db.logEvent("warn", "test-event", "hello world")
 

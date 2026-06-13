@@ -1,9 +1,9 @@
 package hazedb
 
-// SQLite companion + data mirror. The companion (Options.CompanionPath; an
-// in-memory DB when empty) is always present for operational data. The DATA
-// MIRROR is active only when WAL is on AND the companion is a persistent file:
-// a background loop then feeds sealed WAL segments into it as CURRENT state
+// SQLite companion + data mirror. The companion is a file next to the WAL
+// (Options.CompanionPath; default hazedb.db inside WALPath), present only when
+// WAL is on — there is no in-memory companion. A background loop feeds sealed
+// WAL segments into it as CURRENT state
 // (compacted: an UPDATE overwrites, a DELETE removes), so the mirror is a
 // queryable, portable, copy-one-file snapshot of the engine. The drain reuses
 // the WAL record framing (scanRecords) and the catalog encoders, and writes one
@@ -51,42 +51,30 @@ type execer interface {
 	Exec(query string, args ...any) (sql.Result, error)
 }
 
-// openCompanion opens (creating if needed) the SQLite companion database. path
-// is "" for an in-memory companion (":memory:"), or a file path to persist it.
-// The handle is configured but holds no tables yet — the data-mirror tables are
-// added by activateMirror when the mirror is enabled.
+// openCompanion opens (creating if needed) the SQLite companion file at path —
+// always a real file, never in-memory. The handle is configured but holds no
+// tables yet; the data-mirror tables are added by activateMirror.
 func openCompanion(path string) (*sqliteMirror, error) {
-	dsn := path
-	if dsn == "" {
-		dsn = ":memory:"
+	// The companion file lives inside WALPath, and openCompanion runs before
+	// openWAL creates that directory — so ensure the parent exists first.
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("companion: mkdir %q: %w", filepath.Dir(path), err)
 	}
-	// A file companion may name a directory that does not exist yet — the default
-	// lives inside WALPath, and openCompanion runs before openWAL creates it — so
-	// ensure the parent exists before opening.
-	if dsn != ":memory:" {
-		if err := os.MkdirAll(filepath.Dir(dsn), 0o755); err != nil {
-			return nil, fmt.Errorf("companion: mkdir %q: %w", filepath.Dir(dsn), err)
-		}
-	}
-	sdb, err := sql.Open("sqlite", dsn)
+	sdb, err := sql.Open("sqlite", path)
 	if err != nil {
-		return nil, fmt.Errorf("companion: open %q: %w", dsn, err)
+		return nil, fmt.Errorf("companion: open %q: %w", path, err)
 	}
 	// One connection: SQLite is a single writer, the drain is single-threaded, and
 	// it keeps the page cache warm across drains.
 	sdb.SetMaxOpenConns(1)
-	// The durability/concurrency pragmas matter only for a file-backed companion;
-	// an in-memory DB has no journal to mode-switch, so skip them there.
-	if dsn != ":memory:" {
-		for _, pragma := range []string{
-			"PRAGMA journal_mode=WAL",
-			"PRAGMA synchronous=NORMAL",
-			"PRAGMA busy_timeout=5000",
-		} {
-			if _, err := sdb.Exec(pragma); err != nil {
-				sdb.Close()
-				return nil, fmt.Errorf("companion: %q: %w", pragma, err)
-			}
+	for _, pragma := range []string{
+		"PRAGMA journal_mode=WAL",
+		"PRAGMA synchronous=NORMAL",
+		"PRAGMA busy_timeout=5000",
+	} {
+		if _, err := sdb.Exec(pragma); err != nil {
+			sdb.Close()
+			return nil, fmt.Errorf("companion: %q: %w", pragma, err)
 		}
 	}
 	comp := &sqliteMirror{sdb: sdb, tables: map[uint16]*drainTable{}}
@@ -97,9 +85,9 @@ func openCompanion(path string) (*sqliteMirror, error) {
 	return comp, nil
 }
 
-// ensureOps creates the operational tables present in every companion, in every
-// mode (memory-only included): today the _hz_events log; periodic /meta samples
-// land here later. Run by openCompanion, before any mirror activation.
+// ensureOps creates the companion's operational tables: today the _hz_events log;
+// periodic /meta samples land here later. Run by openCompanion, before any mirror
+// activation.
 func (m *sqliteMirror) ensureOps() error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS _hz_events (
@@ -395,7 +383,7 @@ func (db *DB) drainSegment(n uint64, path string) error {
 	return nil
 }
 
-// applyRecord mirrors replayWAL's dispatch, but writes to SQLite instead of the
+// applyRecord mirrors applyReplayRecord's dispatch, but writes to SQLite instead of the
 // in-memory store. Single-threaded (drain only), so the tables map is mutated
 // without a lock.
 func (m *sqliteMirror) applyRecord(tx *sql.Tx, recType uint8, payload []byte) error {

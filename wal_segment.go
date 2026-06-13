@@ -84,12 +84,6 @@ func removeStaleTemps(dir string) error {
 	return nil
 }
 
-// replayAll replays every segment in ascending order into apply. Each segment is
-// read through its own short-lived handle.
-func (w *wal) replayAll(apply func(recType uint8, payload []byte) error, onCorrupt func(seg uint64, err error)) error {
-	return w.replaySegments(0, apply, onCorrupt)
-}
-
 // replayFrom replays only segments numbered above minSeg, ascending. Used by
 // SQLite-backed recovery: segments at or below the drained cursor are already in
 // the mirror and must not be re-applied to memory.

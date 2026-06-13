@@ -73,10 +73,10 @@ type DB struct {
 	compactStop chan struct{}
 	compactDone chan struct{}
 
-	// sq is the SQLite companion — always present (an in-memory DB when
-	// CompanionPath is empty). It holds operational data (the _hz_events log) and,
-	// when mirrorOn, the data mirror: the drain feeds sealed WAL segments into it
-	// and it is the recovery base. drainStop/drainDone drive that goroutine,
+	// sq is the SQLite companion — a file next to the WAL, opened only when WAL is
+	// on (nil otherwise; operational events then go to the log). It holds the
+	// _hz_events log and the data mirror: the drain feeds sealed WAL segments into
+	// it and it is the recovery base. drainStop/drainDone drive that goroutine,
 	// mirroring the merger. See docs/durability.md.
 	sq        *sqliteMirror
 	mirrorOn  bool
@@ -105,63 +105,50 @@ func Open(opts Options) (*DB, error) {
 		scratch:  newScratchPool(),
 	}
 	db.cat.Store(cat)
-	// The SQLite companion is always present (an in-memory DB when CompanionPath
-	// is empty), so operational data (the _hz_events log) never depends on WAL or
-	// mirror state.
-	comp, err := openCompanion(opts.CompanionPath)
-	if err != nil {
-		return nil, err
-	}
-	db.sq = comp
-
+	// The SQLite companion lives next to the WAL, as a file, and exists only when
+	// WAL is on (no WAL → no companion; operational events go to the log instead).
 	if opts.walEnabled() {
 		w, err := openWAL(opts.WALPath)
 		if err != nil {
+			return nil, err
+		}
+		comp, err := openCompanion(opts.CompanionPath)
+		if err != nil {
+			w.close()
+			return nil, err
+		}
+		db.sq = comp
+		db.mirrorOn = true
+		// Recover before starting the flusher, so no background flush races a replay
+		// reader. The companion is the compacted base: load it into memory, then
+		// replay only the undrained WAL tail (segments past the drained cursor) on top.
+		if err := comp.activateMirror(db.cat.Load()); err != nil {
+			w.close()
 			comp.close()
 			return nil, err
 		}
-		// Recover from existing segments before starting the flusher, so no
-		// background flush races a replay reader.
-		if opts.mirrorEnabled() {
-			// Mirror-backed recovery: the companion is the compacted base. Load it
-			// into memory, then replay only the undrained WAL tail (segments past
-			// the drained cursor) on top.
-			if err := comp.activateMirror(db.cat.Load()); err != nil {
-				w.close()
-				comp.close()
-				return nil, err
-			}
-			db.mirrorOn = true
-			if err := db.recoverFromSQLite(); err != nil {
-				w.close()
-				comp.close()
-				return nil, err
-			}
-			if err := w.removeDrainedSegments(comp.lastDrained); err != nil {
-				w.close()
-				comp.close()
-				return nil, err
-			}
-			if err := w.replayFrom(comp.lastDrained, db.applyReplayRecord, db.onWALCorrupt); err != nil {
-				w.close()
-				comp.close()
-				return nil, err
-			}
-			// Keep segment numbers above the drained cursor across restarts: the
-			// drain deletes the segments it consumes, so the highest on-disk segment
-			// can fall below lastDrained. Without this, a post-restart flush could
-			// reuse a number <= lastDrained that drainOnce would skip forever —
-			// those writes would never reach the mirror and be lost on next recovery.
-			if w.seg < comp.lastDrained {
-				w.seg = comp.lastDrained
-			}
-		} else {
-			// WAL-only (no companion path): the WAL segments replay into memory.
-			if err := db.replayWAL(w); err != nil {
-				w.close()
-				comp.close()
-				return nil, err
-			}
+		if err := db.recoverFromSQLite(); err != nil {
+			w.close()
+			comp.close()
+			return nil, err
+		}
+		if err := w.removeDrainedSegments(comp.lastDrained); err != nil {
+			w.close()
+			comp.close()
+			return nil, err
+		}
+		if err := w.replayFrom(comp.lastDrained, db.applyReplayRecord, db.onWALCorrupt); err != nil {
+			w.close()
+			comp.close()
+			return nil, err
+		}
+		// Keep segment numbers above the drained cursor across restarts: the drain
+		// deletes the segments it consumes, so the highest on-disk segment can fall
+		// below lastDrained. Without this, a post-restart flush could reuse a number
+		// <= lastDrained that drainOnce would skip forever — those writes would never
+		// reach the mirror and be lost on next recovery.
+		if w.seg < comp.lastDrained {
+			w.seg = comp.lastDrained
 		}
 		db.wal = w
 		w.startFlusher(opts.walFlushInterval)
@@ -169,7 +156,7 @@ func Open(opts Options) (*DB, error) {
 		// the live rows now, so reads are index-fast before serving.
 		db.rebuildAllIndexes()
 
-		if db.mirrorOn && opts.drainInterval > 0 {
+		if opts.drainInterval > 0 {
 			db.startDrainLoop(opts.drainInterval)
 		}
 	}
@@ -585,18 +572,12 @@ func (db *DB) onWALCorrupt(seg uint64, err error) {
 	db.logEvent("error", "wal-corruption", fmt.Sprintf("segment %d during recovery: %v — good prefix recovered, suffix skipped", seg, err))
 }
 
-// replayWAL rebuilds state from the log. It is single-threaded (runs inside
-// Open before the DB is returned), so it mutates the catalog directly via the
-// atomic pointer. Catalog records (CREATE/DROP) come before any mutation that
-// references the table, so a mutation always resolves against an
-// already-rebuilt catalog.
-func (db *DB) replayWAL(w *wal) error {
-	return w.replayAll(db.applyReplayRecord, db.onWALCorrupt)
-}
-
 // applyReplayRecord applies one decoded WAL record to the in-memory store during
-// recovery. Shared by full replay (replayWAL) and SQLite-backed tail replay
-// (replayFrom): catalog records rebuild the catalog, mutations re-apply rows.
+// recovery. It is single-threaded (runs inside Open before the DB is returned),
+// so it mutates the catalog directly via the atomic pointer; catalog records
+// (CREATE/DROP) precede any mutation referencing the table, so a mutation always
+// resolves against an already-rebuilt catalog. Driven by the undrained-tail
+// replay (replayFrom): catalog records rebuild the catalog, mutations re-apply rows.
 func (db *DB) applyReplayRecord(recType uint8, payload []byte) error {
 	switch recType {
 	case recCreateTable:

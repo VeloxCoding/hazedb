@@ -112,46 +112,6 @@ func TestFileCompanionIsStandardSQLite(t *testing.T) {
 	}
 }
 
-// Ops logging is independent of data durability: with NO WAL but a file
-// companion, data lives only in RAM (lost on restart) while _hz_events persists
-// and accumulates across sessions.
-func TestFileCompanionEventsSurviveMemoryOnly(t *testing.T) {
-	dir := t.TempDir()
-	comp := filepath.Join(dir, "ops.db")
-	openOps := func() *DB {
-		db, err := Open(Options{Schema: testSchema(), CompanionPath: comp}) // no WAL
-		if err != nil {
-			t.Fatal(err)
-		}
-		return db
-	}
-
-	db := openOps()
-	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "ephemeral", 1); err != nil {
-		t.Fatal(err)
-	}
-	db.logEvent("info", "boot", "session one")
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	db2 := openOps()
-	defer db2.Close()
-	// Data is gone — memory-only, no WAL ...
-	if got := countUsers(t, db2); got != 0 {
-		t.Fatalf("memory-only data must not survive restart: got %d rows, want 0", got)
-	}
-	// ... but the event from session one persisted in the companion file.
-	db2.logEvent("info", "boot", "session two")
-	var n int
-	if err := db2.sq.sdb.QueryRow(`SELECT count(*) FROM _hz_events WHERE kind='boot'`).Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	if n != 2 {
-		t.Fatalf("boot events across two memory-only sessions: got %d, want 2", n)
-	}
-}
-
 // With WAL on and CompanionPath left empty, the companion defaults to a file
 // "hazedb.db" inside WALPath, the mirror is on, and data persists across a
 // restart through that default file — the zero-config durable shape.

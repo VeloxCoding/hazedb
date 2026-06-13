@@ -5,10 +5,8 @@ import (
 	"testing"
 )
 
-// applyDefaults resolves an empty CompanionPath to a FILE: inside WALPath when WAL
-// is on, and to the working-directory default otherwise. (The test init sets the
-// no-WAL default to ":memory:", so that branch resolves to ":memory:" here; the
-// production default is the real file asserted below.)
+// applyDefaults gives the companion a file path inside WALPath when WAL is on,
+// and leaves it empty (no companion) when there is no WAL — never in-memory.
 func TestCompanionDefaultResolution(t *testing.T) {
 	walOn := Options{WALPath: "/var/lib/hz/wal"}
 	walOn.applyDefaults()
@@ -16,19 +14,14 @@ func TestCompanionDefaultResolution(t *testing.T) {
 		t.Fatalf("WAL-on companion: got %q, want %q", walOn.CompanionPath, want)
 	}
 
-	walOff := Options{}
-	walOff.applyDefaults()
-	if walOff.CompanionPath != noWALCompanionDefault {
-		t.Fatalf("WAL-off companion: got %q, want the no-WAL default %q", walOff.CompanionPath, noWALCompanionDefault)
-	}
-
-	// Production's no-WAL default is a real file, not in-memory.
-	if defaultCompanionFile != "hazedb.db" {
-		t.Fatalf("default companion file: got %q, want hazedb.db", defaultCompanionFile)
+	noWAL := Options{}
+	noWAL.applyDefaults()
+	if noWAL.CompanionPath != "" {
+		t.Fatalf("no-WAL companion: got %q, want empty (no companion, no in-memory)", noWAL.CompanionPath)
 	}
 
 	// An explicit path is left untouched.
-	explicit := Options{CompanionPath: "/data/ops.db"}
+	explicit := Options{WALPath: "/x/wal", CompanionPath: "/data/ops.db"}
 	explicit.applyDefaults()
 	if explicit.CompanionPath != "/data/ops.db" {
 		t.Fatalf("explicit companion path overwritten: %q", explicit.CompanionPath)
