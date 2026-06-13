@@ -3,6 +3,7 @@ package hazedb
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -56,6 +57,15 @@ const flushMaxBytes = 1 << 20 // 1 MiB
 
 // crc32c is the Castagnoli table used for every envelope checksum.
 var crc32c = crc32.MakeTable(crc32.Castagnoli)
+
+// errWALFraming marks a record whose ENVELOPE is unreadable — a bad magic or a
+// CRC mismatch on a fully-present record. This is bit-rot: the bytes are garbage
+// and no binary can recover them, so recovery and the drain apply the good prefix
+// before it, log, and skip the rest of the segment. It is deliberately distinct
+// from a version mismatch (ErrWALVersion) and from an undecodable but CRC-valid
+// payload (ErrWALCorrupt) — both of those carry intact, intentional bytes and
+// stay FATAL, because silently dropping a committed record is a data-loss bug.
+var errWALFraming = errors.New("hazedb: WAL framing corrupt")
 
 // appendU16LE appends v little-endian.
 func appendU16LE(b []byte, v uint16) []byte { return append(b, byte(v), byte(v>>8)) }
@@ -266,12 +276,15 @@ func (w *wal) replayFile(f *os.File, apply func(recType uint8, payload []byte) e
 // (type, payload) to apply. Pure — it touches no WAL state, so a drainer can
 // scan a segment without disturbing the live WAL.
 //
-// Tail tolerance is narrow: a SHORT read (truncated header/payload) or a
-// declared length past EOF is the incomplete tail of an interrupted write and is
-// discarded. A wrong magic, a non-current version, or a CRC mismatch on a
-// fully-present record is hard corruption and aborts the caller — never skipped.
-// Because every seg-*.wal is sealed atomically, a sealed segment should never
-// present a torn tail; the tolerance covers only odd truncation, not data loss.
+// Tail tolerance is narrow: a SHORT read (truncated header/payload) or a declared
+// length past EOF is the incomplete tail of an interrupted write and is discarded
+// (returns nil). A non-current version returns ErrWALVersion, and an apply() error
+// (an undecodable but CRC-valid payload, or an unknown record type) propagates
+// unchanged — both are FATAL: the bytes are intact/intentional, so the caller must
+// STOP, never silently drop a committed record. A bad magic or a CRC mismatch on a
+// fully-present record is different — it is bit-rot — and returns errWALFraming
+// after every good record before it has been applied; the framing is unreadable
+// past that point, so the caller logs and skips the rest of the segment.
 // payload aliases the read buffer; the caller's decoders copy what they keep.
 func scanRecords(f *os.File, apply func(recType uint8, payload []byte) error) error {
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
@@ -306,10 +319,10 @@ func scanRecords(f *os.File, apply func(recType uint8, payload []byte) error) er
 		version := hdr[3]
 		length := binary.LittleEndian.Uint32(hdr[4:8])
 		if magic != walMagic {
-			return fmt.Errorf("%w: bad magic %#04x at offset %d", ErrWALCorrupt, magic, pos-8)
+			return fmt.Errorf("%w: bad magic %#04x at offset %d", errWALFraming, magic, pos-8)
 		}
 		if version != walVersion {
-			return fmt.Errorf("%w: record version %d != supported %d — shut the old binary down cleanly (which seals + drains the WAL) before upgrading", ErrWALCorrupt, version, walVersion)
+			return fmt.Errorf("%w: record version %d != supported %d — shut the old binary down cleanly (which seals + drains the WAL) before upgrading", ErrWALVersion, version, walVersion)
 		}
 		// Bounds-check before allocating: a torn/corrupt tail can carry a bogus
 		// huge length. If payload+crc can't fit in what remains, it is the
@@ -334,7 +347,7 @@ func scanRecords(f *os.File, apply func(recType uint8, payload []byte) error) er
 		crc := binary.LittleEndian.Uint32(buf[length:])
 		want := crc32.Update(crc32.Update(0, crc32c, hdr[:]), crc32c, payload)
 		if want != crc {
-			return fmt.Errorf("%w: crc mismatch at offset %d", ErrWALCorrupt, pos-int64(length)-4-8)
+			return fmt.Errorf("%w: crc mismatch at offset %d", errWALFraming, pos-int64(length)-4-8)
 		}
 		if err := apply(recType, payload); err != nil {
 			return err

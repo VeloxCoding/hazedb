@@ -14,6 +14,7 @@ package hazedb
 import (
 	"database/sql"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -290,6 +291,16 @@ func (db *DB) drainOnce() error {
 
 // drainSegment applies one sealed segment's records to SQLite in a single
 // transaction and advances the durable cursor in that same transaction.
+//
+// A bit-rot segment (bad magic / CRC mismatch — errWALFraming) is not fatal: the
+// good prefix already in the transaction is committed, the cursor advances past
+// the WHOLE segment, and the unreadable suffix is dropped with a logged event — so
+// random corruption can never stall the mirror (the old code rolled back and the
+// loop retried the same segment forever). Any OTHER error — a transient SQLite/IO
+// failure, or an intact-but-unhandleable record (version, unknown type, a
+// CRC-valid payload that won't decode) — rolls back and leaves the cursor unmoved,
+// so the loop retries on the next tick rather than silently dropping a committed
+// record.
 func (db *DB) drainSegment(n uint64, path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -303,9 +314,12 @@ func (db *DB) drainSegment(n uint64, path string) error {
 	applyErr := scanRecords(f, func(recType uint8, payload []byte) error {
 		return db.sq.applyRecord(tx, recType, payload)
 	})
-	if applyErr != nil {
+	if applyErr != nil && !errors.Is(applyErr, errWALFraming) {
 		tx.Rollback()
 		return fmt.Errorf("mirror: drain segment %d: %w", n, applyErr)
+	}
+	if applyErr != nil {
+		db.logEvent("wal-corruption", fmt.Sprintf("segment %d during drain: %v — good prefix mirrored, suffix skipped", n, applyErr))
 	}
 	if _, err := tx.Exec(
 		`INSERT INTO _hz_meta (k, v) VALUES ('last_drained_segment', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`,
@@ -458,10 +472,14 @@ func (db *DB) startDrainLoop(interval time.Duration) {
 				// Final drain: seal the pending buffer so its records reach the
 				// mirror, then drain every sealed segment.
 				_ = db.wal.flush()
-				_ = db.drainOnce()
+				if err := db.drainOnce(); err != nil {
+					db.logEvent("drain-error", err.Error())
+				}
 				return
 			case <-t.C:
-				_ = db.drainOnce()
+				if err := db.drainOnce(); err != nil {
+					db.logEvent("drain-error", err.Error())
+				}
 			}
 		}
 	}()

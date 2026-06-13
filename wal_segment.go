@@ -7,6 +7,7 @@ package hazedb
 // complete, so listing and replay never have to skip a file being written.
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -85,19 +86,25 @@ func removeStaleTemps(dir string) error {
 
 // replayAll replays every segment in ascending order into apply. Each segment is
 // read through its own short-lived handle.
-func (w *wal) replayAll(apply func(recType uint8, payload []byte) error) error {
-	return w.replaySegments(0, apply)
+func (w *wal) replayAll(apply func(recType uint8, payload []byte) error, onCorrupt func(seg uint64, err error)) error {
+	return w.replaySegments(0, apply, onCorrupt)
 }
 
 // replayFrom replays only segments numbered above minSeg, ascending. Used by
 // SQLite-backed recovery: segments at or below the drained cursor are already in
 // the mirror and must not be re-applied to memory.
-func (w *wal) replayFrom(minSeg uint64, apply func(recType uint8, payload []byte) error) error {
-	return w.replaySegments(minSeg, apply)
+func (w *wal) replayFrom(minSeg uint64, apply func(recType uint8, payload []byte) error, onCorrupt func(seg uint64, err error)) error {
+	return w.replaySegments(minSeg, apply, onCorrupt)
 }
 
-// replaySegments replays segments with number > minSeg, ascending.
-func (w *wal) replaySegments(minSeg uint64, apply func(recType uint8, payload []byte) error) error {
+// replaySegments replays segments with number > minSeg, ascending. A segment
+// whose framing is bit-rot (bad magic / CRC mismatch, i.e. errWALFraming) applies
+// its good prefix, reports the break via onCorrupt, and is skipped from that point
+// on — recovery continues with the next segment instead of aborting. Every other
+// error is fatal: a version mismatch, an unknown record type, or an undecodable
+// but CRC-valid payload all carry intact, intentional bytes, so aborting Open is
+// correct — silently dropping a committed record would be a data-loss bug.
+func (w *wal) replaySegments(minSeg uint64, apply func(recType uint8, payload []byte) error, onCorrupt func(seg uint64, err error)) error {
 	segs, err := listSegments(w.dir)
 	if err != nil {
 		return err
@@ -112,7 +119,12 @@ func (w *wal) replaySegments(minSeg uint64, apply func(recType uint8, payload []
 		}
 		err = w.replayFile(f, apply)
 		f.Close()
-		if err != nil {
+		switch {
+		case errors.Is(err, errWALFraming):
+			if onCorrupt != nil {
+				onCorrupt(n, err)
+			}
+		case err != nil:
 			return err
 		}
 	}

@@ -12,6 +12,7 @@ var (
 	ErrParse         = errors.New("hazedb: parse error")
 	ErrUnindexedJoin = errors.New("hazedb: JOIN requires an index on the join column")
 	ErrWALCorrupt    = errors.New("hazedb: WAL corrupted")
+	ErrWALVersion    = errors.New("hazedb: WAL version mismatch")
 	ErrTableExists   = errors.New("hazedb: table already exists")
 	ErrTxUnsupported = errors.New("hazedb: operation not supported in a transaction")
 	ErrBatchTooLarge = errors.New("hazedb: atomic batch too large")

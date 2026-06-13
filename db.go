@@ -129,7 +129,7 @@ func Open(opts Options) (*DB, error) {
 				m.close()
 				return nil, err
 			}
-			if err := w.replayFrom(m.lastDrained, db.applyReplayRecord); err != nil {
+			if err := w.replayFrom(m.lastDrained, db.applyReplayRecord, db.onWALCorrupt); err != nil {
 				w.close()
 				m.close()
 				return nil, err
@@ -564,13 +564,20 @@ func (db *DB) prepare(sql string, cat *catalog) (*plan, error) {
 	return pl, nil
 }
 
+// onWALCorrupt records a corrupt segment found during recovery. Every record
+// before the break was already applied; the unparseable suffix is skipped and
+// recovery continues with the next segment rather than aborting Open.
+func (db *DB) onWALCorrupt(seg uint64, err error) {
+	db.logEvent("wal-corruption", fmt.Sprintf("segment %d during recovery: %v — good prefix recovered, suffix skipped", seg, err))
+}
+
 // replayWAL rebuilds state from the log. It is single-threaded (runs inside
 // Open before the DB is returned), so it mutates the catalog directly via the
 // atomic pointer. Catalog records (CREATE/DROP) come before any mutation that
 // references the table, so a mutation always resolves against an
 // already-rebuilt catalog.
 func (db *DB) replayWAL(w *wal) error {
-	return w.replayAll(db.applyReplayRecord)
+	return w.replayAll(db.applyReplayRecord, db.onWALCorrupt)
 }
 
 // applyReplayRecord applies one decoded WAL record to the in-memory store during

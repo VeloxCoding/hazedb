@@ -304,8 +304,108 @@ func TestWALRejectsForeignVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := Open(Options{Schema: testSchema(), WALPath: path}); !errors.Is(err, ErrWALCorrupt) {
-		t.Fatalf("Open with a stale-version WAL: want ErrWALCorrupt, got %v", err)
+	if _, err := Open(Options{Schema: testSchema(), WALPath: path}); !errors.Is(err, ErrWALVersion) {
+		t.Fatalf("Open with a stale-version WAL: want ErrWALVersion, got %v", err)
+	}
+}
+
+// TestRecoverySkipsCorruptSuffix: a CRC-broken record mid-segment is real
+// corruption (born-sealed segments are atomic, so it is bit-rot, not a torn
+// tail). Recovery must apply the good prefix before it, skip the unreadable
+// suffix, and still Open — never abort the process. Contrast a version mismatch,
+// which DOES abort (TestWALRejectsForeignVersion).
+func TestRecoverySkipsCorruptSuffix(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+	db, err := Open(Options{Schema: testSchema(), WALPath: path, walFlushInterval: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 5; i++ {
+		if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "n", i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil { // seals all five records into one segment
+		t.Fatal(err)
+	}
+
+	// Flip the final byte: the last record's CRC no longer matches its payload.
+	// Records 1..4 stay intact; record 5 becomes the corrupt suffix.
+	corruptLastByte(t, walSegmentFile(t, path))
+
+	db2, err := Open(Options{Schema: testSchema(), WALPath: path, walFlushInterval: -1})
+	if err != nil {
+		t.Fatalf("Open must survive a corrupt suffix, got: %v", err)
+	}
+	defer db2.Close()
+	if got := countUsers(t, db2); got != 4 {
+		t.Fatalf("recovered rows: got %d, want 4 (good prefix only; corrupt 5th skipped)", got)
+	}
+}
+
+// TestDrainSkipsCorruptSegment: the drain must not stall on a corrupt segment. It
+// commits the good prefix, advances the cursor past the whole segment, and
+// continues — where the old code swallowed the error and retried the same
+// segment forever, freezing the mirror.
+func TestDrainSkipsCorruptSegment(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+	sqPath := filepath.Join(dir, "mirror.db")
+	db, err := Open(Options{
+		Schema: testSchema(), WALPath: walDir, SQLitePath: sqPath,
+		walFlushInterval: -1, drainInterval: -1, // manual flush + manual drain
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for i := 1; i <= 5; i++ {
+		if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "n", i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.wal.flush(); err != nil { // seal one segment
+		t.Fatal(err)
+	}
+	corruptLastByte(t, walSegmentFile(t, walDir))
+
+	if err := db.drainOnce(); err != nil {
+		t.Fatalf("drainOnce must not error on a corrupt segment: %v", err)
+	}
+	if db.sq.lastDrained == 0 {
+		t.Fatal("drain cursor did not advance past the corrupt segment (mirror would stall)")
+	}
+	var n int
+	if err := db.sq.sdb.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 4 {
+		t.Fatalf("mirror rows: got %d, want 4 (good prefix drained, corrupt 5th skipped)", n)
+	}
+}
+
+// corruptLastByte flips the final byte of a segment file, breaking the last
+// record's CRC while leaving every record before it intact.
+func corruptLastByte(t *testing.T, seg string) {
+	t.Helper()
+	f, err := os.OpenFile(seg, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := fi.Size() - 1
+	var b [1]byte
+	if _, err := f.ReadAt(b[:], last); err != nil {
+		t.Fatal(err)
+	}
+	b[0] ^= 0xFF
+	if _, err := f.WriteAt(b[:], last); err != nil {
+		t.Fatal(err)
 	}
 }
 
