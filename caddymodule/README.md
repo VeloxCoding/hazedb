@@ -66,8 +66,9 @@ xcaddy build --with github.com/VeloxCoding/hazedb/caddymodule
 :8080 {
     handle /db/* {
         hazedb {
-            wal_path       /var/lib/hazedb/wal      # WAL directory; set = durable (crash loses ≤~0.5s), unset = memory-only
-            sqlite_path    /var/lib/hazedb/hazedb.db # on-disk SQLite mirror (recovery base; requires wal_path)
+            wal            on                        # on (default) = durable (crash loses ≤~0.5s); off = memory-only
+            wal_path       /var/lib/hazedb/wal       # optional: override the WAL directory. Default <caddy-data-dir>/hazedb/wal
+            companion_path /var/lib/hazedb/hazedb.db # optional: on-disk SQLite companion (events/health always, + data mirror when wal is on). Default <caddy-data-dir>/hazedb/hazedb.db (or next to wal_path)
             init_sql       /etc/hazedb/schema.sql   # CREATE TABLE + seed, run once at startup
             registry_name  default                  # name the *DB is published under for the PHP extension
             max_body_bytes 4194304                  # POST body cap for /query and /exec (default 4 MiB)
@@ -77,7 +78,7 @@ xcaddy build --with github.com/VeloxCoding/hazedb/caddymodule
 }
 ```
 
-All subdirectives are optional. With `wal_path` unset the store is memory-only.
+All subdirectives are optional. By default the store is durable (`wal on`): with nothing set, the WAL and the SQLite companion both live under `<caddy-data-dir>/hazedb/` (e.g. `/var/lib/caddy/hazedb/` under systemd). Set `wal off` for a memory-only store.
 The WAL has one durability story — writes seal to disk within ~0.5s, so a crash
 loses at most that window; there are no durability levels or fsync modes. Tables
 are created at runtime: put your `CREATE TABLE` statements in the `init_sql`

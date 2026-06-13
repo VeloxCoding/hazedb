@@ -15,9 +15,10 @@
 //
 // WAL + reload caveat: with wal_path set, Caddy config reload runs the new
 // Provision (which opens the same file) before the old Cleanup (which closes
-// it) — two writers on one WAL file for that window. Memory mode (no wal_path)
-// reloads cleanly. For durable deployments, restart rather than graceful-reload
-// when changing this handler.
+// it) — two writers on one WAL file for that window. Since WAL is on by default,
+// this applies to a default deployment; memory mode (wal off) reloads cleanly.
+// For durable deployments, restart rather than graceful-reload when changing
+// this handler.
 package caddymodule
 
 import (
@@ -26,6 +27,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,13 +41,21 @@ import (
 
 // Handler is the Caddy HTTP handler that embeds hazedb.
 type Handler struct {
-	// WALPath is the directory holding the write-ahead log segments. Setting it
-	// turns the WAL ON (a write is sealed to disk within ~0.5s, so a crash loses
-	// at most that window); leaving it empty is memory-only.
+	// WAL switches the write-ahead log on or off. "on" (the default; empty means
+	// the default) makes the store durable: a write is sealed to disk within ~0.5s,
+	// so a crash loses at most that window. "off" is memory-only — nothing persists
+	// across a restart.
+	WAL string `json:"wal,omitempty"`
+	// WALPath optionally overrides the directory holding the WAL segments. Empty
+	// uses the default <caddy-data-dir>/hazedb/wal. Ignored when wal is off.
 	WALPath string `json:"wal_path,omitempty"`
-	// SQLitePath enables the on-disk SQLite mirror at this path (queryable export
-	// + recovery base). Empty = no mirror. Requires wal_path.
-	SQLitePath string `json:"sqlite_path,omitempty"`
+	// CompanionPath optionally overrides where the SQLite companion file lives —
+	// always a real file on disk, present whether wal is on or off. It holds the
+	// _hz_events operational log (logging, health) in every mode, plus the data
+	// mirror and recovery base when wal is on. Empty defaults to
+	// <caddy-data-dir>/hazedb/hazedb.db, or <wal_path>/hazedb.db when a custom
+	// wal_path is set. An in-memory path (:memory:) is rejected — never in-memory.
+	CompanionPath string `json:"companion_path,omitempty"`
 	// InitSQL is an absolute path to a .sql file run once at Provision, before
 	// Caddy serves — typically CREATE TABLE + seed rows. Statements are split on
 	// ';'; do not put a semicolon inside a string literal in this file.
@@ -102,6 +112,33 @@ func (h *Handler) applyDefaults() error {
 		h.RegistryName = defaultRegistryName
 	}
 	h.name = h.RegistryName
+	switch strings.ToLower(h.WAL) {
+	case "", "on", "off":
+	default:
+		return fmt.Errorf("hazedb: wal must be \"on\" or \"off\", got %q", h.WAL)
+	}
+	// The WAL is on by default; the store is durable and self-locating unless the
+	// operator turns it off. base is Caddy's per-OS data dir (e.g. /var/lib/caddy
+	// under systemd), and everything hazedb lands under <base>/hazedb:
+	//   - default (wal on, no wal_path) → WAL in <base>/hazedb/wal, companion at
+	//     <base>/hazedb/hazedb.db: the segments and the db file share one folder.
+	//   - custom wal_path → the companion follows it (the core defaults the
+	//     companion to <wal_path>/hazedb.db) unless companion_path is set.
+	//   - wal off → memory-only; the companion still lands at <base>/hazedb.
+	base := filepath.Join(caddy.AppDataDir(), "hazedb")
+	if strings.EqualFold(h.WAL, "off") {
+		if h.WALPath != "" {
+			return fmt.Errorf("hazedb: wal off conflicts with wal_path %q (remove one)", h.WALPath)
+		}
+		if h.CompanionPath == "" {
+			h.CompanionPath = filepath.Join(base, "hazedb.db")
+		}
+	} else if h.WALPath == "" {
+		h.WALPath = filepath.Join(base, "wal")
+		if h.CompanionPath == "" {
+			h.CompanionPath = filepath.Join(base, "hazedb.db")
+		}
+	}
 	return nil
 }
 
@@ -112,10 +149,10 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		return err
 	}
 	opts := hazedb.Options{
-		Schema:     hazedb.Schema{}, // tables created at runtime (init_sql / POST /exec)
-		WALPath:    h.WALPath,
-		SQLitePath: h.SQLitePath,
-		MaxBytes:   h.MaxBytes,
+		Schema:        hazedb.Schema{}, // tables created at runtime (init_sql / POST /exec)
+		WALPath:       h.WALPath,
+		CompanionPath: h.CompanionPath,
+		MaxBytes:      h.MaxBytes,
 	}
 	db, err := hazedb.Open(opts)
 	if err != nil {
@@ -449,8 +486,9 @@ func writeJSON(w http.ResponseWriter, status int, body []byte) {
 // UnmarshalCaddyfile parses the `hazedb` handler directive. Example:
 //
 //	hazedb {
-//	    wal_path        /var/lib/hazedb/wal
-//	    sqlite_path     /var/lib/hazedb/hazedb.db
+//	    wal             on                       # on (default) | off (memory-only)
+//	    wal_path        /var/lib/hazedb/wal      # optional: override the WAL directory
+//	    companion_path  /var/lib/hazedb/hazedb.db
 //	    init_sql        /etc/hazedb/schema.sql
 //	    registry_name   default
 //	    max_bytes       1073741824
@@ -467,10 +505,12 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			value := d.Val()
 			switch key {
+			case "wal":
+				h.WAL = value
 			case "wal_path":
 				h.WALPath = value
-			case "sqlite_path":
-				h.SQLitePath = value
+			case "companion_path":
+				h.CompanionPath = value
 			case "init_sql":
 				h.InitSQL = value
 			case "registry_name":

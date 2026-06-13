@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -35,7 +36,7 @@ func do(t *testing.T, h *Handler, path, body string) (*httptest.ResponseRecorder
 // The module provisions in memory, runs the full DDL→insert→query path over
 // HTTP, and publishes the *DB under "default" for in-process consumers.
 func TestModuleEndToEnd(t *testing.T) {
-	h := &Handler{}
+	h := &Handler{WAL: "off"}
 	if err := h.Provision(caddy.Context{}); err != nil {
 		t.Fatalf("provision: %v", err)
 	}
@@ -81,7 +82,7 @@ func TestModuleEndToEnd(t *testing.T) {
 // GET /meta returns the store-size overview; a non-GET is rejected. The size
 // estimate must track payload weight (a 1 KB-text table outweighs an int table).
 func TestModuleMeta(t *testing.T) {
-	h := &Handler{}
+	h := &Handler{WAL: "off"}
 	if err := h.Provision(caddy.Context{}); err != nil {
 		t.Fatalf("provision: %v", err)
 	}
@@ -139,7 +140,7 @@ func TestModuleMeta(t *testing.T) {
 // (Insufficient Storage), not 400 — the client must free space, not fix a bad
 // request.
 func TestModuleMaxBytes507(t *testing.T) {
-	h := &Handler{MaxBytes: 600} // a few (uuid,int) rows fit, then it is full
+	h := &Handler{WAL: "off", MaxBytes: 600} // a few (uuid,int) rows fit, then it is full
 	if err := h.Provision(caddy.Context{}); err != nil {
 		t.Fatalf("provision: %v", err)
 	}
@@ -167,7 +168,7 @@ func TestModuleMaxBytes507(t *testing.T) {
 
 // Cleanup must clear the registry slot so a removed handler leaves no instance.
 func TestModuleCleanupDeregisters(t *testing.T) {
-	h := &Handler{}
+	h := &Handler{WAL: "off"}
 	if err := h.Provision(caddy.Context{}); err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +186,7 @@ func TestModuleCleanupDeregisters(t *testing.T) {
 // TestBodyLimit: a POST body over MaxBodyBytes is rejected with 413 instead of
 // being read into memory — the memory-exhaustion DoS guard.
 func TestBodyLimit(t *testing.T) {
-	h := &Handler{MaxBodyBytes: 64} // tiny cap; Provision leaves a non-zero value alone
+	h := &Handler{WAL: "off", MaxBodyBytes: 64} // tiny cap; Provision leaves a non-zero value alone
 	if err := h.Provision(caddy.Context{}); err != nil {
 		t.Fatalf("provision: %v", err)
 	}
@@ -208,7 +209,7 @@ func TestBodyLimit(t *testing.T) {
 // rejected with 400 and that valid identifiers (incl. whitespace around a comma,
 // which is normalized) are accepted.
 func TestGetListRejectInjection(t *testing.T) {
-	h := &Handler{}
+	h := &Handler{WAL: "off"}
 	if err := h.Provision(caddy.Context{}); err != nil {
 		t.Fatalf("provision: %v", err)
 	}
@@ -259,5 +260,61 @@ func TestGetListRejectInjection(t *testing.T) {
 	}
 	if code := get("/list?table=users&cols=" + url.QueryEscape("id, name")); code != http.StatusOK {
 		t.Errorf("/list cols with spaces: got %d, want 200", code)
+	}
+}
+
+// applyDefaults pins both on-disk paths predictably. WAL is on by default: a
+// zero-config handler is durable under <caddy-data-dir>/hazedb (WAL in a wal/
+// subdir, the companion file in the parent). "wal off" is memory-only but still
+// keeps a companion. A custom wal_path leaves the companion to the core (next to
+// the WAL).
+func TestDefaultPaths(t *testing.T) {
+	base := filepath.Join(caddy.AppDataDir(), "hazedb")
+
+	// Zero-config: WAL on by default, both under base.
+	def := &Handler{}
+	if err := def.applyDefaults(); err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(base, "wal"); def.WALPath != want {
+		t.Errorf("default WALPath = %q, want %q", def.WALPath, want)
+	}
+	if want := filepath.Join(base, "hazedb.db"); def.CompanionPath != want {
+		t.Errorf("default CompanionPath = %q, want %q", def.CompanionPath, want)
+	}
+
+	// wal off: memory-only, companion still pinned.
+	off := &Handler{WAL: "off"}
+	if err := off.applyDefaults(); err != nil {
+		t.Fatal(err)
+	}
+	if off.WALPath != "" {
+		t.Errorf("wal off should leave WALPath empty (memory-only), got %q", off.WALPath)
+	}
+	if want := filepath.Join(base, "hazedb.db"); off.CompanionPath != want {
+		t.Errorf("off CompanionPath = %q, want %q", off.CompanionPath, want)
+	}
+
+	// Custom wal_path: WAL on (default), companion left empty for the core to place
+	// beside the WAL.
+	cust := &Handler{WALPath: "/srv/hz/wal"}
+	if err := cust.applyDefaults(); err != nil {
+		t.Fatal(err)
+	}
+	if cust.WALPath != "/srv/hz/wal" {
+		t.Errorf("custom WALPath overwritten: %q", cust.WALPath)
+	}
+	if cust.CompanionPath != "" {
+		t.Errorf("custom wal_path should leave CompanionPath empty, got %q", cust.CompanionPath)
+	}
+
+	// An unknown wal value is rejected.
+	if err := (&Handler{WAL: "yes"}).applyDefaults(); err == nil {
+		t.Error("wal=yes should be rejected")
+	}
+
+	// wal off together with a wal_path is contradictory and rejected.
+	if err := (&Handler{WAL: "off", WALPath: "/srv/hz/wal"}).applyDefaults(); err == nil {
+		t.Error("wal off + wal_path should be rejected as contradictory")
 	}
 }
