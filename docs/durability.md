@@ -22,11 +22,11 @@ mechanics first sketched in §4 below. Two reasons the segment approach won:
   so the "don't read a file being appended to" question disappears by construction.
 
 What shipped. WAL durability is opt-in via `Options.WALPath` (set = on, empty =
-memory-only). The **SQLite companion** is a real file holding the data mirror and
-the `_hz_events` operational log. It exists only when WAL is on, sitting next to
-the WAL at `<WALPath>/hazedb.db` (override the location with `Options.CompanionPath`).
-There is no in-memory companion: with no WAL there is no companion at all, and
-operational events go to the standard log instead.
+memory-only). The **SQLite companion** is **always present** — a real file on disk
+(`Options.CompanionPath`; default `hazedb.db` inside WALPath when WAL is on, else
+`hazedb.db` in the working directory). It is hazedb's always-on store: the
+`_hz_events` operational log (logging, health, later perf samples) in every mode,
+plus the data mirror and recovery base when WAL is on. Never in-memory.
 
 - **Born-sealed WAL**: `WALPath` is a directory of immutable `seg-<n>.wal` files.
   A write appends a complete record to an in-memory buffer under the WAL lock;
@@ -37,22 +37,24 @@ operational events go to the standard log instead.
   construction (a crash mid-flush leaves a `.tmp`, cleaned on open) and the log
   never grows as one unbounded file. See [wal.go](../wal.go) /
   [wal_segment.go](../wal_segment.go).
-- **SQLite companion + data mirror.** When WAL is on, the companion file
-  (`<WALPath>/hazedb.db`, or `CompanionPath`) holds the data mirror: a background
-  loop (drains on its interval, default 1s) replays each sealed segment
-  **faithfully** (one SQLite transaction per segment; INSERT/UPDATE/DELETE in WAL
-  order — *not* coalesced), recording the segment number in the same transaction
+- **SQLite companion + data mirror.** The companion is always a file
+  (`<WALPath>/hazedb.db`, the working-directory `hazedb.db`, or `CompanionPath`).
+  When WAL is on it also holds the **data mirror**: a background loop (drains on
+  its interval, default 1s) replays each sealed segment **faithfully** (one SQLite
+  transaction per segment; INSERT/UPDATE/DELETE in WAL order — *not* coalesced),
+  recording the segment number in the same transaction
   (`_hz_meta.last_drained_segment`), then **deletes the segment**, so the WAL stays
   bounded at ~the undrained tail. Every segment on disk is sealed, so there is no
-  open file to race and no age gate is needed. With no WAL there is no companion
-  and no mirror. Driver: `modernc.org/sqlite` (pure Go). See [drain.go](../drain.go).
+  open file to race and no age gate is needed. With no WAL the companion still
+  exists (events/ops only); data lives in RAM. Driver: `modernc.org/sqlite`
+  (pure Go). See [drain.go](../drain.go).
 - **Operational events** (`_hz_events`): rare operator-relevant events — a corrupt
   segment skipped, a drain failure — are recorded as rows (`ts, level, kind,
-  message`) in the companion when WAL is on; with no WAL they go to the standard
-  log. A dashboard reads the table with a plain `SELECT`. Metrics and per-request
-  counters do NOT go here; high-frequency occurrences are counted, not logged per
-  event. The `_hz_` table-name prefix is reserved so user tables cannot collide.
-  See [events.go](../events.go).
+  message`) in the companion, present in every mode (logging does not depend on
+  durability). A dashboard reads the table with a plain `SELECT`. Metrics and
+  per-request counters do NOT go here; high-frequency occurrences are counted, not
+  logged per event. The `_hz_` table-name prefix is reserved so user tables cannot
+  collide. See [events.go](../events.go).
 - **Recovery** = load current state from SQLite (reconciling the catalog with
   runtime-created tables via `_hz_tables`), then replay only segments past the
   drained cursor on top. Boot and crash recovery are the same path. See

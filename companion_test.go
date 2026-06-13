@@ -148,3 +148,40 @@ func TestDefaultCompanionFileWithWAL(t *testing.T) {
 		t.Fatalf("rows after restart via the default companion file: got %d, want 3", got)
 	}
 }
+
+// SQLite is present even with no WAL: data lives only in RAM (lost on restart),
+// but the _hz_events log persists in the companion file and accumulates across
+// sessions — logging/health does not depend on durability.
+func TestFileCompanionEventsSurviveMemoryOnly(t *testing.T) {
+	comp := filepath.Join(t.TempDir(), "hazedb.db")
+	openOps := func() *DB {
+		db, err := Open(Options{Schema: testSchema(), CompanionPath: comp}) // no WAL
+		if err != nil {
+			t.Fatal(err)
+		}
+		return db
+	}
+
+	db := openOps()
+	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "ephemeral", 1); err != nil {
+		t.Fatal(err)
+	}
+	db.logEvent("info", "boot", "session one")
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2 := openOps()
+	defer db2.Close()
+	if got := countUsers(t, db2); got != 0 {
+		t.Fatalf("memory-only data must not survive restart: got %d rows, want 0", got)
+	}
+	db2.logEvent("info", "boot", "session two")
+	var n int
+	if err := db2.sq.sdb.QueryRow(`SELECT count(*) FROM _hz_events WHERE kind='boot'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("boot events across two memory-only sessions: got %d, want 2", n)
+	}
+}

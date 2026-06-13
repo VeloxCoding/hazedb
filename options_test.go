@@ -5,8 +5,8 @@ import (
 	"testing"
 )
 
-// applyDefaults gives the companion a file path inside WALPath when WAL is on,
-// and leaves it empty (no companion) when there is no WAL — never in-memory.
+// applyDefaults always gives the companion a file path: inside WALPath when WAL
+// is on, else "hazedb.db" in the working directory. Never empty, never in-memory.
 func TestCompanionDefaultResolution(t *testing.T) {
 	walOn := Options{WALPath: "/var/lib/hz/wal"}
 	walOn.applyDefaults()
@@ -16,8 +16,8 @@ func TestCompanionDefaultResolution(t *testing.T) {
 
 	noWAL := Options{}
 	noWAL.applyDefaults()
-	if noWAL.CompanionPath != "" {
-		t.Fatalf("no-WAL companion: got %q, want empty (no companion, no in-memory)", noWAL.CompanionPath)
+	if noWAL.CompanionPath != defaultCompanionFile {
+		t.Fatalf("no-WAL companion: got %q, want %q (a file in the working dir)", noWAL.CompanionPath, defaultCompanionFile)
 	}
 
 	// An explicit path is left untouched.

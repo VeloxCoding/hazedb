@@ -105,19 +105,22 @@ func Open(opts Options) (*DB, error) {
 		scratch:  newScratchPool(),
 	}
 	db.cat.Store(cat)
-	// The SQLite companion lives next to the WAL, as a file, and exists only when
-	// WAL is on (no WAL → no companion; operational events go to the log instead).
+	// The SQLite companion is always present — a real file on disk (CompanionPath;
+	// default hazedb.db inside WALPath, or in the working directory with no WAL). It
+	// holds the _hz_events operational log in every mode, and becomes the data
+	// mirror + recovery base when WAL is on. Never in-memory.
+	comp, err := openCompanion(opts.CompanionPath)
+	if err != nil {
+		return nil, err
+	}
+	db.sq = comp
+
 	if opts.walEnabled() {
 		w, err := openWAL(opts.WALPath)
 		if err != nil {
+			comp.close()
 			return nil, err
 		}
-		comp, err := openCompanion(opts.CompanionPath)
-		if err != nil {
-			w.close()
-			return nil, err
-		}
-		db.sq = comp
 		db.mirrorOn = true
 		// Recover before starting the flusher, so no background flush races a replay
 		// reader. The companion is the compacted base: load it into memory, then

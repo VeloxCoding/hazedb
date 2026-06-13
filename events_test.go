@@ -6,16 +6,16 @@ import (
 	"testing"
 )
 
-// With WAL on, the companion file exists and logEvent records a queryable row in
-// _hz_events.
+// Even with NO WAL, the companion file exists and logEvent records a queryable
+// row in _hz_events — SQLite logging does not depend on durability.
 func TestCompanionEventsTable(t *testing.T) {
-	db, err := Open(Options{Schema: testSchema(), WALPath: filepath.Join(t.TempDir(), "wal"), drainInterval: -1})
+	db, err := Open(Options{Schema: testSchema(), CompanionPath: filepath.Join(t.TempDir(), "hazedb.db")})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 	if db.sq == nil {
-		t.Fatal("companion must be present when WAL is on")
+		t.Fatal("companion must be present even without WAL")
 	}
 	db.logEvent("warn", "test-event", "hello world")
 

@@ -7,6 +7,23 @@ import (
 	"testing"
 )
 
+// TestMain runs the whole test binary from a temp working directory. The
+// companion defaults to "hazedb.db" in the working directory when there is no
+// WAL, so this keeps those real files out of the repo (WAL tests get their own
+// companion inside their per-test temp WALPath). No companion is ever in-memory.
+func TestMain(m *testing.M) {
+	tmp, err := os.MkdirTemp("", "hazedb-test")
+	if err != nil {
+		panic(err)
+	}
+	if err := os.Chdir(tmp); err != nil {
+		panic(err)
+	}
+	code := m.Run()
+	_ = os.RemoveAll(tmp)
+	os.Exit(code)
+}
+
 // testSchema returns a small schema used across most tests. The PK is a
 // UUID (hard requirement since M4); tests build deterministic ordered PKs
 // with tid(n) so query strings and ORDER BY id semantics carry over from the

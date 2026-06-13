@@ -34,11 +34,12 @@ type Options struct {
 	// not offered — use a disk-first database if you need it.
 	WALPath string
 
-	// CompanionPath overrides where the SQLite companion file lives — always a real
-	// file, never in-memory. It applies only when WAL is on: the companion holds the
-	// data mirror and the _hz_events log, sitting next to the WAL. Empty defaults to
-	// "hazedb.db" inside WALPath. With no WAL there is no companion at all (events go
-	// to the log); to get the file, turn the WAL on.
+	// CompanionPath is where the SQLite companion file lives — always a real file on
+	// disk, present in EVERY mode (WAL on or off). It is hazedb's always-on store:
+	// the _hz_events operational log (logging, health, later perf samples) and,
+	// when WAL is on, the data mirror + recovery base. Set it to pin hazedb.db at
+	// one fixed path regardless of WAL. Empty defaults to "hazedb.db" inside WALPath
+	// when WAL is on, else "hazedb.db" in the working directory. Never in-memory.
 	CompanionPath string
 
 	// MaxBytes caps the store's approximate in-RAM size (the sum of every table's
@@ -104,11 +105,14 @@ func (o *Options) applyDefaults() {
 	if o.compactInterval == 0 {
 		o.compactInterval = defaultCompactInterval
 	}
-	// The companion lives alongside the WAL, as a file. Default it to "hazedb.db"
-	// inside WALPath. With no WAL there is no companion (it stays empty), never an
-	// in-memory one.
-	if o.walEnabled() && o.CompanionPath == "" {
-		o.CompanionPath = filepath.Join(o.WALPath, defaultCompanionFile)
+	// The companion is always a real file on disk. Default it to "hazedb.db" inside
+	// WALPath when WAL is on, else "hazedb.db" in the working directory.
+	if o.CompanionPath == "" {
+		if o.walEnabled() {
+			o.CompanionPath = filepath.Join(o.WALPath, defaultCompanionFile)
+		} else {
+			o.CompanionPath = defaultCompanionFile
+		}
 	}
 	if o.mirrorEnabled() && o.drainInterval == 0 {
 		o.drainInterval = defaultDrainInterval
