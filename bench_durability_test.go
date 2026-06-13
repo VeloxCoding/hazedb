@@ -33,7 +33,7 @@ func BenchmarkInsert_WALDrain(b *testing.B) {
 	dir := b.TempDir()
 	sqPath := filepath.Join(b.TempDir(), "m.db")
 	db, err := Open(Options{Schema: benchSchema(), sizeHint: b.N,
-		WALPath: dir, SQLitePath: sqPath,
+		WALPath: dir, CompanionPath: sqPath,
 		drainInterval: 200 * time.Millisecond})
 	if err != nil {
 		b.Fatal(err)
@@ -55,7 +55,7 @@ func BenchmarkDrainThroughput(b *testing.B) {
 	dir := b.TempDir()
 	sqPath := filepath.Join(b.TempDir(), "m.db")
 	db, err := Open(Options{Schema: benchSchema(), sizeHint: K,
-		WALPath: dir, SQLitePath: sqPath,
+		WALPath: dir, CompanionPath: sqPath,
 		drainInterval: -1})
 	if err != nil {
 		b.Fatal(err)

@@ -220,9 +220,9 @@ func refToMap(ref map[UUID]Row) map[string]string {
 func openItemsDrainDB(t *testing.T, dir, sqPath string) *DB {
 	t.Helper()
 	db, err := Open(Options{
-		Schema:     itemsSchema(),
-		WALPath:    dir,
-		SQLitePath: sqPath,
+		Schema:        itemsSchema(),
+		WALPath:       dir,
+		CompanionPath: sqPath,
 		// rotate manually in verify()
 		drainInterval: -1, // drain manually in verify()
 	})

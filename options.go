@@ -1,9 +1,6 @@
 package hazedb
 
-import (
-	"fmt"
-	"time"
-)
+import "time"
 
 // Defaults for the tunable fields, in one place. applyDefaults fills any field
 // left at its zero value; a NEGATIVE duration is preserved as "explicitly
@@ -33,11 +30,19 @@ type Options struct {
 	// not offered — use a disk-first database if you need it.
 	WALPath string
 
-	// SQLitePath enables the on-disk SQLite mirror: a background drain feeds
-	// sealed WAL segments into it (compacted current state) and it becomes the
-	// recovery base. Empty = no mirror (the WAL segments replay into memory on
-	// boot). Requires WALPath (the mirror is fed from the WAL).
-	SQLitePath string
+	// CompanionPath is the always-present SQLite companion — hazedb's sidecar for
+	// operational data (the _hz_events log; later, periodic /meta samples). Empty
+	// keeps it in memory (":memory:" — present while the process runs, gone on
+	// exit); set it to a file (real disk, or a ramdisk for an ephemeral one) to
+	// persist that data across restarts.
+	//
+	// It is also where the DATA MIRROR lives: when WAL is on AND this path is set
+	// (persistent), a background drain feeds sealed WAL segments into it as
+	// compacted current state and it becomes the recovery base. WAL on with no
+	// CompanionPath is WAL-only — segments replay into memory on boot, no mirror —
+	// because the drain deletes drained segments, so an in-memory mirror could not
+	// survive a restart as a recovery base.
+	CompanionPath string
 
 	// MaxBytes caps the store's approximate in-RAM size (the sum of every table's
 	// byte tally, the same figure MetaSnapshot reports). An INSERT that would push
@@ -72,16 +77,20 @@ type Options struct {
 	indexMergeThreshold int64
 }
 
-// validate rejects contradictory configs before any resource is opened.
+// validate rejects contradictory configs before any resource is opened. Every
+// WAL/companion combination is currently legal: memory-only, WAL-only (no
+// mirror), WAL + mirror, and a companion file with no WAL (ops-only).
 func (o *Options) validate() error {
-	if o.SQLitePath != "" && o.WALPath == "" {
-		return fmt.Errorf("hazedb: SQLitePath is set but WALPath is empty — the mirror is fed from the WAL, so the WAL must be enabled")
-	}
 	return nil
 }
 
 // walEnabled reports whether on-disk persistence is on.
 func (o *Options) walEnabled() bool { return o.WALPath != "" }
+
+// mirrorEnabled reports whether the data mirror is active: the WAL feeds it and a
+// persistent companion is its home. An in-memory companion cannot be a recovery
+// base (the drain deletes WAL segments once mirrored), so the mirror needs a path.
+func (o *Options) mirrorEnabled() bool { return o.walEnabled() && o.CompanionPath != "" }
 
 // applyDefaults fills unset (zero) fields. Negative values are left intact (they
 // mean "disabled"). The drain default applies only when the mirror is enabled.
@@ -98,7 +107,7 @@ func (o *Options) applyDefaults() {
 	if o.compactInterval == 0 {
 		o.compactInterval = defaultCompactInterval
 	}
-	if o.SQLitePath != "" && o.drainInterval == 0 {
+	if o.mirrorEnabled() && o.drainInterval == 0 {
 		o.drainInterval = defaultDrainInterval
 	}
 }

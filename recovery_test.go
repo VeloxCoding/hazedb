@@ -353,7 +353,7 @@ func TestDrainSkipsCorruptSegment(t *testing.T) {
 	walDir := filepath.Join(dir, "wal")
 	sqPath := filepath.Join(dir, "mirror.db")
 	db, err := Open(Options{
-		Schema: testSchema(), WALPath: walDir, SQLitePath: sqPath,
+		Schema: testSchema(), WALPath: walDir, CompanionPath: sqPath,
 		walFlushInterval: -1, drainInterval: -1, // manual flush + manual drain
 	})
 	if err != nil {

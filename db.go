@@ -73,10 +73,13 @@ type DB struct {
 	compactStop chan struct{}
 	compactDone chan struct{}
 
-	// sq is the on-disk SQLite mirror (nil when SQLitePath is unset). The drain
-	// loop feeds sealed WAL segments into it; drainStop/drainDone drive that
-	// goroutine, mirroring the merger. See docs/durability.md.
+	// sq is the SQLite companion — always present (an in-memory DB when
+	// CompanionPath is empty). It holds operational data (the _hz_events log) and,
+	// when mirrorOn, the data mirror: the drain feeds sealed WAL segments into it
+	// and it is the recovery base. drainStop/drainDone drive that goroutine,
+	// mirroring the merger. See docs/durability.md.
 	sq        *sqliteMirror
+	mirrorOn  bool
 	drainStop chan struct{}
 	drainDone chan struct{}
 }
@@ -102,36 +105,46 @@ func Open(opts Options) (*DB, error) {
 		scratch:  newScratchPool(),
 	}
 	db.cat.Store(cat)
+	// The SQLite companion is always present (an in-memory DB when CompanionPath
+	// is empty), so operational data (the _hz_events log) never depends on WAL or
+	// mirror state.
+	comp, err := openCompanion(opts.CompanionPath)
+	if err != nil {
+		return nil, err
+	}
+	db.sq = comp
+
 	if opts.walEnabled() {
 		w, err := openWAL(opts.WALPath)
 		if err != nil {
+			comp.close()
 			return nil, err
 		}
 		// Recover from existing segments before starting the flusher, so no
 		// background flush races a replay reader.
-		if opts.SQLitePath != "" {
-			// SQLite-backed recovery: the mirror is the base. Load it into memory,
-			// then replay only the undrained WAL tail (segments past the drained
-			// cursor) on top.
-			m, merr := newSQLiteMirror(opts.SQLitePath, db.cat.Load())
-			if merr != nil {
+		if opts.mirrorEnabled() {
+			// Mirror-backed recovery: the companion is the compacted base. Load it
+			// into memory, then replay only the undrained WAL tail (segments past
+			// the drained cursor) on top.
+			if err := comp.activateMirror(db.cat.Load()); err != nil {
 				w.close()
-				return nil, merr
+				comp.close()
+				return nil, err
 			}
-			db.sq = m
+			db.mirrorOn = true
 			if err := db.recoverFromSQLite(); err != nil {
 				w.close()
-				m.close()
+				comp.close()
 				return nil, err
 			}
-			if err := w.removeDrainedSegments(m.lastDrained); err != nil {
+			if err := w.removeDrainedSegments(comp.lastDrained); err != nil {
 				w.close()
-				m.close()
+				comp.close()
 				return nil, err
 			}
-			if err := w.replayFrom(m.lastDrained, db.applyReplayRecord, db.onWALCorrupt); err != nil {
+			if err := w.replayFrom(comp.lastDrained, db.applyReplayRecord, db.onWALCorrupt); err != nil {
 				w.close()
-				m.close()
+				comp.close()
 				return nil, err
 			}
 			// Keep segment numbers above the drained cursor across restarts: the
@@ -139,13 +152,14 @@ func Open(opts Options) (*DB, error) {
 			// can fall below lastDrained. Without this, a post-restart flush could
 			// reuse a number <= lastDrained that drainOnce would skip forever —
 			// those writes would never reach the mirror and be lost on next recovery.
-			if w.seg < m.lastDrained {
-				w.seg = m.lastDrained
+			if w.seg < comp.lastDrained {
+				w.seg = comp.lastDrained
 			}
 		} else {
-			// No mirror: the WAL segments themselves replay into memory.
+			// WAL-only (no companion path): the WAL segments replay into memory.
 			if err := db.replayWAL(w); err != nil {
 				w.close()
+				comp.close()
 				return nil, err
 			}
 		}
@@ -155,7 +169,7 @@ func Open(opts Options) (*DB, error) {
 		// the live rows now, so reads are index-fast before serving.
 		db.rebuildAllIndexes()
 
-		if opts.SQLitePath != "" && opts.drainInterval > 0 {
+		if db.mirrorOn && opts.drainInterval > 0 {
 			db.startDrainLoop(opts.drainInterval)
 		}
 	}

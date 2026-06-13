@@ -116,9 +116,9 @@ func TestDrainMirrorMatchesEngine(t *testing.T) {
 	dir := t.TempDir()
 	sqPath := filepath.Join(t.TempDir(), "mirror.db")
 	db, err := Open(Options{
-		Schema:     testSchema(),
-		WALPath:    dir,
-		SQLitePath: sqPath,
+		Schema:        testSchema(),
+		WALPath:       dir,
+		CompanionPath: sqPath,
 		// rotate manually
 		drainInterval: -1, // drain manually
 	})

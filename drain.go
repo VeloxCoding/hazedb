@@ -1,7 +1,9 @@
 package hazedb
 
-// SQLite mirror + drain — opt-in (Options.SQLitePath). A background loop feeds
-// sealed WAL segments into an on-disk SQLite database that holds CURRENT state
+// SQLite companion + data mirror. The companion (Options.CompanionPath; an
+// in-memory DB when empty) is always present for operational data. The DATA
+// MIRROR is active only when WAL is on AND the companion is a persistent file:
+// a background loop then feeds sealed WAL segments into it as CURRENT state
 // (compacted: an UPDATE overwrites, a DELETE removes), so the mirror is a
 // queryable, portable, copy-one-file snapshot of the engine. The drain reuses
 // the WAL record framing (scanRecords) and the catalog encoders, and writes one
@@ -48,40 +50,54 @@ type execer interface {
 	Exec(query string, args ...any) (sql.Result, error)
 }
 
-// newSQLiteMirror opens (creating if needed) the mirror DB, ensures the meta
-// tables, loads the drain cursor and the known tables, then seeds any bootstrap
-// tables from cat that the mirror does not yet have (the Open() schema is not
-// journaled as CREATE TABLE records, so it must be seeded here).
-func newSQLiteMirror(path string, cat *catalog) (*sqliteMirror, error) {
-	sdb, err := sql.Open("sqlite", path)
-	if err != nil {
-		return nil, fmt.Errorf("mirror: open %q: %w", path, err)
+// openCompanion opens (creating if needed) the SQLite companion database. path
+// is "" for an in-memory companion (":memory:"), or a file path to persist it.
+// The handle is configured but holds no tables yet — the data-mirror tables are
+// added by activateMirror when the mirror is enabled.
+func openCompanion(path string) (*sqliteMirror, error) {
+	dsn := path
+	if dsn == "" {
+		dsn = ":memory:"
 	}
-	// One connection: SQLite is a single writer, and the drain is single-threaded.
-	// This also keeps the WAL/page cache warm across drains.
+	sdb, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("companion: open %q: %w", dsn, err)
+	}
+	// One connection: SQLite is a single writer, the drain is single-threaded, and
+	// it keeps the page cache warm across drains.
 	sdb.SetMaxOpenConns(1)
-	for _, pragma := range []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA synchronous=NORMAL",
-		"PRAGMA busy_timeout=5000",
-	} {
-		if _, err := sdb.Exec(pragma); err != nil {
-			sdb.Close()
-			return nil, fmt.Errorf("mirror: %q: %w", pragma, err)
+	// The durability/concurrency pragmas matter only for a file-backed companion;
+	// an in-memory DB has no journal to mode-switch, so skip them there.
+	if path != "" {
+		for _, pragma := range []string{
+			"PRAGMA journal_mode=WAL",
+			"PRAGMA synchronous=NORMAL",
+			"PRAGMA busy_timeout=5000",
+		} {
+			if _, err := sdb.Exec(pragma); err != nil {
+				sdb.Close()
+				return nil, fmt.Errorf("companion: %q: %w", pragma, err)
+			}
 		}
 	}
-	m := &sqliteMirror{sdb: sdb, tables: map[uint16]*drainTable{}}
-	if err := m.ensureMeta(); err != nil {
-		sdb.Close()
-		return nil, err
+	return &sqliteMirror{sdb: sdb, tables: map[uint16]*drainTable{}}, nil
+}
+
+// activateMirror turns the companion into the data mirror: ensure the mirror meta
+// tables, load the drain cursor and the known tables, then seed any bootstrap
+// tables from cat the mirror does not yet have (the Open() schema is not
+// journaled as CREATE TABLE records, so it must be seeded here). Called from Open
+// only when the mirror is enabled (WAL on + a persistent companion); Open closes
+// the companion if this fails.
+func (m *sqliteMirror) activateMirror(cat *catalog) error {
+	if err := m.ensureMirrorMeta(); err != nil {
+		return err
 	}
 	if err := m.loadCursor(); err != nil {
-		sdb.Close()
-		return nil, err
+		return err
 	}
 	if err := m.loadTables(); err != nil {
-		sdb.Close()
-		return nil, err
+		return err
 	}
 	for _, rt := range cat.byID {
 		if rt == nil {
@@ -90,15 +106,17 @@ func newSQLiteMirror(path string, cat *catalog) (*sqliteMirror, error) {
 		if _, ok := m.tables[rt.tableID]; ok {
 			continue
 		}
-		if err := m.register(sdb, rt.tableID, rt.table.def.def); err != nil {
-			sdb.Close()
-			return nil, err
+		if err := m.register(m.sdb, rt.tableID, rt.table.def.def); err != nil {
+			return err
 		}
 	}
-	return m, nil
+	return nil
 }
 
-func (m *sqliteMirror) ensureMeta() error {
+// ensureMirrorMeta creates the mirror's bookkeeping tables: the drain cursor
+// (_hz_meta) and the table registry (_hz_tables). Created only when the mirror is
+// active; the operational _hz_events table is separate and always present.
+func (m *sqliteMirror) ensureMirrorMeta() error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS _hz_meta (k TEXT PRIMARY KEY, v INTEGER)`,
 		`CREATE TABLE IF NOT EXISTS _hz_tables (table_id INTEGER PRIMARY KEY, name TEXT, def BLOB)`,
@@ -271,7 +289,7 @@ func valueToArg(v Value) any {
 // every candidate is already flushed, fsynced, and closed — there is no open
 // file to race and no age gate is needed. A no-op when the mirror or WAL is absent.
 func (db *DB) drainOnce() error {
-	if db.sq == nil || db.wal == nil {
+	if !db.mirrorOn || db.wal == nil {
 		return nil
 	}
 	sealed, err := db.wal.sealedSegments()

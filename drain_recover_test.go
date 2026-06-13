@@ -12,7 +12,7 @@ func TestSQLiteRecoveryAfterCrash(t *testing.T) {
 	dir := t.TempDir()
 	sqPath := filepath.Join(t.TempDir(), "m.db")
 	opts := Options{
-		Schema: testSchema(), WALPath: dir, SQLitePath: sqPath,
+		Schema: testSchema(), WALPath: dir, CompanionPath: sqPath,
 		drainInterval: -1,
 	}
 	db, err := Open(opts)
@@ -78,7 +78,7 @@ func TestDrainReclaimsSegments(t *testing.T) {
 	dir := t.TempDir()
 	sqPath := filepath.Join(t.TempDir(), "m.db")
 	db, err := Open(Options{
-		Schema: testSchema(), WALPath: dir, SQLitePath: sqPath,
+		Schema: testSchema(), WALPath: dir, CompanionPath: sqPath,
 		drainInterval: -1,
 	})
 	if err != nil {

@@ -1,9 +1,10 @@
 package hazedb
 
-// SQLite-backed recovery — the read side of the mirror. On Open with SQLitePath
-// set, the current state lives in SQLite (drained segments are deleted), so the
-// engine is rebuilt from the mirror and only the undrained WAL tail is replayed
-// on top. WAL-free: rows enter via rt.insert and are never re-journaled.
+// SQLite-backed recovery — the read side of the mirror. When the mirror is active
+// (WAL on + a persistent companion), the current state lives in SQLite (drained
+// segments are deleted), so the engine is rebuilt from the mirror and only the
+// undrained WAL tail is replayed on top. WAL-free: rows enter via rt.insert and
+// are never re-journaled.
 
 import (
 	"database/sql"
