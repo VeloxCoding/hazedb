@@ -8,6 +8,7 @@ package hazedb
 
 import (
 	"database/sql"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -148,5 +149,42 @@ func TestFileCompanionEventsSurviveMemoryOnly(t *testing.T) {
 	}
 	if n != 2 {
 		t.Fatalf("boot events across two memory-only sessions: got %d, want 2", n)
+	}
+}
+
+// With WAL on and CompanionPath left empty, the companion defaults to a file
+// "hazedb.db" inside WALPath, the mirror is on, and data persists across a
+// restart through that default file — the zero-config durable shape.
+func TestDefaultCompanionFileWithWAL(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+	openDB := func() *DB {
+		db, err := Open(Options{Schema: testSchema(), WALPath: walDir}) // no CompanionPath
+		if err != nil {
+			t.Fatal(err)
+		}
+		return db
+	}
+
+	db := openDB()
+	for i := 1; i <= 3; i++ {
+		if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "u", i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil { // final drain folds the data into the default file
+		t.Fatal(err)
+	}
+
+	// The default companion file exists inside WALPath.
+	want := filepath.Join(walDir, "hazedb.db")
+	if _, err := os.Stat(want); err != nil {
+		t.Fatalf("default companion file %s should exist: %v", want, err)
+	}
+
+	db2 := openDB() // same default path → recovery base
+	defer db2.Close()
+	if got := countUsers(t, db2); got != 3 {
+		t.Fatalf("rows after restart via the default companion file: got %d, want 3", got)
 	}
 }

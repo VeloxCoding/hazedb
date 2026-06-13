@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -59,6 +60,14 @@ func openCompanion(path string) (*sqliteMirror, error) {
 	if dsn == "" {
 		dsn = ":memory:"
 	}
+	// A file companion may name a directory that does not exist yet — the default
+	// lives inside WALPath, and openCompanion runs before openWAL creates it — so
+	// ensure the parent exists before opening.
+	if dsn != ":memory:" {
+		if err := os.MkdirAll(filepath.Dir(dsn), 0o755); err != nil {
+			return nil, fmt.Errorf("companion: mkdir %q: %w", filepath.Dir(dsn), err)
+		}
+	}
 	sdb, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("companion: open %q: %w", dsn, err)
@@ -68,7 +77,7 @@ func openCompanion(path string) (*sqliteMirror, error) {
 	sdb.SetMaxOpenConns(1)
 	// The durability/concurrency pragmas matter only for a file-backed companion;
 	// an in-memory DB has no journal to mode-switch, so skip them there.
-	if path != "" {
+	if dsn != ":memory:" {
 		for _, pragma := range []string{
 			"PRAGMA journal_mode=WAL",
 			"PRAGMA synchronous=NORMAL",

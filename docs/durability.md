@@ -22,10 +22,12 @@ mechanics first sketched in §4 below. Two reasons the segment approach won:
   so the "don't read a file being appended to" question disappears by construction.
 
 What shipped. WAL durability is opt-in via `Options.WALPath` (set = on, empty =
-memory-only). Separately, the **SQLite companion** (`Options.CompanionPath`; an
-in-memory DB when empty) is **always present** — it holds operational data (the
-`_hz_events` log) regardless of WAL, and hosts the data mirror when WAL is on and
-the path is a persistent file:
+memory-only). Separately, the **SQLite companion** (`Options.CompanionPath`) is
+**always present** — it holds operational data (the `_hz_events` log) regardless
+of WAL, and hosts the data mirror when WAL is on. Left empty it defaults to a
+**file** — `hazedb.db` inside WALPath when durable, or `hazedb.db` in the working
+directory when there is no WAL (memory-only data stays in RAM, but the events log
+still persists); set it explicitly (a path, or `":memory:"`) to override:
 
 - **Born-sealed WAL**: `WALPath` is a directory of immutable `seg-<n>.wal` files.
   A write appends a complete record to an in-memory buffer under the WAL lock;

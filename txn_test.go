@@ -17,7 +17,7 @@ import (
 func TestTxnEnvelopeReplays(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "txn.wal")
-	db, err := Open(Options{Schema: Schema{}, WALPath: path})
+	db, err := Open(Options{Schema: Schema{}, WALPath: path, CompanionPath: ":memory:"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestTxnEnvelopeReplays(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: Schema{}, WALPath: path})
+	db2, err := Open(Options{Schema: Schema{}, WALPath: path, CompanionPath: ":memory:"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +59,7 @@ func TestTxnEnvelopeReplays(t *testing.T) {
 func TestTxnEnvelopeTornTailDiscarded(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "torn.wal")
-	db, err := Open(Options{Schema: Schema{}, WALPath: path})
+	db, err := Open(Options{Schema: Schema{}, WALPath: path, CompanionPath: ":memory:"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestTxnEnvelopeTornTailDiscarded(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: Schema{}, WALPath: path})
+	db2, err := Open(Options{Schema: Schema{}, WALPath: path, CompanionPath: ":memory:"})
 	if err != nil {
 		t.Fatalf("torn TXN tail should be tolerated, got %v", err)
 	}
@@ -160,7 +160,7 @@ func TestBroadUpdateAtomicOnWALFailure(t *testing.T) {
 func TestBroadWriteSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "broad.wal")
-	db, err := Open(Options{Schema: testSchema(), WALPath: path})
+	db, err := Open(Options{Schema: testSchema(), WALPath: path, CompanionPath: ":memory:"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestBroadWriteSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: testSchema(), WALPath: path})
+	db2, err := Open(Options{Schema: testSchema(), WALPath: path, CompanionPath: ":memory:"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +252,7 @@ func TestTransactionRollback(t *testing.T) {
 func TestTransactionSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "tx.wal")
-	db, err := Open(Options{Schema: Schema{}, WALPath: path})
+	db, err := Open(Options{Schema: Schema{}, WALPath: path, CompanionPath: ":memory:"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +271,7 @@ func TestTransactionSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2, err := Open(Options{Schema: Schema{}, WALPath: path})
+	db2, err := Open(Options{Schema: Schema{}, WALPath: path, CompanionPath: ":memory:"})
 	if err != nil {
 		t.Fatal(err)
 	}

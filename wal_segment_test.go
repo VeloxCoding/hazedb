@@ -12,7 +12,7 @@ import (
 // exercise the flusher pass a short interval instead.
 func openSegmented(t *testing.T, dir string, flush time.Duration) *DB {
 	t.Helper()
-	db, err := Open(Options{Schema: testSchema(), WALPath: dir, walFlushInterval: flush})
+	db, err := Open(Options{Schema: testSchema(), WALPath: dir, walFlushInterval: flush, CompanionPath: ":memory:"})
 	if err != nil {
 		t.Fatalf("open segmented: %v", err)
 	}

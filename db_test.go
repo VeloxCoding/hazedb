@@ -7,6 +7,12 @@ import (
 	"testing"
 )
 
+// Memory-only test Opens would otherwise default the companion to a "hazedb.db"
+// file in the working directory (the production default); keep tests in-memory so
+// the suite writes no files. Production is unaffected — this runs only in the test
+// binary.
+func init() { noWALCompanionDefault = ":memory:" }
+
 // testSchema returns a small schema used across most tests. The PK is a
 // UUID (hard requirement since M4); tests build deterministic ordered PKs
 // with tid(n) so query strings and ORDER BY id semantics carry over from the
@@ -57,7 +63,10 @@ func openDBWithWAL(t *testing.T) (*DB, string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.wal")
-	db, err := Open(Options{Schema: testSchema(), WALPath: path})
+	// CompanionPath ":memory:" keeps these WAL tests WAL-only (no data mirror), the
+	// behaviour they were written against; the file-companion default is exercised
+	// by companion_test.go.
+	db, err := Open(Options{Schema: testSchema(), WALPath: path, CompanionPath: ":memory:"})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

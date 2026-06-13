@@ -1,6 +1,9 @@
 package hazedb
 
-import "time"
+import (
+	"path/filepath"
+	"time"
+)
 
 // Defaults for the tunable fields, in one place. applyDefaults fills any field
 // left at its zero value; a NEGATIVE duration is preserved as "explicitly
@@ -10,7 +13,14 @@ const (
 	defaultFlushInterval      = 500 * time.Millisecond
 	defaultDrainInterval      = time.Second
 	defaultIndexMergeInterval = 50 * time.Millisecond
+	defaultCompanionFile      = "hazedb.db" // default companion filename
 )
+
+// noWALCompanionDefault is the companion path used when CompanionPath is empty and
+// WAL is off — a file in the working directory. It is a var, not a const, only so
+// package tests can set it to ":memory:" (in an init) and avoid scattering a
+// hazedb.db across the repo; production never changes it.
+var noWALCompanionDefault = defaultCompanionFile
 
 // Options configure Open. The EXPORTED fields are the entire operator surface;
 // the unexported fields are internal tuning, settable only from package tests
@@ -30,18 +40,17 @@ type Options struct {
 	// not offered — use a disk-first database if you need it.
 	WALPath string
 
-	// CompanionPath is the always-present SQLite companion — hazedb's sidecar for
-	// operational data (the _hz_events log; later, periodic /meta samples). Empty
-	// keeps it in memory (":memory:" — present while the process runs, gone on
-	// exit); set it to a file (real disk, or a ramdisk for an ephemeral one) to
-	// persist that data across restarts.
-	//
-	// It is also where the DATA MIRROR lives: when WAL is on AND this path is set
-	// (persistent), a background drain feeds sealed WAL segments into it as
-	// compacted current state and it becomes the recovery base. WAL on with no
-	// CompanionPath is WAL-only — segments replay into memory on boot, no mirror —
-	// because the drain deletes drained segments, so an in-memory mirror could not
-	// survive a restart as a recovery base.
+	// CompanionPath is the SQLite companion — hazedb's always-present sidecar for
+	// operational data (the _hz_events log; later, periodic /meta samples) and the
+	// data mirror. Left empty it defaults to a FILE:
+	//   - WAL on  → "hazedb.db" inside WALPath: the data mirror and events persist
+	//     there, and the file is the recovery base.
+	//   - WAL off → "hazedb.db" in the working directory: a memory-only store keeps
+	//     its rows in RAM, but the companion still persists the _hz_events log.
+	// Set it to a path to choose the location (a ramdisk path for an ephemeral
+	// file), or to ":memory:" to keep the companion in-memory (with WAL on that is
+	// WAL-only mode: segments replay into memory on boot, no mirror — the drain
+	// deletes drained segments, so an in-memory mirror could not be a recovery base).
 	CompanionPath string
 
 	// MaxBytes caps the store's approximate in-RAM size (the sum of every table's
@@ -87,10 +96,12 @@ func (o *Options) validate() error {
 // walEnabled reports whether on-disk persistence is on.
 func (o *Options) walEnabled() bool { return o.WALPath != "" }
 
-// mirrorEnabled reports whether the data mirror is active: the WAL feeds it and a
-// persistent companion is its home. An in-memory companion cannot be a recovery
-// base (the drain deletes WAL segments once mirrored), so the mirror needs a path.
-func (o *Options) mirrorEnabled() bool { return o.walEnabled() && o.CompanionPath != "" }
+// mirrorEnabled reports whether the data mirror is active: the WAL feeds it and
+// the companion is a real file (not in-memory). An in-memory companion cannot be
+// a recovery base — the drain deletes WAL segments once mirrored — so ":memory:"
+// (set explicitly, or the WAL-off default) means WAL-only. Call only after
+// applyDefaults, which resolves an empty path to a file or ":memory:".
+func (o *Options) mirrorEnabled() bool { return o.walEnabled() && o.CompanionPath != ":memory:" }
 
 // applyDefaults fills unset (zero) fields. Negative values are left intact (they
 // mean "disabled"). The drain default applies only when the mirror is enabled.
@@ -106,6 +117,17 @@ func (o *Options) applyDefaults() {
 	}
 	if o.compactInterval == 0 {
 		o.compactInterval = defaultCompactInterval
+	}
+	// Default the companion to a FILE: inside WALPath when durable (data mirror +
+	// events persist, recovery base), else "hazedb.db" in the working directory
+	// (memory-only data stays in RAM, but the _hz_events log still persists).
+	// noWALCompanionDefault is ":memory:" under test so the suite writes no files.
+	if o.CompanionPath == "" {
+		if o.walEnabled() {
+			o.CompanionPath = filepath.Join(o.WALPath, defaultCompanionFile)
+		} else {
+			o.CompanionPath = noWALCompanionDefault
+		}
 	}
 	if o.mirrorEnabled() && o.drainInterval == 0 {
 		o.drainInterval = defaultDrainInterval
