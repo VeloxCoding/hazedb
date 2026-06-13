@@ -1,7 +1,9 @@
 package hazedb
 
 import (
+	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -76,18 +78,32 @@ type Options struct {
 }
 
 // validate rejects contradictory configs before any resource is opened. Every
-// WAL/companion combination is currently legal: memory-only, WAL-only (no
-// mirror), WAL + mirror, and a companion file with no WAL (ops-only).
+// WAL/companion combination is legal: in-RAM store (no WAL), WAL-only, WAL +
+// mirror, and a companion with no WAL (ops-only). The one hard rule is that the
+// companion is always an on-disk file — an explicit in-memory DSN is rejected,
+// since the companion must survive a restart to serve logging, health, and the
+// data mirror. An empty CompanionPath is fine here: applyDefaults turns it into a
+// real file path.
 func (o *Options) validate() error {
+	if isInMemoryDSN(o.CompanionPath) {
+		return fmt.Errorf("%w: CompanionPath=%q", ErrCompanionInMemory, o.CompanionPath)
+	}
 	return nil
+}
+
+// isInMemoryDSN reports whether a SQLite path/DSN opens an in-memory database
+// rather than a file. Covers the bare ":memory:" form, the "file::memory:" URI,
+// and any DSN carrying the mode=memory query parameter.
+func isInMemoryDSN(path string) bool {
+	return strings.Contains(path, ":memory:") || strings.Contains(path, "mode=memory")
 }
 
 // walEnabled reports whether on-disk persistence is on.
 func (o *Options) walEnabled() bool { return o.WALPath != "" }
 
 // mirrorEnabled reports whether the data mirror is active — exactly when WAL is
-// on. The companion file lives alongside the WAL; with no WAL there is no
-// companion and no mirror.
+// on. The companion file is always present (it also holds the _hz_events log with
+// no WAL); the mirror is the data-replication role layered on top when WAL is on.
 func (o *Options) mirrorEnabled() bool { return o.walEnabled() }
 
 // applyDefaults fills unset (zero) fields. Negative values are left intact (they
