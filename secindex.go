@@ -425,6 +425,24 @@ func (si *secIndex) lookupLeading(key Value) []UUID {
 	return si.prefixLookup(encodeCompositeKey([]Value{key}))
 }
 
+// countKey returns how many PKs a single-column index holds for key, without
+// allocating a candidate slice (unlike lookup). Used by COUNT(*) WHERE col = ?
+// when the index is authoritative (no pending dirty overlay).
+func (si *secIndex) countKey(key Value) int {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
+	k := keyOf(key)
+	if !si.ordered {
+		return len(si.fwd[k])
+	}
+	lo := sort.Search(len(si.sorted), func(i int) bool { return !si.sorted[i].key.less(k) })
+	n := 0
+	for i := lo; i < len(si.sorted) && !k.less(si.sorted[i].key); i++ {
+		n++
+	}
+	return n
+}
+
 // indexByOrdinals returns the secondary index whose columns are exactly ords, in
 // order, or nil. Locates a composite index chosen at plan time (stored as its
 // ordinal list on the plan).

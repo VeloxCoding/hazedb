@@ -421,6 +421,116 @@ func BenchmarkFetchByScan_SQLiteMem(b *testing.B) {
 	}
 }
 
+// ---- COUNT(*) over an indexed column (compareN/countBuckets rows per key) ----
+// A separate table c(id PK, bucket [INDEX], n) with compareN rows spread over
+// countBuckets buckets, so COUNT(*) WHERE bucket = ? counts ~100 rows resolved
+// through the index — not a full scan, and not a single row.
+const countBuckets = 100
+
+func newCountIdxDB(b *testing.B) *DB {
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: compareN})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { db.Close() })
+	db.Exec("CREATE TABLE c (id uuid primary key, bucket text, n int, INDEX (bucket))")
+	for i := 0; i < compareN; i++ {
+		db.Exec("INSERT INTO c (id, bucket, n) VALUES (?, ?, ?)", tid(i), "b"+strconv.Itoa(i%countBuckets), i)
+	}
+	db.mergeIndexes()
+	return db
+}
+
+func newCountIdxSQLite(b *testing.B) *sql.DB {
+	d, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		b.Fatal(err)
+	}
+	d.SetMaxOpenConns(1)
+	b.Cleanup(func() { d.Close() })
+	d.Exec("CREATE TABLE c (id BLOB PRIMARY KEY, bucket TEXT, n INTEGER)")
+	d.Exec("CREATE INDEX idx_c_bucket ON c(bucket)")
+	ins, _ := d.Prepare("INSERT INTO c (id, bucket, n) VALUES (?, ?, ?)")
+	for i := 0; i < compareN; i++ {
+		ins.Exec(key16(i), "b"+strconv.Itoa(i%countBuckets), i)
+	}
+	ins.Close()
+	return d
+}
+
+func BenchmarkCountByIndex_hazedb_Mem(b *testing.B) {
+	db := newCountIdxDB(b)
+	want := int64(compareN / countBuckets)
+	keys := make([]string, countBuckets) // prebuilt: the key string is not part of the op
+	for i := range keys {
+		keys[i] = "b" + strconv.Itoa(i)
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, r, err := db.Query("SELECT COUNT(*) FROM c WHERE bucket = ?", keys[i%countBuckets])
+		if err != nil || r[0][0].Int() != want {
+			b.Fatalf("err=%v rows=%v", err, r)
+		}
+	}
+}
+
+// Typed-arg variant: QueryValues skips the []any boxing + conversion, isolating
+// hazedb's own count-result allocations.
+func BenchmarkCountByIndex_hazedb_Typed(b *testing.B) {
+	db := newCountIdxDB(b)
+	want := int64(compareN / countBuckets)
+	keys := make([]Value, countBuckets)
+	for i := range keys {
+		keys[i] = Str("b" + strconv.Itoa(i))
+	}
+	argv := make([]Value, 1)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		argv[0] = keys[i%countBuckets]
+		_, r, err := db.QueryValues("SELECT COUNT(*) FROM c WHERE bucket = ?", argv...)
+		if err != nil || r[0][0].Int() != want {
+			b.Fatalf("err=%v rows=%v", err, r)
+		}
+	}
+}
+
+func BenchmarkCountByIndex_SQLiteMem(b *testing.B) {
+	s, _ := newCountIdxSQLite(b).Prepare("SELECT COUNT(*) FROM c WHERE bucket = ?")
+	defer s.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var n int64
+		if err := s.QueryRow("b" + strconv.Itoa(i%countBuckets)).Scan(&n); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// JSON variant: QueryJSONInto into a reused buffer is the adapter path
+// (fetchall_json / HTTP). For COUNT(*) it should encode alloc-free.
+func BenchmarkCountByIndex_hazedb_JSON(b *testing.B) {
+	db := newCountIdxDB(b)
+	keys := make([]Value, countBuckets)
+	for i := range keys {
+		keys[i] = Str("b" + strconv.Itoa(i))
+	}
+	argv := make([]Value, 1)
+	dst := make([]byte, 0, 64)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		argv[0] = keys[i%countBuckets]
+		_, js, err := db.QueryJSONInto(dst[:0], "SELECT COUNT(*) FROM c WHERE bucket = ?", argv...)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = js
+	}
+}
+
 // ---- UPDATE by indexed column / by scan (1 row; WHERE column unchanged) ----
 func BenchmarkUpdateByIndex_hazedb_Mem(b *testing.B) {
 	db := newIdxScanDB(b)

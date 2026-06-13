@@ -7,6 +7,7 @@ type stmt interface{ isStmt() }
 type selectStmt struct {
 	cols      []resultCol // empty means *
 	starAll   bool
+	countStar bool // SELECT COUNT(*) — the sole aggregate; cols is empty
 	table     string
 	alias     string       // FROM table alias ("" = none; the table name still qualifies)
 	joins     []joinClause // v1: at most one (two-table join)

@@ -229,8 +229,7 @@ func (db *DB) ExecValues(sql string, args ...Value) (int, error) {
 // execPlan runs a non-SELECT plan against raw args. Shared by Exec (which looks
 // the plan up by SQL each call) and *Stmt.Exec (which holds a compiled plan).
 func (db *DB) execPlan(pl *plan, args []any) (int, error) {
-	var argBuf [8]Value
-	vargs, err := toValuesInto(args, argBuf[:])
+	vargs, err := toValues(args)
 	if err != nil {
 		return 0, err
 	}
@@ -335,7 +334,7 @@ func (db *DB) queryPlan(pl *plan, args []any) ([]string, []Row, error) {
 	if _, ok := pl.st.(*selectStmt); !ok {
 		return nil, nil, fmt.Errorf("hazedb: Query used with non-SELECT — use Exec instead")
 	}
-	if pl.pkLookup {
+	if pl.pkLookup && !pl.countStar {
 		keyVal, ok, err := pl.pkKeyFromArgs(args)
 		if err != nil {
 			return nil, nil, err
@@ -357,6 +356,13 @@ func (db *DB) queryPlan(pl *plan, args []any) ([]string, []Row, error) {
 func (db *DB) queryPlanV(pl *plan, vargs []Value) ([]string, []Row, error) {
 	if err := pl.checkArgs(len(vargs)); err != nil {
 		return nil, nil, err
+	}
+	if pl.countStar {
+		n, err := db.countRows(pl, vargs)
+		if err != nil {
+			return nil, nil, err
+		}
+		return pl.colNames, []Row{{Int(n)}}, nil
 	}
 	if pl.pkLookup {
 		keyVal, err := evalLitOrParamValue(pl.pkSource, vargs)
@@ -390,7 +396,7 @@ func (db *DB) queryRowPlan(pl *plan, args []any) ([]string, Row, error) {
 	if _, ok := pl.st.(*selectStmt); !ok {
 		return nil, nil, fmt.Errorf("hazedb: QueryRow used with non-SELECT — use Exec instead")
 	}
-	if pl.pkLookup {
+	if pl.pkLookup && !pl.countStar {
 		keyVal, ok, err := pl.pkKeyFromArgs(args)
 		if err != nil {
 			return nil, nil, err
@@ -413,6 +419,13 @@ func (db *DB) queryRowPlan(pl *plan, args []any) ([]string, Row, error) {
 func (db *DB) queryRowPlanV(pl *plan, vargs []Value) ([]string, Row, error) {
 	if err := pl.checkArgs(len(vargs)); err != nil {
 		return nil, nil, err
+	}
+	if pl.countStar {
+		n, err := db.countRows(pl, vargs)
+		if err != nil {
+			return nil, nil, err
+		}
+		return pl.colNames, Row{Int(n)}, nil
 	}
 	if pl.pkLookup {
 		keyVal, err := evalLitOrParamValue(pl.pkSource, vargs)

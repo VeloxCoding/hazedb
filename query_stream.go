@@ -1,6 +1,9 @@
 package hazedb
 
-import "fmt"
+import (
+	"fmt"
+	"strconv"
+)
 
 // Streaming reads — QueryEach / QueryJSON visit or encode result rows WITHOUT
 // the []Row + per-row clone that Query/QueryValues build. For consumers that
@@ -16,16 +19,69 @@ import "fmt"
 // arena in place and BYTES backings are reused, so a retained alias is a
 // use-after-free, not just staleness. Use Query when you need owned rows.
 
-// selectEach runs a SELECT plan and calls visit once per result row, in order,
-// honoring WHERE / projection / ORDER BY / LIMIT exactly like execSelect. visit
-// returns false to stop early. Returns the result column names.
+// selectEach runs a SELECT plan and calls visit once per result row. A COUNT(*)
+// plan emits exactly one row, [count]; every other plan streams via streamSelect.
+func (db *DB) selectEach(pl *plan, args []Value, visit func(row Row) bool) ([]string, error) {
+	if pl.countStar {
+		n, err := db.countRows(pl, args)
+		if err != nil {
+			return nil, err
+		}
+		visit(Row{Int(n)})
+		return pl.colNames, nil
+	}
+	return db.streamSelect(pl, args, visit)
+}
+
+// countRows counts the rows a COUNT(*) plan's WHERE matches, without
+// materializing them: a PK-pinned count is 0 or 1 via the point reader; any
+// other reuses the streamSelect dispatch with a counting visitor (pkLookup is
+// false there, so this never re-enters the count path).
+func (db *DB) countRows(pl *plan, args []Value) (int64, error) {
+	if pl.pkLookup {
+		keyVal, err := evalLitOrParamValue(pl.pkSource, args)
+		if err != nil {
+			return 0, err
+		}
+		_, rows, err := db.execSelectPK(pl, keyVal)
+		return int64(len(rows)), err
+	}
+	// Index-bucket fast path: when WHERE is one indexed equality, the merged index
+	// bucket size IS the count — no row fetch, no per-row recheck. This reads the
+	// index as of the last merge, so the result reflects state up to one merge
+	// interval old (~50ms by default); pending writes in the dirty overlay are not
+	// reconciled. That bounded staleness is the deliberate contract for an indexed
+	// COUNT(*): a count is consumed and acted on after the fact, by which point the
+	// true total has moved anyway, and reconciling the overlay costs more than the
+	// staleness is worth. (Unindexed COUNT(*) below still reads live rows.)
+	if pl.countIdxBucket {
+		keyVal, err := evalLitOrParamValue(pl.idxSrcs[0], args)
+		if err != nil {
+			return 0, err
+		}
+		if keyVal.IsNull() {
+			return 0, nil // NULL matches nothing
+		}
+		if si := pl.rt.table.indexFor(pl.idxCols[0]); si != nil {
+			return int64(si.countKey(keyVal)), nil
+		}
+		// Index unexpectedly absent — fall through to the live streaming count.
+	}
+	var n int64
+	_, err := db.streamSelect(pl, args, func(Row) bool { n++; return true })
+	return n, err
+}
+
+// streamSelect runs a non-count SELECT plan and calls visit once per result row,
+// in order, honoring WHERE / projection / ORDER BY / LIMIT exactly like
+// execSelect. visit returns false to stop early. Returns the result column names.
 //
 // No-ORDER-BY scan and indexed-equality reads STREAM: visit sees the live row
 // (projected into a reused scratch — Value headers only, no clone) under its
 // shard lock. ORDER BY, ordered-index walks, and PK lookups fall back to the
 // materialized path and visit owned clones — they must buffer (to sort) or are
 // trivially one row, so there is nothing to stream.
-func (db *DB) selectEach(pl *plan, args []Value, visit func(row Row) bool) ([]string, error) {
+func (db *DB) streamSelect(pl *plan, args []Value, visit func(row Row) bool) ([]string, error) {
 	st := pl.st.(*selectStmt)
 	tbl := pl.rt
 	colNames := pl.colNames
@@ -209,6 +265,18 @@ func (db *DB) QueryJSONInto(dst []byte, sql string, args ...Value) ([]string, []
 	}
 	cols := pl.colNames
 	prefix := pl.colJSONPrefix
+	// COUNT(*) is one int row: append [{"count":N}] straight into dst, skipping the
+	// per-row visitor and its Row allocation (a reused dst then encodes alloc-free).
+	if pl.countStar {
+		n, err := db.countRows(pl, args)
+		if err != nil {
+			return nil, nil, err
+		}
+		buf := append(dst, '[', '{')
+		buf = append(buf, prefix[0]...)
+		buf = strconv.AppendInt(buf, n, 10)
+		return cols, append(buf, '}', ']'), nil
+	}
 	buf := append(dst, '[')
 	first := true
 	if _, err = db.selectEach(pl, args, func(row Row) bool {

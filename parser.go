@@ -3,6 +3,7 @@ package hazedb
 import (
 	"fmt"
 	"strconv"
+	"strings"
 )
 
 // Parse turns one SQL statement into a stmt AST. Trailing semicolon
@@ -322,7 +323,20 @@ func (p *parser) parseSelect() (*selectStmt, error) {
 	p.advance() // SELECT
 	st := &selectStmt{limit: -1}
 
-	if p.peek().kind == tkStar {
+	if p.peek().kind == tkIdent && strings.EqualFold(p.peek().text, "count") {
+		// COUNT(*) — the only aggregate, parsed as a whole-projection special case.
+		p.advance() // COUNT
+		if _, err := p.expect(tkLParen, "( after COUNT"); err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(tkStar, "* in COUNT(*)"); err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(tkRParen, ") to close COUNT(*)"); err != nil {
+			return nil, err
+		}
+		st.countStar = true
+	} else if p.peek().kind == tkStar {
 		p.advance()
 		st.starAll = true
 	} else {
@@ -409,6 +423,10 @@ func (p *parser) parseSelect() (*selectStmt, error) {
 			return nil, fmt.Errorf("%w: bad OFFSET integer: %v", ErrParse, err)
 		}
 		st.offset = m
+	}
+
+	if st.countStar && (st.orderCol != "" || st.limit != -1 || st.offset != 0 || len(st.joins) > 0) {
+		return nil, fmt.Errorf("%w: COUNT(*) supports only FROM and WHERE (no JOIN/ORDER BY/LIMIT/OFFSET)", ErrParse)
 	}
 
 	return st, nil

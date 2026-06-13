@@ -114,7 +114,17 @@ type plan struct {
 	// then go straight through tableShard.getByPK and skip the full
 	// scan. pkSource is the expression that yields the key.
 	pkLookup bool
-	pkSource expr
+
+	// countStar is true for SELECT COUNT(*): the WHERE planning below still runs
+	// (pkLookup / idxLookup / partLookup / scan), but the executor counts matches
+	// instead of projecting rows. colNames is ["count"].
+	countStar bool
+	// countIdxBucket is set when countStar's WHERE is exactly one single-column
+	// indexed equality (col = ?): the executor returns the merged index bucket size
+	// directly, touching no rows. The count is as of the last index merge (bounded
+	// staleness ~50ms); see countRows.
+	countIdxBucket bool
+	pkSource       expr
 
 	// partLookup is true when a SELECT on a partitioned table pins the
 	// PartitionKey column to a value (WHERE thread = ?). The executor then
@@ -199,27 +209,34 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 			}
 			return pl, nil
 		}
-		if !s.starAll {
-			pl.projOrdinals = make([]int, 0, len(s.cols))
-			for _, c := range s.cols {
-				ord, ok := rt.colByName[c.col]
-				if !ok {
-					return nil, fmt.Errorf("%w: %q.%q", ErrUnknownColumn, tname, c.col)
-				}
-				pl.projOrdinals = append(pl.projOrdinals, ord)
-			}
-		}
-		// Output column names, computed once and reused by every Query on this
-		// cached plan (read-only).
-		if s.starAll {
-			pl.colNames = make([]string, len(rt.def.Columns))
-			for i, c := range rt.def.Columns {
-				pl.colNames[i] = c.Name
-			}
+		if s.countStar {
+			// COUNT(*): one int result, no row projection. The WHERE planning below
+			// still runs; the executor counts matches instead of projecting.
+			pl.countStar = true
+			pl.colNames = []string{"count"}
 		} else {
-			pl.colNames = make([]string, len(s.cols))
-			for i, c := range s.cols {
-				pl.colNames[i] = c.col
+			if !s.starAll {
+				pl.projOrdinals = make([]int, 0, len(s.cols))
+				for _, c := range s.cols {
+					ord, ok := rt.colByName[c.col]
+					if !ok {
+						return nil, fmt.Errorf("%w: %q.%q", ErrUnknownColumn, tname, c.col)
+					}
+					pl.projOrdinals = append(pl.projOrdinals, ord)
+				}
+			}
+			// Output column names, computed once and reused by every Query on this
+			// cached plan (read-only).
+			if s.starAll {
+				pl.colNames = make([]string, len(rt.def.Columns))
+				for i, c := range rt.def.Columns {
+					pl.colNames[i] = c.Name
+				}
+			} else {
+				pl.colNames = make([]string, len(s.cols))
+				for i, c := range s.cols {
+					pl.colNames[i] = c.col
+				}
 			}
 		}
 		// Pre-escape each column's "col": object-key fragment once, so the
@@ -271,6 +288,14 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 				pl.idxLookup = len(pl.idxCols) > 0
 				if !pl.idxLookup {
 					rt.planComposite(pl, s.where, eqs, pl.orderOrdinal)
+				}
+				// COUNT(*) WHERE col = ? on a single indexed column, and the WHERE is
+				// exactly that equality (a bare tkEq, no residual conjuncts): the index
+				// bucket size is the answer when the index is clean. See countRows.
+				if pl.countStar && pl.idxLookup && len(pl.idxCols) == 1 {
+					if be, ok := s.where.(*binOp); ok && be.op == tkEq {
+						pl.countIdxBucket = true
+					}
 				}
 			}
 		}
