@@ -582,7 +582,7 @@ func (db *DB) prepare(sql string, cat *catalog) (*plan, error) {
 // before the break was already applied; the unparseable suffix is skipped and
 // recovery continues with the next segment rather than aborting Open.
 func (db *DB) onWALCorrupt(seg uint64, err error) {
-	db.logEvent("wal-corruption", fmt.Sprintf("segment %d during recovery: %v — good prefix recovered, suffix skipped", seg, err))
+	db.logEvent("error", "wal-corruption", fmt.Sprintf("segment %d during recovery: %v — good prefix recovered, suffix skipped", seg, err))
 }
 
 // replayWAL rebuilds state from the log. It is single-threaded (runs inside

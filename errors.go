@@ -17,4 +17,5 @@ var (
 	ErrTxUnsupported = errors.New("hazedb: operation not supported in a transaction")
 	ErrBatchTooLarge = errors.New("hazedb: atomic batch too large")
 	ErrCapacity      = errors.New("hazedb: store byte capacity exceeded")
+	ErrReservedName  = errors.New("hazedb: table name uses the reserved _hz_ prefix")
 )

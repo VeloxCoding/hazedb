@@ -80,7 +80,35 @@ func openCompanion(path string) (*sqliteMirror, error) {
 			}
 		}
 	}
-	return &sqliteMirror{sdb: sdb, tables: map[uint16]*drainTable{}}, nil
+	comp := &sqliteMirror{sdb: sdb, tables: map[uint16]*drainTable{}}
+	if err := comp.ensureOps(); err != nil {
+		sdb.Close()
+		return nil, err
+	}
+	return comp, nil
+}
+
+// ensureOps creates the operational tables present in every companion, in every
+// mode (memory-only included): today the _hz_events log; periodic /meta samples
+// land here later. Run by openCompanion, before any mirror activation.
+func (m *sqliteMirror) ensureOps() error {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS _hz_events (
+	id      INTEGER PRIMARY KEY,
+	ts      INTEGER NOT NULL,
+	level   TEXT    NOT NULL,
+	kind    TEXT    NOT NULL,
+	message TEXT    NOT NULL,
+	data    TEXT
+)`,
+		`CREATE INDEX IF NOT EXISTS _hz_events_ts ON _hz_events(ts)`,
+	}
+	for _, s := range stmts {
+		if _, err := m.sdb.Exec(s); err != nil {
+			return fmt.Errorf("companion: ops tables: %w", err)
+		}
+	}
+	return nil
 }
 
 // activateMirror turns the companion into the data mirror: ensure the mirror meta
@@ -336,9 +364,6 @@ func (db *DB) drainSegment(n uint64, path string) error {
 		tx.Rollback()
 		return fmt.Errorf("mirror: drain segment %d: %w", n, applyErr)
 	}
-	if applyErr != nil {
-		db.logEvent("wal-corruption", fmt.Sprintf("segment %d during drain: %v — good prefix mirrored, suffix skipped", n, applyErr))
-	}
 	if _, err := tx.Exec(
 		`INSERT INTO _hz_meta (k, v) VALUES ('last_drained_segment', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`,
 		int64(n),
@@ -353,6 +378,11 @@ func (db *DB) drainSegment(n uint64, path string) error {
 	// Reclaim WAL disk: this segment's records are now durably in SQLite, which
 	// is the recovery source for everything up to lastDrained.
 	_ = os.Remove(path)
+	// Log AFTER the commit: logEvent writes to the companion on the same single
+	// connection the transaction above held, so logging mid-tx would deadlock.
+	if applyErr != nil {
+		db.logEvent("error", "wal-corruption", fmt.Sprintf("segment %d during drain: %v — good prefix mirrored, suffix skipped", n, applyErr))
+	}
 	return nil
 }
 
@@ -491,12 +521,12 @@ func (db *DB) startDrainLoop(interval time.Duration) {
 				// mirror, then drain every sealed segment.
 				_ = db.wal.flush()
 				if err := db.drainOnce(); err != nil {
-					db.logEvent("drain-error", err.Error())
+					db.logEvent("error", "drain-error", err.Error())
 				}
 				return
 			case <-t.C:
 				if err := db.drainOnce(); err != nil {
-					db.logEvent("drain-error", err.Error())
+					db.logEvent("error", "drain-error", err.Error())
 				}
 			}
 		}

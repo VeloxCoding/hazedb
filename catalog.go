@@ -3,6 +3,7 @@ package hazedb
 import (
 	"encoding/binary"
 	"fmt"
+	"strings"
 )
 
 // catalog is the immutable set of tables, published behind DB.cat
@@ -89,6 +90,12 @@ func (db *DB) createTable(td TableDef) error {
 	cur := db.cat.Load()
 	if _, exists := cur.byName[td.Name]; exists {
 		return fmt.Errorf("%w: %q", ErrTableExists, td.Name)
+	}
+	// The _hz_ namespace is reserved for the companion's own tables; a user table
+	// there would collide with them in the mirror. Match case-insensitively, since
+	// SQLite identifiers are.
+	if strings.HasPrefix(strings.ToLower(td.Name), reservedTablePrefix) {
+		return fmt.Errorf("%w: %q", ErrReservedName, td.Name)
 	}
 	resolved, err := resolveSchema(Schema{Tables: []TableDef{td}})
 	if err != nil {
