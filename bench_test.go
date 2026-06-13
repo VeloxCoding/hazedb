@@ -330,7 +330,7 @@ func BenchmarkSelectByPKViaStmtNoSQL(b *testing.B) {
 }
 
 // Round-trip parse+plan on every call. Establishes the baseline cost
-// of FASTSQL's interpreter path.
+// of hazedb's interpreter path.
 func BenchmarkRoundtripSelectByPK(b *testing.B) {
 	const N = 10000
 	db := newBenchDB(b, N)
