@@ -11,7 +11,7 @@ import (
 	_ "modernc.org/sqlite"          // pure-Go driver: "sqlite"
 )
 
-// These benchmarks compare FASTSQL's interpreter path to SQLite (via
+// These benchmarks compare hazedb's interpreter path to SQLite (via
 // database/sql, both the cgo and pure-Go drivers). Same logical operation:
 // INSERT one user, SELECT one user by PK, UPDATE by PK, DELETE by PK. Same row
 // shape (id, name, age).
@@ -194,7 +194,7 @@ func BenchmarkUpdateByPK_SQLitePureMem(b *testing.B) {
 
 // -------- INSERT --------
 
-func BenchmarkInsert_FASTSQL_Mem(b *testing.B) {
+func BenchmarkInsert_hazedb_Mem(b *testing.B) {
 	db, _ := Open(Options{Schema: benchSchema(), sizeHint: b.N})
 	defer db.Close()
 	b.ResetTimer()
@@ -218,7 +218,7 @@ func BenchmarkInsert_SQLite(b *testing.B) {
 
 // -------- SELECT BY PK --------
 
-func BenchmarkSelectByPK_FASTSQL_Mem(b *testing.B) {
+func BenchmarkSelectByPK_hazedb_Mem(b *testing.B) {
 	db := newBenchDB(b, compareN)
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -243,7 +243,7 @@ func BenchmarkSelectByPK_SQLite(b *testing.B) {
 
 // -------- UPDATE BY PK --------
 
-func BenchmarkUpdateByPK_FASTSQL_Mem(b *testing.B) {
+func BenchmarkUpdateByPK_hazedb_Mem(b *testing.B) {
 	db := newBenchDB(b, compareN)
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -268,7 +268,7 @@ func BenchmarkUpdateByPK_SQLite(b *testing.B) {
 // to avoid running out, so the work isn't symmetric across stores;
 // reinsert overhead is included in every iter.)
 
-func BenchmarkDeleteByPK_FASTSQL_Mem(b *testing.B) {
+func BenchmarkDeleteByPK_hazedb_Mem(b *testing.B) {
 	db, _ := Open(Options{Schema: benchSchema(), sizeHint: b.N})
 	defer db.Close()
 	for i := 0; i < b.N; i++ {
@@ -302,7 +302,7 @@ func BenchmarkDeleteByPK_SQLite(b *testing.B) {
 }
 
 // -------- DELETE BY PK (in-memory, fair RAM-vs-RAM) --------
-// Mirrors BenchmarkDeleteByPK_FASTSQL_Mem: fresh in-memory store, insert b.N
+// Mirrors BenchmarkDeleteByPK_hazedb_Mem: fresh in-memory store, insert b.N
 // rows, then time deleting them.
 func BenchmarkDeleteByPK_SQLiteMem(b *testing.B) {
 	d, err := sql.Open("sqlite3", ":memory:")
@@ -380,7 +380,7 @@ func newIdxScanSQLite(b *testing.B) *sql.DB {
 }
 
 // ---- FETCH by indexed column / by scan ----
-func BenchmarkFetchByIndex_FASTSQL_Mem(b *testing.B) {
+func BenchmarkFetchByIndex_hazedb_Mem(b *testing.B) {
 	db := newIdxScanDB(b)
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -400,7 +400,7 @@ func BenchmarkFetchByIndex_SQLiteMem(b *testing.B) {
 		s.QueryRow("e" + strconv.Itoa(i%compareN)).Scan(&a)
 	}
 }
-func BenchmarkFetchByScan_FASTSQL_Mem(b *testing.B) {
+func BenchmarkFetchByScan_hazedb_Mem(b *testing.B) {
 	db := newIdxScanDB(b)
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -422,7 +422,7 @@ func BenchmarkFetchByScan_SQLiteMem(b *testing.B) {
 }
 
 // ---- UPDATE by indexed column / by scan (1 row; WHERE column unchanged) ----
-func BenchmarkUpdateByIndex_FASTSQL_Mem(b *testing.B) {
+func BenchmarkUpdateByIndex_hazedb_Mem(b *testing.B) {
 	db := newIdxScanDB(b)
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -444,7 +444,7 @@ func BenchmarkUpdateByIndex_SQLiteMem(b *testing.B) {
 		s.Exec((i%100)+1, "e"+strconv.Itoa(i%compareN))
 	}
 }
-func BenchmarkUpdateByScan_FASTSQL_Mem(b *testing.B) {
+func BenchmarkUpdateByScan_hazedb_Mem(b *testing.B) {
 	db := newIdxScanDB(b)
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -464,7 +464,7 @@ func BenchmarkUpdateByScan_SQLiteMem(b *testing.B) {
 
 // ---- DELETE by indexed column / by scan (insert a fresh row untimed, time its
 // removal; table size stays ~constant) ----
-func BenchmarkDeleteByIndex_FASTSQL_Mem(b *testing.B) {
+func BenchmarkDeleteByIndex_hazedb_Mem(b *testing.B) {
 	db := newIdxScanDB(b)
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -493,7 +493,7 @@ func BenchmarkDeleteByIndex_SQLiteMem(b *testing.B) {
 		del.Exec(em)
 	}
 }
-func BenchmarkDeleteByScan_FASTSQL_Mem(b *testing.B) {
+func BenchmarkDeleteByScan_hazedb_Mem(b *testing.B) {
 	db := newIdxScanDB(b)
 	b.ResetTimer()
 	b.ReportAllocs()
