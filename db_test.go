@@ -748,8 +748,9 @@ func TestWALPartialTail(t *testing.T) {
 	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "alice", 30)
 	db.Close()
 
-	// Append garbage that looks like the start of a record but is
-	// truncated. Replay must tolerate the dangling tail.
+	// Append garbage that looks like the start of a record but is truncated.
+	// Born-sealed: replay flags the dangling tail as framing corruption (logged),
+	// recovers the committed prefix, and still boots.
 	f, err := os.OpenFile(walSegmentFile(t, path), os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		t.Fatal(err)

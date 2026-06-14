@@ -153,10 +153,10 @@ func TestRejectedDuplicateInsertDoesNotCorruptWAL(t *testing.T) {
 	}
 }
 
-// A WAL whose final record carries a corrupt, oversized length must be
-// treated as a truncated tail — not cause an over-allocation (OOM) or a
-// hard error. Recovery must bounds-check the declared length against the
-// bytes actually remaining before allocating/reading the body.
+// A WAL whose final record carries a corrupt, oversized length must be flagged
+// as framing corruption (logged, committed prefix recovered) — never an
+// over-allocation (OOM) or a hard error. Recovery bounds-checks the declared
+// length against the bytes actually remaining before allocating/reading the body.
 func TestWALCorruptTailLengthIsBounded(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "huge.wal")

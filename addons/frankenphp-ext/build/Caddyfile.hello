@@ -1,0 +1,11 @@
+{
+	auto_https off
+	frankenphp {
+		worker /work/hello_worker.php
+	}
+}
+
+:8080 {
+	root * /work
+	php_server
+}

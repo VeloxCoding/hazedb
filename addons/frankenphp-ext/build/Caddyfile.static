@@ -1,0 +1,7 @@
+{
+	auto_https off
+}
+
+:8080 {
+	respond "Hello, World!" 200
+}

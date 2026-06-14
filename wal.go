@@ -276,15 +276,18 @@ func (w *wal) replayFile(f *os.File, apply func(recType uint8, payload []byte) e
 // (type, payload) to apply. Pure — it touches no WAL state, so a drainer can
 // scan a segment without disturbing the live WAL.
 //
-// Tail tolerance is narrow: a SHORT read (truncated header/payload) or a declared
-// length past EOF is the incomplete tail of an interrupted write and is discarded
-// (returns nil). A non-current version returns ErrWALVersion, and an apply() error
-// (an undecodable but CRC-valid payload, or an unknown record type) propagates
-// unchanged — both are FATAL: the bytes are intact/intentional, so the caller must
-// STOP, never silently drop a committed record. A bad magic or a CRC mismatch on a
-// fully-present record is different — it is bit-rot — and returns errWALFraming
-// after every good record before it has been applied; the framing is unreadable
-// past that point, so the caller logs and skips the rest of the segment.
+// Born-sealed means a visible segment is complete by construction, so any short
+// or truncated tail is corruption, not an interrupted write: a partial header, a
+// truncated payload, or a declared length running past EOF all return
+// errWALFraming, as does a bad magic or a CRC mismatch on a fully-present record.
+// These are one and the same non-fatal break — the caller applies the good prefix
+// before it, logs, and skips the rest of the segment, so a truncated suffix is
+// reported rather than silently dropped. A clean EOF on a record boundary is the
+// normal end of segment and returns nil. A non-current version returns
+// ErrWALVersion, and an apply() error (an undecodable but CRC-valid payload, or an
+// unknown record type) propagates unchanged — both FATAL: the bytes are
+// intact/intentional, so the caller must STOP, never silently drop a committed
+// record.
 // payload aliases the read buffer; the caller's decoders copy what they keep.
 func scanRecords(f *os.File, apply func(recType uint8, payload []byte) error) error {
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
@@ -307,7 +310,9 @@ func scanRecords(f *os.File, apply func(recType uint8, payload []byte) error) er
 			return nil
 		}
 		if err == io.ErrUnexpectedEOF {
-			return nil // partial header at tail — tolerated
+			// Partial header. Born-sealed: a sealed segment is complete, so trailing
+			// bytes shorter than a header are corruption, not an interrupted write.
+			return fmt.Errorf("%w: partial header at offset %d", errWALFraming, pos)
 		}
 		if err != nil {
 			return err
@@ -324,11 +329,11 @@ func scanRecords(f *os.File, apply func(recType uint8, payload []byte) error) er
 		if version != walVersion {
 			return fmt.Errorf("%w: record version %d != supported %d — shut the old binary down cleanly (which seals + drains the WAL) before upgrading", ErrWALVersion, version, walVersion)
 		}
-		// Bounds-check before allocating: a torn/corrupt tail can carry a bogus
-		// huge length. If payload+crc can't fit in what remains, it is the
-		// truncated tail — stop.
+		// Bounds-check before allocating (also caps a bogus huge length, so a
+		// corrupt record can't drive an OOM). If payload+crc can't fit in what
+		// remains, the record is truncated — corruption under born-sealed.
 		if int64(length)+4 > fileSize-pos {
-			return nil
+			return fmt.Errorf("%w: record length %d past end at offset %d", errWALFraming, length, pos-8)
 		}
 		need := int(length) + 4
 		if cap(buf) < need {
@@ -338,7 +343,7 @@ func scanRecords(f *os.File, apply func(recType uint8, payload []byte) error) er
 		}
 		if _, err := io.ReadFull(r, buf); err != nil {
 			if err == io.ErrUnexpectedEOF {
-				return nil // truncated payload at tail — tolerated
+				return fmt.Errorf("%w: truncated payload at offset %d", errWALFraming, pos-8)
 			}
 			return err
 		}

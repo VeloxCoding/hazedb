@@ -1,0 +1,20 @@
+# Worker-mode benchmark Caddyfile. Two FrankenPHP workers (hazedb + SQLite)
+# keep their PHP script + runtime warm across requests; the hazedb module
+# provisions the process-global *DB so the worker's hazedb_fetch reaches it.
+{
+	auto_https off
+	frankenphp {
+		worker /work/fetch_haze_worker.php
+		worker /work/fetch_lite_worker.php
+	}
+}
+
+:8080 {
+	handle /db/* {
+		hazedb {
+			registry_name default
+		}
+	}
+	root * /work
+	php_server
+}

@@ -1,0 +1,11 @@
+{
+	auto_https off
+	frankenphp {
+		worker /work/wcheck.php 1
+	}
+}
+
+:8080 {
+	root * /work
+	php_server
+}
