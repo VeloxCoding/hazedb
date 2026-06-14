@@ -13,7 +13,7 @@ import (
 // declared in DDL (INDEX (col)). See docs/secondary-indexes.md for the full
 // design (async maintenance + hybrid reads). This file holds the in-memory
 // structures and the async merger: the write path only marks a PK dirty
-// (markDirtyLocked, store.go), and the background merger reconciles the indexes
+// (markDirtyLocked, store_write.go), and the background merger reconciles the indexes
 // against the live rows off the write path.
 //
 // CALLER CONTRACT — an index is NOT a complete row source for a nullable column.
@@ -93,7 +93,7 @@ type ordEntry struct {
 // caller supplying the old value. Guarded by mu.
 type secIndex struct {
 	ordinals []int // one column for a single-column index, more for a composite
-	ordered  bool  // sorted index (equality + ranges + ORDER BY); see O2
+	ordered  bool  // sorted-view index: equality lookups + ORDER BY walks; else a hash fwd map
 	mu       sync.RWMutex
 	fwd      map[indexKey][]UUID // hash mode: value -> PKs
 	rev      map[UUID]indexKey   // pk -> current key (both modes)
@@ -599,8 +599,8 @@ func (db *DB) stopMergeLoop() {
 	db.mergeStop = nil
 }
 
-// mergeIndexes reconciles every indexed table in the current catalog. The
-// explicit trigger (S4); the background loop (S5) drives it on a ticker.
+// mergeIndexes reconciles every indexed table in the current catalog. It is the
+// explicit trigger, and the background merge loop also drives it on a ticker.
 func (db *DB) mergeIndexes() {
 	cat := db.cat.Load()
 	for _, rt := range cat.byID {
