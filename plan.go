@@ -94,21 +94,17 @@ func assignParamIndices(st stmt) int {
 	return n
 }
 
-// insCell is one compiled INSERT VALUES entry. The three shapes are
-// distinguished by arg: a param reads args[arg] at exec; a literal (arg ==
-// insCellLit) is pre-validated and pre-coerced into lit at plan time; anything
-// else (arg == insCellExpr, e.g. ? + 1) falls back to evalExpr on expr.
+// insCell is one compiled INSERT VALUES entry. Two shapes, distinguished by arg:
+// a param reads args[arg] at exec; anything else (arg == insCellExpr, e.g. ? + ?)
+// falls back to evalExpr on expr. Inline value literals are rejected before
+// planning, so a literal never reaches here.
 type insCell struct {
-	ord  int   // target column ordinal
-	arg  int   // >=0: param index; insCellLit: literal; insCellExpr: expr
-	lit  Value // arg == insCellLit: pre-validated, pre-coerced literal
-	expr expr  // arg == insCellExpr: fallback expression
+	ord  int  // target column ordinal
+	arg  int  // >=0: param index; insCellExpr: expr
+	expr expr // arg == insCellExpr: fallback expression
 }
 
-const (
-	insCellLit  = -1
-	insCellExpr = -2
-)
+const insCellExpr = -2
 
 // plan resolves table/column names and validates them. Produces a
 // minimal plan with the resolved table pointer + column ordinals
@@ -382,24 +378,9 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 				if exprRefsColumn(tuple[i]) {
 					return nil, fmt.Errorf("%w: column reference not allowed in INSERT VALUES", ErrParse)
 				}
-				col := rt.def.Columns[ord]
 				cell := insCell{ord: ord, arg: insCellExpr, expr: tuple[i]}
-				switch v := tuple[i].(type) {
-				case *paramRef:
+				if v, ok := tuple[i].(*paramRef); ok {
 					cell.arg, cell.expr = v.index, nil
-				case *litValue:
-					lv := v.v
-					if col.Type == TypeUUID && lv.Kind == KindString {
-						u, perr := ParseUUID(lv.Str())
-						if perr != nil {
-							return nil, perr
-						}
-						lv = UUIDVal(u)
-					}
-					if err := validateValue(col, lv); err != nil {
-						return nil, err
-					}
-					cell.arg, cell.lit, cell.expr = insCellLit, lv, nil
 				}
 				tmpl[i] = cell
 			}

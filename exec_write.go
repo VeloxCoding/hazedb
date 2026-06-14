@@ -79,13 +79,6 @@ func (db *DB) buildRowFromTmpl(pl *plan, tmpl []insCell, args []Value) (Row, err
 	for i := range tmpl {
 		c := &tmpl[i]
 		ord := c.ord
-		if c.arg == insCellLit {
-			row[ord] = c.lit // pre-validated + pre-coerced at plan time
-			if ord == pkOrd {
-				pkProvided = true
-			}
-			continue
-		}
 		var v Value
 		if c.arg >= 0 {
 			if c.arg >= len(args) {
