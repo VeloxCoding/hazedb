@@ -28,8 +28,12 @@ func (db *DB) Prepare(sql string) (*Stmt, error) {
 }
 
 // bound returns the held plan, rebinding it if a CREATE/DROP has changed the
-// catalog since it was compiled. Hot path: one atomic load + version compare.
+// catalog since it was compiled. Hot path: a few atomic loads + a version
+// compare, no lock.
 func (s *Stmt) bound() (*plan, error) {
+	if s.db.closed.Load() {
+		return nil, ErrClosed
+	}
 	cat := s.db.cat.Load()
 	if pl := s.pl.Load(); pl.catVersion == cat.version {
 		return pl, nil

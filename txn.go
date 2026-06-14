@@ -59,6 +59,9 @@ type stagedMut struct {
 // staged statements atomically; returning an error (or any tx.Exec having
 // failed) discards everything — nothing is written to the store or the WAL.
 func (db *DB) Transaction(fn func(*Tx) error) error {
+	if db.closed.Load() {
+		return ErrClosed
+	}
 	tx := &Tx{db: db, cat: db.cat.Load()}
 	cerr := fn(tx)
 	if tx.err != nil {
@@ -331,7 +334,7 @@ func (tx *Tx) commit() error {
 		case opInsert:
 			t.txInsertLocked(a.row, a.cost)
 		case opUpdate:
-			t.txReplaceLocked(a.pk, a.row, a.cost)
+			t.txReplaceLocked(a.pk, a.row, a.cost, t.updateTouchesIndex(a.ords))
 		case opDelete:
 			t.txDeleteLocked(a.pk, a.cost)
 		}
@@ -475,8 +478,10 @@ func (t *table) txInsertLocked(row Row, cost int64) {
 }
 
 // txReplaceLocked overwrites the row at pk with nr in place (PK + PartitionKey
-// are immutable, so the location never changes).
-func (t *table) txReplaceLocked(pk UUID, nr Row, cost int64) {
+// are immutable, so the location never changes). touch reports whether the
+// update changed an indexed column; only then does the row enter the dirty
+// overlay (a non-indexed update leaves every index entry valid).
+func (t *table) txReplaceLocked(pk UUID, nr Row, cost int64, touch bool) {
 	if t.pkDir != nil {
 		loc := t.pkDir.idx[pk]
 		s := &t.shards[loc.shard]
@@ -488,7 +493,9 @@ func (t *table) txReplaceLocked(pk UUID, nr Row, cost int64) {
 	rowID, _ := s.pk.get(pk) // present by commit's overlay-walk contract
 	s.rows[rowID] = nr
 	s.bytes += cost
-	t.markDirtyLocked(s, pk)
+	if touch {
+		t.markDirtyLocked(s, pk)
+	}
 }
 
 // txDeleteLocked tombstones the row at pk and removes its index entry.

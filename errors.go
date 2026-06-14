@@ -19,4 +19,5 @@ var (
 	ErrCapacity          = errors.New("hazedb: store byte capacity exceeded")
 	ErrReservedName      = errors.New("hazedb: table name uses the reserved _hz_ prefix")
 	ErrCompanionInMemory = errors.New("hazedb: companion must be an on-disk file, not in-memory")
+	ErrClosed            = errors.New("hazedb: database is closed")
 )
