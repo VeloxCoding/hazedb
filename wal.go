@@ -38,7 +38,7 @@ import (
 // disk-first database if you need it.
 const (
 	walMagic   uint16 = 0x485A // "HZ"
-	walVersion uint8  = 2      // bumped when opUpdate nsets widened u8->u16; replay rejects any other version
+	walVersion uint8  = 2      // current envelope version; replay rejects any other
 
 	recMutation    uint8 = 1
 	recTxn         uint8 = 2 // transaction: a group of sub-mutations, atomic
@@ -105,11 +105,10 @@ type wal struct {
 	closeErr  error
 }
 
-// openWAL opens (creating if needed) the segment directory and scans for the
-// highest existing segment so the next flush seals after it. It does NOT start
-// the flusher — the caller replays existing segments first, then startFlusher().
-// A leftover *.tmp from a crash mid-flush is removed: it was never renamed into
-// place, so its data is not part of any committed segment.
+// openWAL opens (creating if needed) the segment directory, clears stale segment
+// temps from a crash mid-flush, and scans for the highest existing segment so the
+// next flush seals after it. It does NOT start the flusher — the caller replays
+// existing segments first, then startFlusher().
 func openWAL(dir string) (*wal, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("wal: mkdir %q: %w", dir, err)
@@ -156,8 +155,8 @@ func (w *wal) startFlusher(interval time.Duration) {
 
 // writeRecord serialises one op + payload into the pending buffer. Holds w.mu so
 // records are appended whole and in order. A failed write sets the sticky error
-// and reports it so the caller aborts before applying the mutation to memory
-// (RFC pipeline step 6). When the buffer reaches flushMaxBytes it seals inline.
+// and reports it so the caller aborts before applying the mutation to memory.
+// When the buffer reaches flushMaxBytes it seals inline.
 func (w *wal) writeRecord(recType uint8, payload []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
