@@ -1,6 +1,7 @@
 package hazedb
 
 import (
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -115,6 +116,65 @@ func TestSegmentedRotateTicker(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("rotate ticker did not seal a segment within 3s")
+}
+
+// seedSegments writes n one-row inserts, sealing each into its own segment, so a
+// test can punch a numbering gap by deleting a middle file.
+func seedSegments(t *testing.T, db *DB, n int) {
+	t.Helper()
+	for i := 1; i <= n; i++ {
+		if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(i), "n", i); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.wal.flush(); err != nil { // seal this insert into its own segment
+			t.Fatal(err)
+		}
+	}
+}
+
+// A gap in the undrained segment numbering is data loss: born-sealed numbers
+// never skip, so a missing middle segment means a committed segment vanished and
+// the higher ones depend on it. Recovery must refuse to boot, not replay an
+// inconsistent suffix.
+func TestSegmentedGapRefusesRecovery(t *testing.T) {
+	dir := t.TempDir()
+	db := openSegmented(t, dir, time.Hour)
+	seedSegments(t, db, 3) // segments 1,2,3
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if segs, _ := listSegments(dir); len(segs) != 3 {
+		t.Fatalf("want 3 segments, got %v", segs)
+	}
+	if err := os.Remove((&wal{dir: dir}).segPath(2)); err != nil { // punch a gap at 2
+		t.Fatal(err)
+	}
+	_, err := Open(Options{Schema: testSchema(), WALPath: dir, walFlushInterval: time.Hour, drainInterval: -1})
+	if !errors.Is(err, errWALMissingSegment) {
+		t.Fatalf("Open across a segment gap: got %v, want errWALMissingSegment", err)
+	}
+}
+
+// drainOnce must not advance the cursor past a gap: it drains the contiguous run
+// below the missing segment, then stops with errWALMissingSegment, leaving the
+// cursor below the gap so later segments are never mirrored onto a missing base.
+func TestDrainStopsAtSegmentGap(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(Options{Schema: testSchema(), WALPath: dir, walFlushInterval: time.Hour, drainInterval: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	seedSegments(t, db, 3) // segments 1,2,3
+	if err := os.Remove(db.wal.segPath(2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.drainOnce(); !errors.Is(err, errWALMissingSegment) {
+		t.Fatalf("drainOnce across a gap: got %v, want errWALMissingSegment", err)
+	}
+	if db.sq.lastDrained != 1 {
+		t.Fatalf("cursor advanced past gap: lastDrained = %d, want 1", db.sq.lastDrained)
+	}
 }
 
 // A clean open/close with no writes must not leave an empty segment behind.

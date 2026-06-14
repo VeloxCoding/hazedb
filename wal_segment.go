@@ -91,7 +91,9 @@ func (w *wal) replayFrom(minSeg uint64, apply func(recType uint8, payload []byte
 	return w.replaySegments(minSeg, apply, onCorrupt)
 }
 
-// replaySegments replays segments with number > minSeg, ascending. A segment
+// replaySegments replays segments with number > minSeg, ascending. The tail must
+// be contiguous from minSeg+1: a missing number is errWALMissingSegment and
+// aborts Open, because the higher segments depend on the lost one. A segment
 // whose framing is bit-rot (bad magic / CRC mismatch, i.e. errWALFraming) applies
 // its good prefix, reports the break via onCorrupt, and is skipped from that point
 // on — recovery continues with the next segment instead of aborting. Every other
@@ -103,10 +105,15 @@ func (w *wal) replaySegments(minSeg uint64, apply func(recType uint8, payload []
 	if err != nil {
 		return err
 	}
+	expected := minSeg + 1
 	for _, n := range segs {
 		if n <= minSeg {
 			continue
 		}
+		if n != expected {
+			return fmt.Errorf("%w: missing segment %d before %d in undrained tail", errWALMissingSegment, expected, n)
+		}
+		expected = n + 1
 		f, err := os.Open(w.segPath(n))
 		if err != nil {
 			return err

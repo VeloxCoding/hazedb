@@ -314,6 +314,13 @@ func valueToArg(v Value) any {
 // per transaction. sealedSegments returns only segments below the active one, so
 // every candidate is already flushed, fsynced, and closed — there is no open
 // file to race and no age gate is needed. A no-op when the mirror or WAL is absent.
+//
+// The undrained range is contiguous above the cursor (born-sealed numbers never
+// skip; drained segments are reclaimed from the bottom), so a gap means a
+// committed segment vanished. drainOnce drains the run below the gap and then
+// stops with errWALMissingSegment, leaving the cursor below the gap — advancing
+// past it would mirror later mutations onto a missing base. The drain loop logs
+// and retries on the next tick.
 func (db *DB) drainOnce() error {
 	if !db.mirrorOn || db.wal == nil {
 		return nil
@@ -322,13 +329,18 @@ func (db *DB) drainOnce() error {
 	if err != nil {
 		return err
 	}
+	expected := db.sq.lastDrained + 1
 	for _, n := range sealed {
-		if n <= db.sq.lastDrained {
-			continue
+		if n < expected {
+			continue // already drained
+		}
+		if n != expected {
+			return fmt.Errorf("%w: missing segment %d before %d above drain cursor", errWALMissingSegment, expected, n)
 		}
 		if err := db.drainSegment(n, db.wal.segPath(n)); err != nil {
 			return err
 		}
+		expected = n + 1
 	}
 	return nil
 }

@@ -67,6 +67,15 @@ var crc32c = crc32.MakeTable(crc32.Castagnoli)
 // stay FATAL, because silently dropping a committed record is a data-loss bug.
 var errWALFraming = errors.New("hazedb: WAL framing corrupt")
 
+// errWALMissingSegment marks a gap in the segment numbering above the drain
+// cursor. Born-sealed numbers never skip and drained segments are reclaimed from
+// the bottom, so the undrained range is always contiguous; a missing number means
+// a committed segment was lost externally. Recovery refuses to boot past it and
+// the drain refuses to advance the cursor past it — the higher segments depend on
+// the missing one, so crossing the gap silently would recover an inconsistent
+// state and mirror later mutations onto a missing base.
+var errWALMissingSegment = errors.New("hazedb: WAL segment missing")
+
 // appendU16LE appends v little-endian.
 func appendU16LE(b []byte, v uint16) []byte { return append(b, byte(v), byte(v>>8)) }
 
