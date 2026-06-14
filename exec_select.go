@@ -480,8 +480,11 @@ func (db *DB) compositeWalkArgs(pl *plan, args []Value) (snap []ordEntry, dirtyK
 		prefix[i] = v
 	}
 	ords := si.ordinals
+	// Reuse one cells buffer across every dirty row: buildDirtyCands calls dirtyKey
+	// serially, and encodeCompositeKey copies the cells into a fresh key string, so
+	// the buffer never escapes — one alloc per query instead of one per dirty row.
+	cells := make([]Value, len(ords))
 	dirtyKey = func(r Row) indexKey {
-		cells := make([]Value, len(ords))
 		for i, o := range ords {
 			cells[i] = r[o]
 		}
