@@ -135,3 +135,25 @@ func TestCountStarRejectsClauses(t *testing.T) {
 		}
 	}
 }
+
+// COUNT(*) WHERE ordered_col = ? sizes the equal-key run via two binary searches
+// (countKey, [lo, hi)). Exercise the bounds: a multi-row bucket, the first key in
+// sort order (lo == 0), the last (hi == len), a single-row bucket, and a missing
+// key between two buckets (lo == hi → 0).
+func TestCountOrderedIndexBucket(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE c (id uuid primary key, bucket text, ORDERED INDEX (bucket))")
+	for _, bk := range []string{"a", "m", "a", "z", "m", "a"} { // sorted runs: a:3, m:2, z:1
+		db.Exec("INSERT INTO c (id, bucket) VALUES (?, ?)", NewUUIDv7(), bk)
+	}
+	db.mergeIndexes() // authoritative index → COUNT routes through countKey
+	for _, tc := range []struct {
+		key  string
+		want int64
+	}{{"a", 3}, {"m", 2}, {"z", 1}, {"q", 0}} { // a first, z last, q missing (a<m<q<z)
+		_, r, err := db.Query("SELECT COUNT(*) FROM c WHERE bucket = ?", tc.key)
+		if err != nil || len(r) != 1 || r[0][0].Int() != tc.want {
+			t.Fatalf("COUNT bucket=%q: got %v (err %v), want %d", tc.key, r, err, tc.want)
+		}
+	}
+}

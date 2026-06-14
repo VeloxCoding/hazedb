@@ -462,8 +462,10 @@ func (si *secIndex) lookupLeading(key Value) []UUID {
 }
 
 // countKey returns how many PKs a single-column index holds for key, without
-// allocating a candidate slice (unlike lookup). Used by COUNT(*) WHERE col = ?
-// when the index is authoritative (no pending dirty overlay).
+// allocating a candidate slice (unlike lookup). Hash: O(1) bucket length. Ordered:
+// the equal-key run sized by two binary searches (hi - lo), O(log N) and flat in
+// bucket size. Used by COUNT(*) WHERE col = ? when the index is authoritative (no
+// pending dirty overlay).
 func (si *secIndex) countKey(key Value) int {
 	si.mu.RLock()
 	defer si.mu.RUnlock()
@@ -471,12 +473,10 @@ func (si *secIndex) countKey(key Value) int {
 	if !si.ordered {
 		return len(si.fwd[k])
 	}
+	// equal-range: [lo, hi) is the run of entries whose key == k.
 	lo := sort.Search(len(si.sorted), func(i int) bool { return !si.sorted[i].key.less(k) })
-	n := 0
-	for i := lo; i < len(si.sorted) && !k.less(si.sorted[i].key); i++ {
-		n++
-	}
-	return n
+	hi := sort.Search(len(si.sorted), func(i int) bool { return k.less(si.sorted[i].key) })
+	return hi - lo
 }
 
 // indexByOrdinals returns the secondary index whose columns are exactly ords, in
