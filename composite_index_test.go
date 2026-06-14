@@ -302,6 +302,29 @@ func TestCompositeWalkNullableFallsBack(t *testing.T) {
 	}
 }
 
+// Single-column analogue: an ordered index excludes NULL values, so ORDER BY a
+// nullable indexed column must NOT walk the index (the walk reads only the index
+// snapshot + dirty overlay, so after a merge the NULL rows vanish) — it falls
+// back to scan+sort, which sees every row.
+func TestOrderWalkNullableFallsBack(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE t (id uuid primary key, email text null, ORDERED INDEX (email))")
+	db.Exec("INSERT INTO t (id, email) VALUES (?, ?)", NewUUIDv7(), "a")
+	db.Exec("INSERT INTO t (id) VALUES (?)", NewUUIDv7()) // email NULL — excluded from the index
+	db.mergeIndexes()
+
+	pl, err := db.prepare("SELECT id, email FROM t ORDER BY email", db.cat.Load())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pl.orderWalk {
+		t.Fatalf("ORDER BY a nullable indexed column must not orderWalk (it drops NULL rows)")
+	}
+	if _, rows, _ := db.Query("SELECT id, email FROM t ORDER BY email"); len(rows) != 2 {
+		t.Fatalf("ORDER BY dropped the NULL-email row: got %d rows, want 2", len(rows))
+	}
+}
+
 // seedJoin builds users(name indexed) + posts(author uuid, title) with the given
 // posts index DDL, one "alice" (returned) and a decoy "bob", alice's titles out
 // of order plus a bob post that must never leak, then merges.

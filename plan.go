@@ -301,8 +301,11 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 		}
 		// ORDER BY on an ordered-indexed column, with no equality index chosen
 		// (applies with or without a WHERE): walk the sorted index in order
-		// instead of scanning + sorting.
-		if s.orderCol != "" && !pl.idxLookup && !pl.compLookup && !pl.compWalk && rt.orderedIndexOn(pl.orderOrdinal) {
+		// instead of scanning + sorting. Correctness guard (same as the composite
+		// path's anyNullable): an ordered index excludes NULL values, so a nullable
+		// ORDER BY column would drop its NULL rows from the walk — fall back to
+		// scan+sort, which sees every row.
+		if s.orderCol != "" && !pl.idxLookup && !pl.compLookup && !pl.compWalk && rt.orderedIndexOn(pl.orderOrdinal) && !rt.def.Columns[pl.orderOrdinal].Nullable {
 			pl.orderWalk = true
 		}
 	case *insertStmt:
