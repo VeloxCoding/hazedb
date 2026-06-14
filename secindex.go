@@ -686,18 +686,17 @@ func (t *table) mergeIndexes() {
 	// hash-indexed or NULL-valued column, or a no-op SET) skips its O(n) sorted-view
 	// fold entirely, and the folds that do run get the minimal change set.
 	changedPerIdx := make([][]UUID, len(t.indexes))
+	var batch []UUID // reused across shards: one buffer, not one alloc per shard
 	for i := range t.shards {
 		s := &t.shards[i]
 		s.mu.RLock()
 		nr := len(s.dirtyRead)
 		nd := len(s.dirtyDel)
-		var batch []UUID
-		if nr > 0 {
-			batch = append(batch, s.dirtyRead[:nr]...)
-		}
-		if nd > 0 {
-			batch = append(batch, s.dirtyDel[:nd]...)
-		}
+		// Copy the snapshotted prefixes into the reused buffer (an independent copy,
+		// so the recompute below never touches the live shard list). [:0] keeps the
+		// backing; append no-ops when a count is 0.
+		batch = append(batch[:0], s.dirtyRead[:nr]...)
+		batch = append(batch, s.dirtyDel[:nd]...)
 		s.mu.RUnlock()
 		if len(batch) == 0 {
 			continue
