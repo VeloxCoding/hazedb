@@ -167,12 +167,14 @@ func (t *table) appendMatchJSON(pk UUID, pred func(Row) bool, cols []string, ord
 }
 
 // idxCandidateSet is the candidate-PK enumerator for an indexed SELECT: the
-// (intersected) index hits UNION the dirty overlay. Returned by value — pks
-// aliases the index bucket and dirty aliases dirtyPKs(), so constructing it
-// allocates nothing, and emit takes its visitor as an argument rather than
-// being a heap closure that captures the slices (which escaped). Shared by
-// execSelectIdx (materialized) and selectEach (streaming) so the hybrid
-// index∪dirty correctness has a single definition.
+// (intersected) index hits UNION the dirty overlay. pks holds the slice
+// secIndex.lookup returns (a fresh copy of the bucket — the live bucket must not
+// escape the index lock) and dirty holds dirtyPKs()'s freshly-copied overlay, so
+// the set owns its slices rather than aliasing index state. Returned by value,
+// and emit takes its visitor as an argument rather than being a heap closure that
+// captures the slices (which escaped). Shared by execSelectIdx (materialized) and
+// selectEach (streaming) so the hybrid index∪dirty correctness has a single
+// definition.
 type idxCandidateSet struct {
 	pks   []UUID // index hits (intersected); already unique within the index
 	dirty []UUID // dirty overlay (mutated since the last merge); may overlap pks
