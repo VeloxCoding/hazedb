@@ -15,6 +15,13 @@ import (
 // structures and the async merger: the write path only marks a PK dirty
 // (markDirtyLocked, store.go), and the background merger reconciles the indexes
 // against the live rows off the write path.
+//
+// CALLER CONTRACT — an index is NOT a complete row source for a nullable column.
+// NULL cells are never indexed (keyFromCells), so a row with a NULL in an indexed
+// column is absent from that index. Any path that walks an index as the WHOLE row
+// source (an ORDER BY walk, a scan substitute) MUST guard nullable columns with
+// the planner's anyNullable and fall back to a scan, or it silently drops the NULL
+// rows. Equality lookups are exempt — a NULL never '='-matches anything.
 
 // indexKey is a comparable, value-typed encoding of an indexed cell, usable as
 // a Go map key (Value carries an unsafe.Pointer and is not itself comparable).
