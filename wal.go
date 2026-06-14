@@ -229,22 +229,17 @@ func (w *wal) flushLocked() error {
 		w.err = fmt.Errorf("wal: rename %q: %w", tmp, err)
 		return w.err
 	}
-	w.syncDir() // best-effort: makes the rename durable on Linux; no-op elsewhere
+	// Make the rename's directory entry durable across power loss. On Unix a dir
+	// fsync is supported and meaningful, so a failure is a real durability fault
+	// and is made sticky — the symmetric counterpart to the file fsync above. On
+	// Windows it is a no-op (FlushFileBuffers rejects a directory handle).
+	if err := fsyncDir(w.dir); err != nil {
+		w.err = fmt.Errorf("wal: sync dir %q: %w", w.dir, err)
+		return w.err
+	}
 	w.seg = n
 	w.buf = w.buf[:0]
 	return nil
-}
-
-// syncDir fsyncs the segment directory so a freshly renamed segment's directory
-// entry survives power loss. Best-effort: platforms that cannot fsync a
-// directory handle return an error that is intentionally ignored.
-func (w *wal) syncDir() {
-	d, err := os.Open(w.dir)
-	if err != nil {
-		return
-	}
-	_ = d.Sync()
-	_ = d.Close()
 }
 
 // flush seals the pending buffer into a segment now (the manual durability
