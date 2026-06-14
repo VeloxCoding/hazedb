@@ -396,6 +396,25 @@ $row = hazedb_fetch('SELECT name, age FROM users WHERE id = ?',
 
 // Filter + order + limit, one table — list of assoc rows
 $rows = hazedb_fetchall('SELECT name FROM users WHERE age >= ? ORDER BY age DESC LIMIT 10', 18);
+
+// --- Two-table join (INNER / LEFT; the ON column must be the PK or indexed,
+//     columns are qualified table.col / alias.col, values stay ?) ---
+hazedb_exec('CREATE TABLE posts (id uuid primary key, author uuid, title text,
+            ORDERED INDEX (author, title))');     // serves filter-by-author + order-by-title
+
+// INNER join, point read: one post plus its author's name. ON posts.author -> users.id (PK).
+$row = hazedb_fetch(
+    'SELECT p.title, u.name FROM posts p JOIN users u ON p.author = u.id WHERE p.id = ?',
+    $postId);
+
+// LEFT join, list-view: an author's posts ordered by title, paged. The composite
+// ORDERED INDEX (author, title) walks in order and probes users for only the LIMIT
+// rows — no sort. A LEFT miss yields null user columns; LIMIT/OFFSET stay literals.
+$page = hazedb_fetchall(
+    'SELECT p.title, u.name
+       FROM posts p LEFT JOIN users u ON p.author = u.id
+      WHERE p.author = ? ORDER BY p.title LIMIT 10 OFFSET 20',
+    $authorId);
 ```
 
 `$args` (`mixed`, optional): a native PHP **array** of positional params, or a
