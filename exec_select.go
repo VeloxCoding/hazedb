@@ -521,6 +521,12 @@ type dcand struct {
 // walk (single-column, composite, join probe).
 func (tbl *tableRT) buildDirtyCands(match func(Row) bool, keyFn func(Row) indexKey) ([]dcand, map[UUID]struct{}) {
 	dirty := tbl.dirtyPKs()
+	if len(dirty) == 0 {
+		// Steady state after a merge: no overlay to shadow or sort. Skip the empty
+		// map alloc + sort — mergeOrderedStreams handles a nil dc and nil dirtySet
+		// (a nil-map lookup reports "not shadowed").
+		return nil, nil
+	}
 	dirtySet := make(map[UUID]struct{}, len(dirty))
 	var dc []dcand
 	for _, pk := range dirty {
