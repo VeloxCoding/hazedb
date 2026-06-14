@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -31,6 +32,29 @@ func do(t *testing.T, h *Handler, path, body string) (*httptest.ResponseRecorder
 		}
 	}
 	return w, out
+}
+
+// init_sql runs a trusted schema + seed script at Provision: multiple statements,
+// inline literal values for the seed row, and a ';' inside a string literal that
+// must not split the statement.
+func TestInitSQLSeedsWithLiterals(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "schema.sql")
+	script := "CREATE TABLE cfg (id uuid primary key, k text, v text);\n" +
+		"INSERT INTO cfg (id, k, v) VALUES ('00000000-0000-7000-8000-000000000001', 'greeting', 'hi; there');"
+	if err := os.WriteFile(path, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := &Handler{WAL: "off", InitSQL: path}
+	if err := h.Provision(caddy.Context{}); err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	defer h.Cleanup()
+
+	_, rows, err := h.db.Query("SELECT v FROM cfg WHERE k = ?", "greeting")
+	if err != nil || len(rows) != 1 || rows[0][0].Str() != "hi; there" {
+		t.Fatalf("seed row: rows=%v err=%v", rows, err)
+	}
 }
 
 // The module provisions in memory, runs the full DDL→insert→query path over

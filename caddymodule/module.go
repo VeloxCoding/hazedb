@@ -57,8 +57,9 @@ type Handler struct {
 	// wal_path is set. An in-memory path (:memory:) is rejected — never in-memory.
 	CompanionPath string `json:"companion_path,omitempty"`
 	// InitSQL is an absolute path to a .sql file run once at Provision, before
-	// Caddy serves — typically CREATE TABLE + seed rows. Statements are split on
-	// ';'; do not put a semicolon inside a string literal in this file.
+	// Caddy serves — typically CREATE TABLE + seed rows. It runs as a trusted
+	// script (ExecScript): statements are split on top-level ';' (a ';' inside a
+	// string literal is safe) and may use inline literal values for seed data.
 	InitSQL string `json:"init_sql,omitempty"`
 	// RegistryName is the name the *DB is published under for in-process
 	// consumers. Empty = "default" (what the PHP extension looks up).
@@ -179,22 +180,17 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-// runInitSQL runs each ';'-separated statement from the file through Exec.
+// runInitSQL runs the file as one trusted multi-statement script via ExecScript:
+// the engine splits on top-level ';' (so a ';' inside a string literal does not
+// split) and permits inline literal values, so an operator's schema + seed file
+// runs as written. This is trusted operator config, never request input.
 func (h *Handler) runInitSQL(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	for _, stmt := range strings.Split(string(data), ";") {
-		stmt = strings.TrimSpace(stmt)
-		if stmt == "" {
-			continue
-		}
-		if _, err := h.db.Exec(stmt); err != nil {
-			return fmt.Errorf("statement %q: %w", stmt, err)
-		}
-	}
-	return nil
+	_, err = h.db.ExecScript(string(data))
+	return err
 }
 
 // Cleanup deregisters and closes the *DB. DeregisterDBIf is the CAS-safe form:

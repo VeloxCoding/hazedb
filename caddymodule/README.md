@@ -90,8 +90,9 @@ hazedb creates tables at runtime, so the module opens with an empty schema.
 Define tables one of two ways:
 
 - **`init_sql`** — a file of `;`-separated statements run once at startup
-  (typical: `CREATE TABLE ...` plus any seed rows). Don't put a `;` inside a
-  string literal in that file.
+  (typical: `CREATE TABLE ...` plus any seed rows). It runs as a trusted script,
+  so a `;` inside a string literal is safe and seed rows may use inline literal
+  values.
 - **`POST /exec`** — send `CREATE TABLE ...` like any other write.
 
 ## Sharing the instance with PHP
