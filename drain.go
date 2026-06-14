@@ -70,7 +70,14 @@ func openCompanion(path string) (*sqliteMirror, error) {
 	sdb.SetMaxOpenConns(1)
 	for _, pragma := range []string{
 		"PRAGMA journal_mode=WAL",
-		"PRAGMA synchronous=NORMAL",
+		// FULL, not NORMAL: the drain reclaims a hazedb WAL segment right after its
+		// SQLite commit, so that commit must be power-loss durable — otherwise a
+		// power loss could roll back the (NORMAL, unsynced) commit while the segment
+		// that held the same writes is already deleted, losing data the WAL had
+		// already fsynced (durability.md §5). FULL fsyncs the SQLite WAL per commit;
+		// the cost lands on the background drain (one fsync per ~1 MiB segment), not
+		// on any user write.
+		"PRAGMA synchronous=FULL",
 		"PRAGMA busy_timeout=5000",
 	} {
 		if _, err := sdb.Exec(pragma); err != nil {

@@ -222,7 +222,10 @@ Both reduce to:
 
 1. After a crash, on-disk SQLite holds everything up to the last drained segment;
    the undrained tail segments are still on disk (the drainer deletes a segment
-   only after its SQLite transaction commits).
+   only after its SQLite transaction commits). The mirror runs
+   `synchronous=FULL`, so that commit is fsynced (power-loss durable) before the
+   segment is reclaimed — otherwise power loss could roll back the commit while the
+   segment holding the same writes is already gone.
 2. **Load SQLite → in-memory shards** ([recover_sqlite.go](../recover_sqlite.go)),
    reconciling runtime-created tables via `_hz_tables`.
 3. **Replay the undrained tail segments → memory** through the apply path

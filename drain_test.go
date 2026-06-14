@@ -196,3 +196,23 @@ func TestDrainRejectsWrongTypedValue(t *testing.T) {
 		t.Fatalf("cursor advanced past corruption: lastDrained = %d, want 0", db.sq.lastDrained)
 	}
 }
+
+// The mirror runs synchronous=FULL: the drain reclaims a hazedb WAL segment only
+// after its SQLite commit, so that commit must be power-loss durable, or a reclaim
+// could lose data the WAL had already fsynced (durability.md §5/§6). NORMAL in WAL
+// mode does not fsync per commit, so it would break that guarantee.
+func TestMirrorSynchronousFull(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(Options{Schema: testSchema(), WALPath: dir, walFlushInterval: time.Hour, drainInterval: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var sync int
+	if err := db.sq.sdb.QueryRow("PRAGMA synchronous").Scan(&sync); err != nil {
+		t.Fatal(err)
+	}
+	if sync != 2 { // 0=OFF 1=NORMAL 2=FULL 3=EXTRA
+		t.Fatalf("mirror PRAGMA synchronous = %d, want 2 (FULL)", sync)
+	}
+}
