@@ -216,3 +216,32 @@ func TestMirrorSynchronousFull(t *testing.T) {
 		t.Fatalf("mirror PRAGMA synchronous = %d, want 2 (FULL)", sync)
 	}
 }
+
+// Corrupt companion metadata fails recovery closed: a negative drain cursor (which
+// would delete every WAL tail segment) and a table row whose id disagrees with the
+// id embedded in its own def (which would bind a table under the wrong key) are
+// both rejected as ErrWALCorrupt rather than silently mis-recovered.
+func TestMirrorMetaFailsClosedOnCorruptValues(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(Options{Schema: testSchema(), WALPath: dir, walFlushInterval: time.Hour, drainInterval: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.sq.sdb.Exec(`INSERT OR REPLACE INTO _hz_meta (k, v) VALUES ('last_drained_segment', -1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.sq.loadCursor(); !errors.Is(err, ErrWALCorrupt) {
+		t.Fatalf("loadCursor(negative): got %v, want ErrWALCorrupt", err)
+	}
+
+	// table_id 7 but the def embeds id 9 — an id that disagrees with its own def.
+	def := encodeCreateTable(nil, 9, TableDef{Name: "x", Columns: []ColumnDef{{Name: "id", Type: TypeUUID, PK: true}}})
+	if _, err := db.sq.sdb.Exec(`INSERT INTO _hz_tables (table_id, name, def) VALUES (?, ?, ?)`, int64(7), "x", def); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.sq.loadTables(); !errors.Is(err, ErrWALCorrupt) {
+		t.Fatalf("loadTables(id mismatch): got %v, want ErrWALCorrupt", err)
+	}
+}

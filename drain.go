@@ -172,6 +172,12 @@ func (m *sqliteMirror) loadCursor() error {
 	if err != nil {
 		return fmt.Errorf("mirror: load cursor: %w", err)
 	}
+	if v < 0 {
+		// A negative cursor would become a near-max uint64, so removeDrainedSegments
+		// would delete every WAL tail segment and replay would skip them all. Fail
+		// closed on the impossible value instead of silently destroying the tail.
+		return fmt.Errorf("%w: companion drain cursor is negative (%d)", ErrWALCorrupt, v)
+	}
 	m.lastDrained = uint64(v)
 	return nil
 }
@@ -180,20 +186,30 @@ func (m *sqliteMirror) loadCursor() error {
 // the drain knows every table's schema after a restart without re-reading the
 // (possibly already-deleted) CREATE TABLE records.
 func (m *sqliteMirror) loadTables() error {
-	rows, err := m.sdb.Query(`SELECT table_id, def FROM _hz_tables`)
+	rows, err := m.sdb.Query(`SELECT table_id, name, def FROM _hz_tables`)
 	if err != nil {
 		return fmt.Errorf("mirror: load tables: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var id int64
+		var name string
 		var def []byte
-		if err := rows.Scan(&id, &def); err != nil {
+		if err := rows.Scan(&id, &name, &def); err != nil {
 			return err
 		}
-		_, td, err := decodeCreateTable(def)
+		if id < 0 || id > 0xFFFF { // uint16 range: a wrapped id would bind a table under the wrong key
+			return fmt.Errorf("%w: companion table_id %d out of range", ErrWALCorrupt, id)
+		}
+		decID, td, err := decodeCreateTable(def)
 		if err != nil {
 			return err
+		}
+		// The registry columns are redundant with the def BLOB (register writes both
+		// from the same table); a disagreement means corruption — fail closed rather
+		// than bind a table under an id/name that does not match its own def.
+		if decID != uint16(id) || td.Name != name {
+			return fmt.Errorf("%w: companion table row (id=%d, name=%q) disagrees with its def (id=%d, name=%q)", ErrWALCorrupt, id, name, decID, td.Name)
 		}
 		m.tables[uint16(id)] = buildDrainTable(td)
 	}
