@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3" // cgo driver: "sqlite3"
@@ -632,5 +633,271 @@ func BenchmarkDeleteByScan_SQLiteMem(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		del.Exec("ck" + strconv.Itoa(i))
+	}
+}
+
+// ---- ORDER BY on a composite ordered index (the "latest-N sorted" pattern) ----
+// posts(id PK, author, title) with an ordered (author, title) index, compareN rows
+// spread over orderAuthors authors (~compareN/orderAuthors each). The hot query is
+// the top-N-sorted shape — WHERE author = ? ORDER BY title LIMIT N — which BOTH
+// engines serve by walking the (author, title) index in order and stopping at the
+// LIMIT, with no sort of the per-author set (hazedb's compWalk; SQLite's covering
+// index). Titles are inserted out of order (a coprime stride) so the ORDER BY is
+// real work, not an artefact of insertion order. This is a fair op-vs-op race —
+// both walk the index — so the gap reflects in-process vs cgo+row-marshalling, not
+// an algorithmic difference.
+const orderAuthors = 100
+
+func newOrderWalkDB(b *testing.B) *DB {
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: compareN})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { db.Close() })
+	db.Exec("CREATE TABLE posts (id uuid primary key, author text, title text, ORDERED INDEX (author, title))")
+	for i := 0; i < compareN; i++ {
+		db.Exec("INSERT INTO posts (id, author, title) VALUES (?, ?, ?)",
+			tid(i), "a"+strconv.Itoa(i%orderAuthors), "t"+strconv.Itoa((i*7)%compareN))
+	}
+	db.mergeIndexes()
+	return db
+}
+
+func newOrderWalkSQLite(b *testing.B) *sql.DB {
+	d, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		b.Fatal(err)
+	}
+	d.SetMaxOpenConns(1)
+	b.Cleanup(func() { d.Close() })
+	d.Exec("CREATE TABLE posts (id BLOB PRIMARY KEY, author TEXT, title TEXT)")
+	d.Exec("CREATE INDEX idx_posts_author_title ON posts(author, title)")
+	ins, _ := d.Prepare("INSERT INTO posts (id, author, title) VALUES (?, ?, ?)")
+	for i := 0; i < compareN; i++ {
+		ins.Exec(key16(i), "a"+strconv.Itoa(i%orderAuthors), "t"+strconv.Itoa((i*7)%compareN))
+	}
+	ins.Close()
+	return d
+}
+
+func BenchmarkOrderByIndex_hazedb_Mem(b *testing.B) {
+	db := newOrderWalkDB(b)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, r, err := db.Query("SELECT title FROM posts WHERE author = ? ORDER BY title LIMIT 20", "a"+strconv.Itoa(i%orderAuthors)); err != nil || len(r) != 20 {
+			b.Fatalf("rows=%d err=%v", len(r), err)
+		}
+	}
+}
+
+func BenchmarkOrderByIndex_SQLiteMem(b *testing.B) {
+	s, _ := newOrderWalkSQLite(b).Prepare("SELECT title FROM posts WHERE author = ? ORDER BY title LIMIT 20")
+	defer s.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		rows, err := s.Query("a" + strconv.Itoa(i%orderAuthors))
+		if err != nil {
+			b.Fatal(err)
+		}
+		for rows.Next() {
+			var t string
+			rows.Scan(&t)
+		}
+		rows.Close()
+	}
+}
+
+// ---- Partition-pinned read (recent-N in a thread) ----
+// hazedb's signature shape: msgs(id PK, thread PARTITION KEY, seq ordered), so
+// WHERE thread = ? ORDER BY seq DESC LIMIT N reads ONLY that partition and walks
+// its ordered tail — no cross-partition scan, no sort. SQLite has no partitioning,
+// so the fair counterpart is a (thread, seq) index it walks backward, stopping at
+// the LIMIT. compareN rows over msgThreads threads (~compareN/msgThreads each).
+const msgThreads = 100
+
+func newPartReadDB(b *testing.B) *DB {
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: compareN})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { db.Close() })
+	db.Exec("CREATE TABLE msgs (id uuid primary key, thread uuid partition key, seq int immutable, body text)")
+	for i := 0; i < compareN; i++ {
+		db.Exec("INSERT INTO msgs (id, thread, seq, body) VALUES (?, ?, ?, ?)", tid(i), tid(i%msgThreads), i, "b")
+	}
+	db.mergeIndexes()
+	return db
+}
+
+func newPartReadSQLite(b *testing.B) *sql.DB {
+	d, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		b.Fatal(err)
+	}
+	d.SetMaxOpenConns(1)
+	b.Cleanup(func() { d.Close() })
+	d.Exec("CREATE TABLE msgs (id BLOB PRIMARY KEY, thread BLOB, seq INTEGER, body TEXT)")
+	d.Exec("CREATE INDEX idx_msgs_thread_seq ON msgs(thread, seq)")
+	ins, _ := d.Prepare("INSERT INTO msgs (id, thread, seq, body) VALUES (?, ?, ?, ?)")
+	for i := 0; i < compareN; i++ {
+		ins.Exec(key16(i), key16(i%msgThreads), i, "b")
+	}
+	ins.Close()
+	return d
+}
+
+func BenchmarkPartitionRead_hazedb_Mem(b *testing.B) {
+	db := newPartReadDB(b)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, r, err := db.Query("SELECT body FROM msgs WHERE thread = ? ORDER BY seq DESC LIMIT 20", tid(i%msgThreads)); err != nil || len(r) != 20 {
+			b.Fatalf("rows=%d err=%v", len(r), err)
+		}
+	}
+}
+
+func BenchmarkPartitionRead_SQLiteMem(b *testing.B) {
+	s, _ := newPartReadSQLite(b).Prepare("SELECT body FROM msgs WHERE thread = ? ORDER BY seq DESC LIMIT 20")
+	defer s.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		rows, err := s.Query(key16(i % msgThreads))
+		if err != nil {
+			b.Fatal(err)
+		}
+		for rows.Next() {
+			var body string
+			rows.Scan(&body)
+		}
+		rows.Close()
+	}
+}
+
+// ---- Bulk INSERT (multi-row VALUES) ----
+// One statement inserts insBatch rows: hazedb compiles a per-tuple template and
+// applies the batch atomically; SQLite uses a multi-VALUES INSERT. ns/op is per
+// BATCH (divide by insBatch for per-row). Fresh PKs each iteration, no dup-key
+// churn. Both in-memory (RAM vs RAM).
+const insBatch = 50
+
+func bulkInsertSQL(table string) string {
+	var b strings.Builder
+	b.WriteString("INSERT INTO ")
+	b.WriteString(table)
+	b.WriteString(" (id, name, age) VALUES ")
+	for i := 0; i < insBatch; i++ {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString("(?, ?, ?)")
+	}
+	return b.String()
+}
+
+func BenchmarkBulkInsert_hazedb_Mem(b *testing.B) {
+	db, _ := Open(Options{Schema: benchSchema(), sizeHint: b.N * insBatch})
+	defer db.Close()
+	q := bulkInsertSQL("users")
+	args := make([]any, insBatch*3)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		base := compareN + i*insBatch
+		for j := 0; j < insBatch; j++ {
+			args[j*3], args[j*3+1], args[j*3+2] = tid(base+j), "name", j%100
+		}
+		if n, err := db.Exec(q, args...); err != nil || n != insBatch {
+			b.Fatalf("n=%d err=%v", n, err)
+		}
+	}
+}
+
+func BenchmarkBulkInsert_SQLiteMem(b *testing.B) {
+	d, cleanup := setupSQLiteMem(b)
+	defer cleanup()
+	stmt, _ := d.Prepare(bulkInsertSQL("users"))
+	defer stmt.Close()
+	args := make([]any, insBatch*3)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		base := compareN + i*insBatch
+		for j := 0; j < insBatch; j++ {
+			args[j*3], args[j*3+1], args[j*3+2] = key16(base+j), "name", j%100
+		}
+		stmt.Exec(args...)
+	}
+}
+
+// ---- Range + sorted list (filter a window, ordered, paginated) ----
+// WHERE age >= ? AND age < ? ORDER BY age LIMIT N over an ordered index on age:
+// hazedb walks the index in order and residual-filters the range (orderWalk),
+// stopping at the LIMIT; SQLite walks the same index over the range. compareN rows,
+// age spread 0..ageSpan so a 100-wide window holds many candidates the LIMIT trims.
+const ageSpan = 1000
+
+func newRangeDB(b *testing.B) *DB {
+	db, err := Open(Options{Schema: Schema{}, indexMergeInterval: -1, sizeHint: compareN})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { db.Close() })
+	db.Exec("CREATE TABLE u (id uuid primary key, name text, age int, ORDERED INDEX (age))")
+	for i := 0; i < compareN; i++ {
+		db.Exec("INSERT INTO u (id, name, age) VALUES (?, ?, ?)", tid(i), "n", (i*7)%ageSpan)
+	}
+	db.mergeIndexes()
+	return db
+}
+
+func newRangeSQLite(b *testing.B) *sql.DB {
+	d, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		b.Fatal(err)
+	}
+	d.SetMaxOpenConns(1)
+	b.Cleanup(func() { d.Close() })
+	d.Exec("CREATE TABLE u (id BLOB PRIMARY KEY, name TEXT, age INTEGER)")
+	d.Exec("CREATE INDEX idx_u_age ON u(age)")
+	ins, _ := d.Prepare("INSERT INTO u (id, name, age) VALUES (?, ?, ?)")
+	for i := 0; i < compareN; i++ {
+		ins.Exec(key16(i), "n", (i*7)%ageSpan)
+	}
+	ins.Close()
+	return d
+}
+
+func BenchmarkRangeOrder_hazedb_Mem(b *testing.B) {
+	db := newRangeDB(b)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		lo := i % (ageSpan - 100)
+		if _, r, err := db.Query("SELECT name FROM u WHERE age >= ? AND age < ? ORDER BY age LIMIT 20", lo, lo+100); err != nil || len(r) != 20 {
+			b.Fatalf("rows=%d err=%v", len(r), err)
+		}
+	}
+}
+
+func BenchmarkRangeOrder_SQLiteMem(b *testing.B) {
+	s, _ := newRangeSQLite(b).Prepare("SELECT name FROM u WHERE age >= ? AND age < ? ORDER BY age LIMIT 20")
+	defer s.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		lo := i % (ageSpan - 100)
+		rows, err := s.Query(lo, lo+100)
+		if err != nil {
+			b.Fatal(err)
+		}
+		for rows.Next() {
+			var n string
+			rows.Scan(&n)
+		}
+		rows.Close()
 	}
 }
