@@ -576,58 +576,61 @@ func BenchmarkUpdateByScan_SQLiteMem(b *testing.B) {
 // removal; table size stays ~constant) ----
 func BenchmarkDeleteByIndex_hazedb_Mem(b *testing.B) {
 	db := newIdxScanDB(b)
+	// Pre-insert b.N deletable rows untimed, merge the index once, then time ONLY
+	// the deletes — the same clean shape as BenchmarkDeleteByPK. The old
+	// per-iteration StopTimer/StartTimer around a sub-µs delete inflated the
+	// number ~15× (harness overhead, not delete cost).
+	for i := 0; i < b.N; i++ {
+		db.Exec("INSERT INTO t (id, email, code, age) VALUES (?, ?, ?, ?)", tid(compareN+i), "ek"+strconv.Itoa(i), "x", 1)
+	}
+	db.mergeIndexes()
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		b.StopTimer()
-		em := "ek" + strconv.Itoa(i)
-		db.Exec("INSERT INTO t (id, email, code, age) VALUES (?, ?, ?, ?)", tid(compareN+i), em, "x", 1)
-		db.mergeIndexes() // merge the fresh row into the email index → steady-state delete
-		b.StartTimer()
-		db.Exec("DELETE FROM t WHERE email = ?", em)
+		db.Exec("DELETE FROM t WHERE email = ?", "ek"+strconv.Itoa(i))
 	}
 }
 func BenchmarkDeleteByIndex_SQLiteMem(b *testing.B) {
 	d := newIdxScanSQLite(b)
 	ins, _ := d.Prepare("INSERT INTO t (id, email, code, age) VALUES (?, ?, ?, ?)")
-	defer ins.Close()
+	for i := 0; i < b.N; i++ {
+		ins.Exec(key16(compareN+i), "ek"+strconv.Itoa(i), "x", 1)
+	}
+	ins.Close()
 	del, _ := d.Prepare("DELETE FROM t WHERE email = ?")
 	defer del.Close()
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		b.StopTimer()
-		em := "ek" + strconv.Itoa(i)
-		ins.Exec(key16(compareN+i), em, "x", 1)
-		b.StartTimer()
-		del.Exec(em)
+		del.Exec("ek" + strconv.Itoa(i))
 	}
 }
 func BenchmarkDeleteByScan_hazedb_Mem(b *testing.B) {
 	db := newIdxScanDB(b)
+	// Pre-insert b.N rows untimed, then time ONLY the deletes (clean shape, no
+	// per-iteration StopTimer). code is unindexed, so each delete full-scans.
+	for i := 0; i < b.N; i++ {
+		db.Exec("INSERT INTO t (id, email, code, age) VALUES (?, ?, ?, ?)", tid(compareN+i), "x"+strconv.Itoa(i), "ck"+strconv.Itoa(i), 1)
+	}
+	db.mergeIndexes()
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		b.StopTimer()
-		cd := "ck" + strconv.Itoa(i)
-		db.Exec("INSERT INTO t (id, email, code, age) VALUES (?, ?, ?, ?)", tid(compareN+i), "x"+strconv.Itoa(i), cd, 1)
-		b.StartTimer()
-		db.Exec("DELETE FROM t WHERE code = ?", cd) // full scan finds the live row
+		db.Exec("DELETE FROM t WHERE code = ?", "ck"+strconv.Itoa(i)) // full scan finds the live row
 	}
 }
 func BenchmarkDeleteByScan_SQLiteMem(b *testing.B) {
 	d := newIdxScanSQLite(b)
 	ins, _ := d.Prepare("INSERT INTO t (id, email, code, age) VALUES (?, ?, ?, ?)")
-	defer ins.Close()
+	for i := 0; i < b.N; i++ {
+		ins.Exec(key16(compareN+i), "x"+strconv.Itoa(i), "ck"+strconv.Itoa(i), 1)
+	}
+	ins.Close()
 	del, _ := d.Prepare("DELETE FROM t WHERE code = ?")
 	defer del.Close()
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		b.StopTimer()
-		cd := "ck" + strconv.Itoa(i)
-		ins.Exec(key16(compareN+i), "x"+strconv.Itoa(i), cd, 1)
-		b.StartTimer()
-		del.Exec(cd)
+		del.Exec("ck" + strconv.Itoa(i))
 	}
 }
