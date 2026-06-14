@@ -83,17 +83,19 @@ func (t *table) compactShardLocked(s *tableShard, shardIdx uint32) {
 		return
 	}
 	pkOrd := t.def.pkOrdinal
-	s.pk = pkMap{}
-	s.pk.init(s.live)
+	var newPk pkMap
+	newPk.init(s.live)
 	for _, r := range s.rows {
 		if r == nil {
 			continue
 		}
 		id := uint64(len(newRows))
 		newRows = append(newRows, r)
-		s.pk.put(r[pkOrd].UUID(), id)
+		newPk.put(r[pkOrd].UUID(), id)
 	}
-	s.rows = newRows
+	// Swap both at the end: until here only locals are touched, so the shard's
+	// lookup state never observes a half-rebuilt arena.
+	s.rows, s.pk = newRows, newPk
 }
 
 // compactShard acquires the write lock(s) for shard shardIdx in the global order
