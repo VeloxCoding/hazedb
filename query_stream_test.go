@@ -42,33 +42,37 @@ func seedStreamTable(t *testing.T) *DB {
 // trusted Query/RowsToJSONObjects oracle.
 func TestQueryStreamMatchesMaterialized(t *testing.T) {
 	db := seedStreamTable(t)
-	queries := []string{
-		"SELECT * FROM users",
-		"SELECT name, age FROM users",
-		"SELECT * FROM users WHERE age >= 30",
-		"SELECT name FROM users WHERE name = 'Alice'",                            // indexed eq
-		"SELECT id, name, city FROM users WHERE name = 'Peter' AND city = 'AMS'", // two-index AND
-		"SELECT name FROM users WHERE city = 'NONE'",                             // empty
-		"SELECT name, data FROM users WHERE name = 'Bob'",                        // indexed, BYTES
-		"SELECT * FROM users LIMIT 2",                                            // scan + LIMIT
-		"SELECT name FROM users WHERE name = 'Peter' LIMIT 2",                    // indexed + LIMIT
-		"SELECT name FROM users ORDER BY name ASC",                               // ORDER BY (fallback)
-		"SELECT name, age FROM users ORDER BY age DESC LIMIT 2",                  // ORDER BY + LIMIT (fallback)
+	queries := []struct {
+		sql  string
+		args []Value
+	}{
+		{"SELECT * FROM users", nil},
+		{"SELECT name, age FROM users", nil},
+		{"SELECT * FROM users WHERE age >= ?", []Value{Int(30)}},
+		{"SELECT name FROM users WHERE name = ?", []Value{Str("Alice")}},                                    // indexed eq
+		{"SELECT id, name, city FROM users WHERE name = ? AND city = ?", []Value{Str("Peter"), Str("AMS")}}, // two-index AND
+		{"SELECT name FROM users WHERE city = ?", []Value{Str("NONE")}},                                     // empty
+		{"SELECT name, data FROM users WHERE name = ?", []Value{Str("Bob")}},                                // indexed, BYTES
+		{"SELECT * FROM users LIMIT 2", nil},                                                                // scan + LIMIT
+		{"SELECT name FROM users WHERE name = ? LIMIT 2", []Value{Str("Peter")}},                            // indexed + LIMIT
+		{"SELECT name FROM users ORDER BY name ASC", nil},                                                   // ORDER BY (fallback)
+		{"SELECT name, age FROM users ORDER BY age DESC LIMIT 2", nil},                                      // ORDER BY + LIMIT (fallback)
 	}
 
 	for _, phase := range []string{"overlay", "merged"} {
 		if phase == "merged" {
 			db.mergeIndexes()
 		}
-		for _, sql := range queries {
-			wantCols, wantRows, err := db.Query(sql)
+		for _, q := range queries {
+			sql := q.sql
+			wantCols, wantRows, err := db.QueryValues(sql, q.args...)
 			if err != nil {
 				t.Fatalf("[%s] Query(%q): %v", phase, sql, err)
 			}
 			wantJSON, _ := RowsToJSONObjects(wantCols, wantRows)
 
 			// QueryJSON: byte-identical to the materialized encode.
-			gotCols, gotJSON, err := db.QueryJSON(sql)
+			gotCols, gotJSON, err := db.QueryJSON(sql, q.args...)
 			if err != nil {
 				t.Fatalf("[%s] QueryJSON(%q): %v", phase, sql, err)
 			}
@@ -82,7 +86,7 @@ func TestQueryStreamMatchesMaterialized(t *testing.T) {
 			// QueryEach: clone each streamed row (contract: copy before return),
 			// then encode — must match too.
 			var each []Row
-			if err := db.QueryEach(sql, nil, func(cols []string, row Row) bool {
+			if err := db.QueryEach(sql, q.args, func(cols []string, row Row) bool {
 				each = append(each, row.Clone())
 				return true
 			}); err != nil {
@@ -119,28 +123,32 @@ func TestQueryStreamOrderedMatchesMaterialized(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	queries := []string{
-		"SELECT id, day FROM posts ORDER BY day ASC",                                             // orderWalk
-		"SELECT id, day FROM posts ORDER BY day DESC LIMIT 3",                                    // orderWalk + LIMIT
-		"SELECT id, day FROM posts ORDER BY day ASC LIMIT 3 OFFSET 2",                            // orderWalk + LIMIT/OFFSET
-		"SELECT id, author, day FROM posts WHERE author = 'A' ORDER BY day DESC",                 // compWalk
-		"SELECT id, author, day FROM posts WHERE author = 'A' ORDER BY day DESC LIMIT 2",         // compWalk + LIMIT
-		"SELECT id, author, day FROM posts WHERE author = 'B' ORDER BY day ASC LIMIT 2 OFFSET 1", // compWalk + LIMIT/OFFSET
-		"SELECT * FROM posts WHERE author = 'A' ORDER BY day DESC",                               // compWalk, SELECT *
+	queries := []struct {
+		sql  string
+		args []Value
+	}{
+		{"SELECT id, day FROM posts ORDER BY day ASC", nil},                                                         // orderWalk
+		{"SELECT id, day FROM posts ORDER BY day DESC LIMIT 3", nil},                                                // orderWalk + LIMIT
+		{"SELECT id, day FROM posts ORDER BY day ASC LIMIT 3 OFFSET 2", nil},                                        // orderWalk + LIMIT/OFFSET
+		{"SELECT id, author, day FROM posts WHERE author = ? ORDER BY day DESC", []Value{Str("A")}},                 // compWalk
+		{"SELECT id, author, day FROM posts WHERE author = ? ORDER BY day DESC LIMIT 2", []Value{Str("A")}},         // compWalk + LIMIT
+		{"SELECT id, author, day FROM posts WHERE author = ? ORDER BY day ASC LIMIT 2 OFFSET 1", []Value{Str("B")}}, // compWalk + LIMIT/OFFSET
+		{"SELECT * FROM posts WHERE author = ? ORDER BY day DESC", []Value{Str("A")}},                               // compWalk, SELECT *
 	}
 
 	for _, phase := range []string{"overlay", "merged"} {
 		if phase == "merged" {
 			db.mergeIndexes()
 		}
-		for _, sql := range queries {
-			wantCols, wantRows, err := db.Query(sql)
+		for _, q := range queries {
+			sql := q.sql
+			wantCols, wantRows, err := db.QueryValues(sql, q.args...)
 			if err != nil {
 				t.Fatalf("[%s] Query(%q): %v", phase, sql, err)
 			}
 			wantJSON, _ := RowsToJSONObjects(wantCols, wantRows)
 
-			_, gotJSON, err := db.QueryJSON(sql)
+			_, gotJSON, err := db.QueryJSON(sql, q.args...)
 			if err != nil {
 				t.Fatalf("[%s] QueryJSON(%q): %v", phase, sql, err)
 			}
@@ -149,7 +157,7 @@ func TestQueryStreamOrderedMatchesMaterialized(t *testing.T) {
 			}
 
 			var each []Row
-			if err := db.QueryEach(sql, nil, func(cols []string, row Row) bool {
+			if err := db.QueryEach(sql, q.args, func(cols []string, row Row) bool {
 				each = append(each, row.Clone())
 				return true
 			}); err != nil {

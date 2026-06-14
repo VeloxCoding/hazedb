@@ -56,12 +56,12 @@ func TestCompileFilterParity(t *testing.T) {
 		{"SELECT id FROM t WHERE age >= ?", []Value{Int(40)}, true},
 		{"SELECT id FROM t WHERE age IS NULL", nil, true},
 		{"SELECT id FROM t WHERE age IS NOT NULL", nil, true},
-		{"SELECT id FROM t WHERE code = 'c2'", nil, true}, // literal rhs
+		{"SELECT id FROM t WHERE code = ?", []Value{Str("c2")}, true}, // param rhs
 		{"SELECT id FROM t WHERE code = ? AND age > ?", []Value{Str("c2"), Int(0)}, true},
 		{"SELECT id FROM t WHERE code = ? OR tag = ?", []Value{Str("c1"), Str("y")}, true},
 		{"SELECT id FROM t WHERE NOT (code = ?)", []Value{Str("c1")}, true},
-		{"SELECT id FROM t WHERE age + 1 = ?", []Value{Int(41)}, false}, // arithmetic lhs → fallback
-		{"SELECT id FROM t WHERE age = age", nil, false},                // col vs col → fallback
+		{"SELECT id FROM t WHERE age + ? = ?", []Value{Int(1), Int(41)}, false}, // arithmetic lhs → fallback
+		{"SELECT id FROM t WHERE age = age", nil, false},                        // col vs col → fallback
 	}
 
 	for _, c := range cases {
@@ -104,7 +104,7 @@ func TestScanMatcherEndToEnd(t *testing.T) {
 		t.Fatalf("compiled shape: rows=%d err=%v (want 2: age 12,17)", len(r), err)
 	}
 	// fallback: arithmetic in WHERE
-	if _, r, err := db.Query("SELECT id FROM t WHERE age + 0 = ?", 7); err != nil || len(r) != 1 {
+	if _, r, err := db.Query("SELECT id FROM t WHERE age + ? = ?", 0, 7); err != nil || len(r) != 1 {
 		t.Fatalf("fallback shape: rows=%d err=%v (want 1)", len(r), err)
 	}
 }

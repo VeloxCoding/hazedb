@@ -1054,12 +1054,12 @@ func TestMergeSkipPreservesOrderedView(t *testing.T) {
 
 	// Touch only the hash-indexed column → the ordered (seq) index is unchanged,
 	// so its fold is skipped. The sorted view must remain intact.
-	db.Exec("UPDATE t SET status = 9 WHERE id = ?", tid(0))
+	db.Exec("UPDATE t SET status = ? WHERE id = ?", 9, tid(0))
 	rt.mergeIndexes()
 	wantFirst5(1, 2, 3, 4, 5)
 
 	// Touch the ordered column → the fold must run and reflect the new key.
-	db.Exec("UPDATE t SET seq = 0 WHERE id = ?", tid(5)) // tid(5) was seq 15 → now 0, sorts first
+	db.Exec("UPDATE t SET seq = ? WHERE id = ?", 0, tid(5)) // tid(5) was seq 15 → now 0, sorts first
 	rt.mergeIndexes()
 	wantFirst5(0, 1, 2, 3, 4)
 }

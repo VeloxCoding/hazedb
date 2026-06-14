@@ -92,8 +92,8 @@ func TestQueryValuesParity(t *testing.T) {
 		t.Fatalf("QueryRowValues mismatch: %v vs %v", rowA, rowB)
 	}
 	// scan read
-	cols, rowsA, _ := db.Query("SELECT name, age FROM users WHERE age >= 0 LIMIT 50")
-	_, rowsB, _ := db.QueryValues("SELECT name, age FROM users WHERE age >= 0 LIMIT 50")
+	cols, rowsA, _ := db.Query("SELECT name, age FROM users WHERE age >= ? LIMIT 50", 0)
+	_, rowsB, _ := db.QueryValues("SELECT name, age FROM users WHERE age >= ? LIMIT 50", Int(0))
 	if len(rowsA) != len(rowsB) || len(rowsA) == 0 {
 		t.Fatalf("QueryValues count mismatch: %d vs %d", len(rowsA), len(rowsB))
 	}

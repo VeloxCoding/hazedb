@@ -5,6 +5,51 @@ import "fmt"
 // assignParamIndices walks the AST and replaces every paramRef.index
 // = -1 with a running count, so positional args bind in source order.
 // Called once after parse, before plan. Returns the parameter count.
+// rejectValueLiterals enforces the parameterize-everything contract: a value in a
+// WHERE/SET/VALUES position must be a ? placeholder, never an inline literal. This
+// bounds the plan cache (only finite parameterized shapes are ever cached) and
+// removes the SQL-injection path — a value never reaches the parser as syntax.
+// LIMIT/OFFSET/ORDER BY are not value literals (separate stmt fields) and IS NULL
+// is its own node, so those are unaffected; only litValue nodes are rejected.
+func rejectValueLiterals(st stmt) error {
+	bad := false
+	var walk func(expr)
+	walk = func(e expr) {
+		switch x := e.(type) {
+		case *litValue:
+			bad = true
+		case *binOp:
+			walk(x.lhs)
+			walk(x.rhs)
+		case *notExpr:
+			walk(x.e)
+		case *isNullExpr:
+			walk(x.e)
+		}
+	}
+	switch s := st.(type) {
+	case *selectStmt:
+		walk(s.where)
+	case *insertStmt:
+		for _, tuple := range s.rows {
+			for _, e := range tuple {
+				walk(e)
+			}
+		}
+	case *updateStmt:
+		for _, set := range s.sets {
+			walk(set.val)
+		}
+		walk(s.where)
+	case *deleteStmt:
+		walk(s.where)
+	}
+	if bad {
+		return fmt.Errorf("%w: inline value literals are not allowed — use ? placeholders for all values", ErrParse)
+	}
+	return nil
+}
+
 func assignParamIndices(st stmt) int {
 	var n int
 	var walk func(expr) expr

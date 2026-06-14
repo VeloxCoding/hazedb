@@ -299,6 +299,9 @@ func (db *DB) prepare(sql string, cat *catalog) (*plan, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := rejectValueLiterals(st); err != nil {
+		return nil, err
+	}
 	nparams := assignParamIndices(st)
 	pl, err := db.plan(st, cat)
 	if err != nil {
