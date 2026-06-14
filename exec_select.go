@@ -2,6 +2,8 @@ package hazedb
 
 import "slices"
 
+// execSelectPK reads the single PK-matched row, projected (or the whole row for
+// SELECT *). Returns no rows for LIMIT 0, any OFFSET, or a NULL key.
 func (db *DB) execSelectPK(pl *plan, keyVal Value) ([]string, []Row, error) {
 	st := pl.st.(*selectStmt)
 	tbl := pl.rt
