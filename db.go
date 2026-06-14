@@ -129,10 +129,32 @@ func Open(opts Options) (*DB, error) {
 	}
 	db.sq = comp
 
+	// All-or-nothing cleanup: anything opened or started below — the WAL, its
+	// flusher, the background loops, the companion — is torn down unless Open
+	// reaches the success line (ok = true). This fires on an error return AND on a
+	// panic in one of the void calls after the flusher is live (rebuildAllIndexes,
+	// start*Loop), so a half-built DB never leaks the flusher goroutine or the open
+	// files. The stop*Loop helpers are no-ops when their loop never started, and
+	// w/comp are closed only if opened. Order mirrors Close: stop loops (the drain
+	// loop seals the WAL) before closing the WAL.
+	var w *wal
+	ok := false
+	defer func() {
+		if ok {
+			return
+		}
+		db.stopDrainLoop()
+		db.stopMergeLoop()
+		db.stopCompactLoop()
+		if w != nil {
+			w.close()
+		}
+		comp.close()
+	}()
+
 	if opts.walEnabled() {
-		w, err := openWAL(opts.WALPath)
+		w, err = openWAL(opts.WALPath)
 		if err != nil {
-			comp.close()
 			return nil, err
 		}
 		db.mirrorOn = true
@@ -140,23 +162,15 @@ func Open(opts Options) (*DB, error) {
 		// reader. The companion is the compacted base: load it into memory, then
 		// replay only the undrained WAL tail (segments past the drained cursor) on top.
 		if err := comp.activateMirror(db.cat.Load()); err != nil {
-			w.close()
-			comp.close()
 			return nil, err
 		}
 		if err := db.recoverFromSQLite(); err != nil {
-			w.close()
-			comp.close()
 			return nil, err
 		}
 		if err := w.removeDrainedSegments(comp.lastDrained); err != nil {
-			w.close()
-			comp.close()
 			return nil, err
 		}
 		if err := w.replayFrom(comp.lastDrained, db.applyReplayRecord, db.onWALCorrupt); err != nil {
-			w.close()
-			comp.close()
 			return nil, err
 		}
 		// Keep segment numbers above the drained cursor across restarts: the drain
@@ -183,6 +197,7 @@ func Open(opts Options) (*DB, error) {
 	if opts.compactInterval > 0 {
 		db.startCompactLoop(opts.compactInterval)
 	}
+	ok = true
 	return db, nil
 }
 
