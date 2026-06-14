@@ -176,7 +176,7 @@ func (t *table) appendMatchProject(pk UUID, pred func(Row) bool, ords []int, sta
 		return dst, false
 	}
 	r := s.rows[rowID]
-	if r == nil || !pred(r) {
+	if r == nil || (pred != nil && !pred(r)) { // nil pred = caller guarantees the match
 		return dst, false
 	}
 	if starAll {
@@ -320,10 +320,51 @@ func (db *DB) idxCandidates(pl *plan, ctx *evalCtx) (cand idxCandidateSet, ok bo
 // evaluates the full WHERE on each live row. With an ORDER BY it gathers all
 // matches and sorts before LIMIT (the filtered-list pattern); otherwise it
 // projects and stops at LIMIT.
-func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
-	if pl.st.(*selectStmt).limit == 0 {
+func (db *DB) execSelectIdx(pl *plan, args []Value) ([]string, []Row, error) {
+	st := pl.st.(*selectStmt)
+	if st.limit == 0 {
 		return pl.colNames, nil, nil
 	}
+	// Point-read fast path: a single indexed equality that fully covers the WHERE
+	// (idxExact), no ORDER BY, no dirty overlay, and a single live hit. Fetch and
+	// project that one row directly — no eval context, bucket copy, candidate set,
+	// or result packing. A multi-hit or any dirty row falls through to the general
+	// path (which builds the context lazily below).
+	if pl.idxExact && pl.orderOrdinal < 0 && len(pl.idxCols) == 1 && pl.rt.readDirtyCount.Load() == 0 {
+		keyVal, err := evalLitOrParamValue(pl.idxSrcs[0], args)
+		if err != nil {
+			return nil, nil, err
+		}
+		if keyVal.IsNull() {
+			return pl.colNames, nil, nil
+		}
+		if si := pl.rt.indexFor(pl.idxCols[0]); si != nil {
+			pk, found, one := si.lookupOne(keyOf(keyVal))
+			if !found {
+				return pl.colNames, nil, nil
+			}
+			if one {
+				if st.offset > 0 {
+					return pl.colNames, nil, nil // the lone row is dropped by OFFSET
+				}
+				var pr Row
+				var ok bool
+				if st.starAll {
+					pr, ok = pl.rt.getByPK(pk)
+				} else {
+					pr, ok = pl.rt.getByPKProject(pk, pl.projOrdinals)
+				}
+				if !ok {
+					return pl.colNames, nil, nil
+				}
+				return pl.colNames, []Row{pr}, nil
+			}
+			// found && !one: a multi-hit bucket → fall through to the general path.
+		}
+	}
+	// General path: a multi-hit / multi-column / ORDER BY / dirty-overlay index
+	// read. Build the eval context once for candidate resolution + the WHERE check.
+	ctx := &evalCtx{cols: pl.rt.def.colByName, args: args}
 	cand, ok, err := db.idxCandidates(pl, ctx)
 	if err != nil {
 		return nil, nil, err
@@ -386,7 +427,32 @@ func (db *DB) execCandidates(pl *plan, ctx *evalCtx, cand idxCandidateSet) ([]st
 	hint := cand.capHint(eff)
 	out := make([]Row, 0, hint)
 	packed := make([]Value, 0, hint*len(colNames))
-	pred := rowMatcher(st.where, ctx)
+	// A fresh index hit needs no re-check when the WHERE is exactly the indexed
+	// equalities (idxExact) and nothing is dirty: the bucket is authoritative and a
+	// deleted row is dropped by the fetch. Skipping the matcher also avoids
+	// compiling it. With a dirty overlay (possibly stale entries) or a residual
+	// conjunct, the full WHERE is re-checked per candidate.
+	var pred func(Row) bool
+	if !(pl.idxExact && len(cand.dirty) == 0) {
+		pred = rowMatcher(st.where, ctx)
+	}
+	// Dirty-empty fast path: walk the index hits directly, no dedup map and no emit
+	// closure (which would escape to the heap). The dirty union needs both.
+	if len(cand.dirty) == 0 {
+		for _, pk := range cand.pks {
+			start := len(packed)
+			var ok bool
+			packed, ok = tbl.appendMatchProject(pk, pred, pl.projOrdinals, st.starAll, packed)
+			if !ok {
+				continue
+			}
+			out = append(out, Row(packed[start:len(packed):len(packed)]))
+			if eff >= 0 && len(out) >= eff {
+				break
+			}
+		}
+		return colNames, sliceOffsetLimit(out, st.offset, st.limit), nil
+	}
 	cand.emit(func(pk UUID) bool {
 		start := len(packed)
 		var ok bool
@@ -997,7 +1063,7 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 	// Secondary-index lookup: resolve candidate PKs through the index, fetch
 	// each by PK and project. No scan.
 	if pl.idxLookup {
-		return db.execSelectIdx(pl, &ctx)
+		return db.execSelectIdx(pl, ctx.args)
 	}
 
 	// Composite ordered walk: WHERE pins a prefix, ORDER BY the trailing column —

@@ -193,6 +193,11 @@ type plan struct {
 	idxLookup bool
 	idxCols   []int
 	idxSrcs   []expr
+	// idxExact is true when the WHERE is EXACTLY the indexed equalities (no residual
+	// conjunct). A fresh index hit then needs no per-row re-check: when the dirty
+	// overlay is empty the bucket is authoritative for those columns, and a deleted
+	// row is dropped by the row fetch. The executor skips the matcher in that case.
+	idxExact bool
 
 	// orderWalk is true when ORDER BY is on an ordered-indexed column and no
 	// equality index was chosen: the executor walks the sorted index (merged
@@ -346,7 +351,13 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 						}
 					}
 					pl.idxLookup = len(pl.idxCols) > 0
-					if !pl.idxLookup {
+					if pl.idxLookup {
+						// Exact when every top-level WHERE conjunct is one of the indexed
+						// equalities — i.e. no residual to re-check on a fresh index hit.
+						var conj []expr
+						collectConjuncts(s.where, &conj)
+						pl.idxExact = len(conj) == len(pl.idxCols)
+					} else {
 						rt.planCompositeLookup(pl, eqs)
 					}
 				}

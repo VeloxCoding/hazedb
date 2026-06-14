@@ -94,6 +94,11 @@ func (db *DB) queryPlanV(pl *plan, vargs []Value) ([]string, []Row, error) {
 		}
 		return db.execSelectPK(pl, keyVal)
 	}
+	if pl.idxLookup {
+		// Route directly, skipping execSelect's eval-context construction: the
+		// point-read fast path needs no context, and the general path builds its own.
+		return db.execSelectIdx(pl, vargs)
+	}
 	return db.execSelect(pl, vargs)
 }
 
