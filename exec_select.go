@@ -1050,8 +1050,14 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 
 	// One predicate for the whole scan: a compiled fast path for simple WHERE
 	// shapes (col = ?, ranges, AND/OR/NOT, IS NULL), else an evalExpr fallback.
-	// Built once, not per row.
-	match := rowMatcher(st.where, &ctx)
+	// Built once, not per row. nil for a partition-pinned scan: partLookup is set
+	// only when the WHERE is exactly the PartitionKey equality (detectColEq matches
+	// a bare equality, not an AND-chain), so every row the partition scan yields
+	// already satisfies it — the per-row match would be pure overhead.
+	var match func(Row) bool
+	if !partPinned {
+		match = rowMatcher(st.where, &ctx)
+	}
 
 	// No ORDER BY: project straight into one packed buffer during the scan (each
 	// result Row is a capped view of its span) — no full-row clone, no second
@@ -1096,9 +1102,7 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 				if r == nil {
 					continue
 				}
-				if !match(r) {
-					continue
-				}
+				// match is nil here (partition-pinned): every partition row matches.
 				if packed == nil {
 					packed = make([]Value, 0, capHint*width)
 				}
@@ -1152,7 +1156,15 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 
 	scan := tbl.scanAll
 	if partPinned {
-		scan = func(fn func(Row) bool) { tbl.scanPartition(part, fn) }
+		// Scan the partition in the ORDER BY direction: a DESC walk reads the tail
+		// newest-first so a top-N heap fills with the highest keys and rejects the
+		// rest clone-free (the common "recent N in a partition" shape). Correct for
+		// any data — only heap churn differs.
+		if st.orderDesc {
+			scan = func(fn func(Row) bool) { tbl.scanPartitionRev(part, fn) }
+		} else {
+			scan = func(fn func(Row) bool) { tbl.scanPartition(part, fn) }
+		}
 	}
 
 	// ORDER BY + LIMIT: keep only the best `limit` rows by the order column,
@@ -1165,13 +1177,16 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 		}
 		// Keep offset+limit rows so the offset can be dropped after sorting.
 		top := topN{ord: pl.orderOrdinal, desc: st.orderDesc, capN: fetchBound(st.limit, st.offset), proj: projOrNil(st.starAll, pl.projOrdinals)}
-		scan(func(r Row) bool {
-			if !match(r) {
+		if match == nil { // partition-pinned: every scanned row matches
+			scan(func(r Row) bool { top.offer(r); return true })
+		} else {
+			scan(func(r Row) bool {
+				if match(r) {
+					top.offer(r)
+				}
 				return true
-			}
-			top.offer(r)
-			return true
-		})
+			})
+		}
 		return colNames, sliceOffsetLimit(top.sorted(), st.offset, st.limit), nil
 	}
 
@@ -1181,12 +1196,16 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 	// the whole row to the projected cells, and removes the second projection pass.
 	// (orderOrdinal >= 0 here: the no-ORDER-BY case returned via the packed path above.)
 	top := topN{ord: pl.orderOrdinal, desc: st.orderDesc, proj: projOrNil(st.starAll, pl.projOrdinals)}
-	scan(func(r Row) bool {
-		if match(r) {
-			top.collect(r)
-		}
-		return true
-	})
+	if match == nil { // partition-pinned: every scanned row matches
+		scan(func(r Row) bool { top.collect(r); return true })
+	} else {
+		scan(func(r Row) bool {
+			if match(r) {
+				top.collect(r)
+			}
+			return true
+		})
+	}
 	return colNames, sliceOffsetLimit(top.sorted(), st.offset, st.limit), nil
 }
 
@@ -1236,7 +1255,16 @@ type topN struct {
 	capN int
 	proj []int
 	h    []topEntry
+	// backing carves every kept row from one slice (each topEntry.row a fixed-width
+	// window into it) so a bounded fixed-projection top-N allocates the kept-row
+	// storage once instead of once per row that enters. Slots are reused as the
+	// heap evicts. nil for SELECT * (variable width) or an unbounded/huge capN.
+	backing []Value
 }
+
+// topPackCap bounds the packed-backing prealloc: above it, a top-N that may keep
+// few rows would waste a large contiguous buffer, so fall back to per-row clones.
+const topPackCap = 1024
 
 // topEntry is one kept row plus its sort key, captured before projection so the
 // projected row need not contain the order column.
@@ -1271,10 +1299,50 @@ func (t *topN) take(r Row) Row {
 	return pr
 }
 
+// packs reports whether kept rows are carved from the shared backing (a bounded,
+// fixed-width projection) rather than allocated per row.
+func (t *topN) packs() bool { return t.proj != nil && t.capN > 0 && t.capN <= topPackCap }
+
+// projInto deep-copies r's projected columns into dst (len == len(proj)).
+func (t *topN) projInto(dst, r Row) {
+	for j, ord := range t.proj {
+		dst[j] = cloneValue(r[ord])
+	}
+}
+
+// fillSlot returns the kept form of r for the fill phase at heap position i:
+// backing slot i when packing, else a fresh allocation.
+func (t *topN) fillSlot(r Row, i int) Row {
+	if !t.packs() {
+		return t.take(r)
+	}
+	w := len(t.proj)
+	if t.backing == nil {
+		t.backing = make([]Value, t.capN*w)
+	}
+	off := i * w
+	slot := t.backing[off : off+w : off+w]
+	t.projInto(slot, r)
+	return slot
+}
+
+// reuseSlot writes r's projection into the evicted root's window (no allocation),
+// or allocates when not packing.
+func (t *topN) reuseSlot(r, slot Row) Row {
+	if !t.packs() {
+		return t.take(r)
+	}
+	t.projInto(slot, r)
+	return slot
+}
+
 func (t *topN) offer(r Row) {
 	key := cloneValue(r[t.ord]) // capture before projection; cloned so reused scratch can't mutate it
+	if t.h == nil && t.packs() {
+		t.h = make([]topEntry, 0, t.capN) // presize: a bounded heap never reallocs
+	}
 	if len(t.h) < t.capN {
-		t.h = append(t.h, topEntry{key, t.take(r)})
+		t.h = append(t.h, topEntry{key, t.fillSlot(r, len(t.h))})
 		for i := len(t.h) - 1; i > 0; {
 			p := (i - 1) / 2
 			if !t.evictable(t.h[i].key, t.h[p].key) {
@@ -1288,7 +1356,7 @@ func (t *topN) offer(r Row) {
 	if !t.evictable(t.h[0].key, key) { // r can't beat the current worst
 		return
 	}
-	t.h[0] = topEntry{key, t.take(r)}
+	t.h[0] = topEntry{key, t.reuseSlot(r, t.h[0].row)}
 	for i, n := 0, len(t.h); ; {
 		worst, l, rr := i, 2*i+1, 2*i+2
 		if l < n && t.evictable(t.h[l].key, t.h[worst].key) {
@@ -1312,13 +1380,14 @@ func (t *topN) collect(r Row) {
 	t.h = append(t.h, topEntry{cloneValue(r[t.ord]), t.take(r)})
 }
 
-// sorted returns the kept rows in ORDER BY order (already projected). It sorts by
-// the captured key, stably, so ties keep heap order (arbitrary but deterministic).
+// sorted returns the kept rows in ORDER BY order (already projected). Ties sort
+// arbitrarily — SQL leaves the order of equal ORDER BY keys unspecified — so an
+// unstable sort is used (faster, no stability bookkeeping).
 func (t *topN) sorted() []Row {
-	slices.SortStableFunc(t.h, func(a, b topEntry) int {
+	slices.SortFunc(t.h, func(a, b topEntry) int {
 		c, ok := a.key.Compare(b.key)
 		if !ok {
-			return 0 // incomparable (NULL): equal → stable heap order preserved
+			return 0 // incomparable (NULL): treat as equal
 		}
 		if t.desc {
 			return -c

@@ -86,6 +86,31 @@ func (t *table) scanPartition(part UUID, fn func(Row) bool) {
 	}
 }
 
+// scanPartitionRev visits the partition's live rows newest-insertion-first — the
+// reverse of scanPartition. For an ORDER BY DESC on a column that grows with
+// insertion (a sequence, a timestamp), this hands a top-N heap the highest keys
+// first, so the rest are rejected without a clone instead of each evicting the
+// heap root. Correct for any data; only the clone/CPU count differs.
+func (t *table) scanPartitionRev(part UUID, fn func(Row) bool) {
+	s := t.shardOf(part)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	tail := s.tails[part]
+	for i := len(tail) - 1; i >= 0; i-- {
+		rowID := tail[i]
+		if rowID >= uint64(len(s.rows)) {
+			continue
+		}
+		r := s.rows[rowID]
+		if r == nil {
+			continue // tombstoned
+		}
+		if !fn(r) {
+			return
+		}
+	}
+}
+
 // getByPKPartitioned resolves PK → location, reads under the shard lock, and
 // re-resolves on a tombstone / PK-mismatch. Re-resolving (not returning
 // not-found from a stale location) is required: a DELETE+INSERT of the same PK
