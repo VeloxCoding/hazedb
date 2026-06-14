@@ -1,6 +1,9 @@
 package hazedb
 
-import "slices"
+import (
+	"slices"
+	"sort"
+)
 
 // execSelectPK reads the single PK-matched row, projected (or the whole row for
 // SELECT *). Returns no rows for LIMIT 0, any OFFSET, or a NULL key.
@@ -56,6 +59,44 @@ func (db *DB) execSelectPKOne(pl *plan, keyVal Value) ([]string, Row, error) {
 	}
 	pr, _ := tbl.getByPKProject(pk, pl.projOrdinals)
 	return colNames, pr, nil
+}
+
+// execSelectPKResidual serves a SELECT whose WHERE pins the PK by equality inside
+// an AND-chain (pl.pkProbe): fetch the one PK-addressed row, then return it only
+// if the FULL WHERE matches, so residual conjuncts (WHERE id = ? AND age = ?) are
+// honoured. A PK match is at most one row, so LIMIT 0 / any OFFSET drops it and
+// ORDER BY needs no sort. The row is cloned under the lock by getByPK, so matching
+// and projecting it off-lock is consistent.
+func (db *DB) execSelectPKResidual(pl *plan, keyVal Value, args []Value) ([]string, []Row, error) {
+	st := pl.st.(*selectStmt)
+	tbl := pl.rt
+	colNames := pl.colNames
+	if st.limit == 0 || st.offset > 0 {
+		return colNames, nil, nil
+	}
+	if keyVal.IsNull() {
+		return colNames, nil, nil
+	}
+	pk, err := coerceToUUID(keyVal)
+	if err != nil {
+		return nil, nil, err
+	}
+	r, ok := tbl.getByPK(pk)
+	if !ok {
+		return colNames, nil, nil
+	}
+	match := rowMatcher(st.where, &evalCtx{cols: tbl.def.colByName, args: args})
+	if !match(r) {
+		return colNames, nil, nil
+	}
+	if st.starAll {
+		return colNames, []Row{r}, nil
+	}
+	proj := make(Row, len(pl.projOrdinals))
+	for i, ord := range pl.projOrdinals {
+		proj[i] = r[ord]
+	}
+	return colNames, []Row{proj}, nil
 }
 
 // offerLiveRow offers pk's live row to an ORDER BY top-N heap under the shard
@@ -609,19 +650,122 @@ func mergeOrderedStreams(snap []ordEntry, dc []dcand, dirtySet map[UUID]struct{}
 	}
 }
 
+// flipRangeOp mirrors a comparison so a `value OP col` predicate reads as
+// `col flip(OP) value` (e.g. ? < age == age > ?).
+func flipRangeOp(op tokenKind) tokenKind {
+	switch op {
+	case tkLt:
+		return tkGt
+	case tkLte:
+		return tkGte
+	case tkGt:
+		return tkLt
+	case tkGte:
+		return tkLte
+	}
+	return op
+}
+
+// rangeBound is one side of a range constraint on a column: the evaluated bound
+// value, its column-oriented operator, and whether it was present.
+type rangeBound struct {
+	val Value
+	op  tokenKind
+	ok  bool
+}
+
+// orderColumnRange scans the WHERE conjuncts for the lower (>= / >) and upper
+// (< / <=) range bounds on the ORDER BY column (ordinal ord), evaluating each
+// bound value. Either side may be absent. A `value OP col` predicate is read as
+// `col flip(OP) value`. The first bound found on each side wins (a looser extra
+// bound is harmless — the residual still filters).
+func orderColumnRange(conj []expr, ord int, args []Value) (lo, hi rangeBound) {
+	for _, c := range conj {
+		b, isBin := c.(*binOp)
+		if !isBin {
+			continue
+		}
+		var op tokenKind
+		var valExpr expr
+		if cr, ok := b.lhs.(*colRef); ok && cr.ord == ord && isLitOrParam(b.rhs) {
+			op, valExpr = b.op, b.rhs
+		} else if cr, ok := b.rhs.(*colRef); ok && cr.ord == ord && isLitOrParam(b.lhs) {
+			op, valExpr = flipRangeOp(b.op), b.lhs
+		} else {
+			continue
+		}
+		switch op {
+		case tkGt, tkGte:
+			if !lo.ok {
+				if v, err := evalLitOrParamValue(valExpr, args); err == nil {
+					lo = rangeBound{v, op, true}
+				}
+			}
+		case tkLt, tkLte:
+			if !hi.ok {
+				if v, err := evalLitOrParamValue(valExpr, args); err == nil {
+					hi = rangeBound{v, op, true}
+				}
+			}
+		}
+	}
+	return
+}
+
+// seekOrderedSnap clips the ascending index snapshot to the window the WHERE's
+// bounds on the ORDER BY column allow, so an ordered walk both STARTS at the lower
+// bound and STOPS at the upper bound instead of scanning the rest of the index —
+// each cut an O(log n) seek. The window is direction-independent: ASC walks it
+// front-to-back, DESC back-to-front. The full WHERE stays the residual matcher, so
+// a missing / kind-mismatched / NULL bound just skips that cut (the residual still
+// filters); only entries that provably fail a bound are dropped.
+func seekOrderedSnap(snap []ordEntry, conj []expr, ord int, args []Value) []ordEntry {
+	if len(snap) == 0 {
+		return snap
+	}
+	lo, hi := orderColumnRange(conj, ord, args)
+	start, end := 0, len(snap)
+	if lo.ok && !lo.val.IsNull() {
+		if lk := keyOf(lo.val); lk.kind == snap[0].key.kind {
+			if lo.op == tkGt { // first key > lo
+				start = sort.Search(len(snap), func(i int) bool { return lk.less(snap[i].key) })
+			} else { // first key >= lo
+				start = sort.Search(len(snap), func(i int) bool { return !snap[i].key.less(lk) })
+			}
+		}
+	}
+	if hi.ok && !hi.val.IsNull() {
+		if hk := keyOf(hi.val); hk.kind == snap[0].key.kind {
+			if hi.op == tkLt { // first key >= hi
+				end = sort.Search(len(snap), func(i int) bool { return !snap[i].key.less(hk) })
+			} else { // first key > hi
+				end = sort.Search(len(snap), func(i int) bool { return hk.less(snap[i].key) })
+			}
+		}
+	}
+	if start >= end { // empty or contradictory window
+		return snap[:0]
+	}
+	return snap[start:end]
+}
+
 // orderedWalkArgs resolves the (snap, dirtyKey, residual) inputs orderedWalk
 // needs for a single-column ordered walk. ok=false means a missing index. The
 // index sits on the ORDER BY column, not the WHERE columns, so the snap
-// guarantees nothing about the WHERE: the whole WHERE is residual. Shared by the
-// materializing and streaming entry points.
-func (db *DB) orderedWalkArgs(pl *plan) (snap []ordEntry, dirtyKey func(Row) indexKey, residual []expr, ok bool) {
+// guarantees nothing about the WHERE: the whole WHERE is residual. When the WHERE
+// bounds the ORDER BY column by a range, the snap is clipped to that window so the
+// walk skips the entries before AND after it. Shared by the materializing and
+// streaming entry points.
+func (db *DB) orderedWalkArgs(pl *plan, args []Value) (snap []ordEntry, dirtyKey func(Row) indexKey, residual []expr, ok bool) {
 	si := pl.rt.indexFor(pl.orderOrdinal)
 	if si == nil {
 		return nil, nil, nil, false
 	}
 	ord := pl.orderOrdinal
-	collectConjuncts(pl.st.(*selectStmt).where, &residual)
-	return si.snapshot(), func(r Row) indexKey { return keyOf(r[ord]) }, residual, true
+	st := pl.st.(*selectStmt)
+	collectConjuncts(st.where, &residual)
+	snap = seekOrderedSnap(si.snapshot(), residual, ord, args)
+	return snap, func(r Row) indexKey { return keyOf(r[ord]) }, residual, true
 }
 
 // execSelectOrderedWalk serves an ORDER BY on an ordered-indexed column by
@@ -632,7 +776,7 @@ func (db *DB) orderedWalkArgs(pl *plan) (snap []ordEntry, dirtyKey func(Row) ind
 // and the row is fetched only when selected. Dirty PKs are excluded from the
 // index walk (the entry may be stale) and supplied from their live rows.
 func (db *DB) execSelectOrderedWalk(pl *plan, args []Value) ([]string, []Row, error) {
-	snap, dirtyKey, residual, ok := db.orderedWalkArgs(pl)
+	snap, dirtyKey, residual, ok := db.orderedWalkArgs(pl, args)
 	if !ok {
 		return pl.colNames, nil, nil
 	}
@@ -776,7 +920,7 @@ func (db *DB) orderedWalkEach(pl *plan, args []Value, snap []ordEntry, dirtyKey 
 // counterparts of execSelectOrderedWalk / execSelectCompositeWalk: same walk
 // inputs, but visiting rows instead of returning a []Row.
 func (db *DB) execSelectOrderedWalkEach(pl *plan, args []Value, visit func(row Row) bool) error {
-	snap, dirtyKey, residual, ok := db.orderedWalkArgs(pl)
+	snap, dirtyKey, residual, ok := db.orderedWalkArgs(pl, args)
 	if !ok {
 		return nil
 	}
@@ -871,6 +1015,17 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 	// overlay) in order and stop at LIMIT — no scan, no sort.
 	if pl.orderWalk {
 		return db.execSelectOrderedWalk(pl, args)
+	}
+
+	// PK pinned inside an AND-chain (no bare-PK / index / partition path): fetch
+	// the one PK-addressed row and return it only if the full WHERE matches —
+	// O(1) instead of a scan. <=1 row, so ORDER BY needs no sort.
+	if pl.pkProbe != nil {
+		keyVal, err := evalExpr(pl.pkProbe, &ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		return db.execSelectPKResidual(pl, keyVal, args)
 	}
 
 	// Collect matching rows. A partition-pinned SELECT (WHERE partkey = ?)

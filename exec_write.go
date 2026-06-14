@@ -378,6 +378,43 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		}
 		return tbl.updateByCandidates(pks, match, pl.updateOrdinals, compute, encode, journalAll)
 	}
+	// PK pinned inside an AND-chain with no index path: resolve the single PK and
+	// re-check the full WHERE on it via the same candidate machinery, instead of
+	// scanning. One candidate, so a single-column SET takes the update-in-place lane.
+	if pl.pkProbe != nil {
+		keyVal, err := evalExpr(pl.pkProbe, ctx)
+		if err != nil {
+			return 0, err
+		}
+		if keyVal.IsNull() {
+			return 0, nil
+		}
+		pk, err := coerceToUUID(keyVal)
+		if err != nil {
+			return 0, err
+		}
+		match := func(r Row) bool {
+			ctx.row = r
+			v, err := evalExpr(st.where, ctx)
+			return err == nil && truthy(v)
+		}
+		var j mutJournal
+		if db.wal != nil {
+			j = mutJournal{db: db, tableID: tbl.tableID, ords: pl.updateOrdinals, pkOrd: tbl.def.pkOrdinal}
+		}
+		if len(pl.updateOrdinals) == 1 {
+			ord := pl.updateOrdinals[0]
+			computeOne := func(r Row) (Value, error) {
+				v, cerr := compute(r)
+				if cerr != nil {
+					return Value{}, cerr
+				}
+				return v[0], nil
+			}
+			return tbl.updateOneByCandidate(pk, ord, match, computeOne, j)
+		}
+		return tbl.updateByCandidates([]UUID{pk}, match, pl.updateOrdinals, compute, encode, journalAll)
+	}
 	// Full-scan fallback: compiled matcher over an owned args copy.
 	matchArgs := make([]Value, len(args))
 	copy(matchArgs, args)
@@ -488,6 +525,39 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 			cand.emit(func(pk UUID) bool { pks = append(pks, pk); return false })
 		}
 		return tbl.deleteByCandidates(pks, match, encode, journalAll)
+	}
+	// PK pinned inside an AND-chain with no index path: resolve the single PK and
+	// re-check the full WHERE on it (deleteOneByCandidate honours the residual),
+	// instead of scanning.
+	if pl.pkProbe != nil {
+		keyVal, err := evalExpr(pl.pkProbe, ctx)
+		if err != nil {
+			return 0, err
+		}
+		if keyVal.IsNull() {
+			return 0, nil
+		}
+		pk, err := coerceToUUID(keyVal)
+		if err != nil {
+			return 0, err
+		}
+		match := func(r Row) bool {
+			ctx.row = r
+			v, err := evalExpr(st.where, ctx)
+			return err == nil && truthy(v)
+		}
+		var j mutJournal
+		if db.wal != nil {
+			j = mutJournal{db: db, tableID: tbl.tableID, pkVal: UUIDVal(pk)}
+		}
+		ok, err := tbl.deleteOneByCandidate(pk, match, j)
+		if err != nil {
+			return 0, err
+		}
+		if ok {
+			return 1, nil
+		}
+		return 0, nil
 	}
 	// Full-scan fallback: compiled matcher over an owned args copy.
 	matchArgs := make([]Value, len(args))

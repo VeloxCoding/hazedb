@@ -2,9 +2,6 @@ package hazedb
 
 import "fmt"
 
-// assignParamIndices walks the AST and replaces every paramRef.index
-// = -1 with a running count, so positional args bind in source order.
-// Called once after parse, before plan. Returns the parameter count.
 // rejectValueLiterals enforces the parameterize-everything contract: a value in a
 // WHERE/SET/VALUES position must be a ? placeholder, never an inline literal. This
 // bounds the plan cache (only finite parameterized shapes are ever cached) and
@@ -50,6 +47,9 @@ func rejectValueLiterals(st stmt) error {
 	return nil
 }
 
+// assignParamIndices walks the AST and replaces every paramRef.index = -1 with a
+// running count, so positional args bind in source order. Called once after parse,
+// before plan. Returns the parameter count.
 func assignParamIndices(st stmt) int {
 	var n int
 	var walk func(expr) expr
@@ -118,9 +118,9 @@ type plan struct {
 	rt         *tableRT
 	catVersion uint64
 	// nparams is the number of positional ? parameters in the statement, set
-	// from assignParamIndices. Exec/Query reject an arg count that does not
-	// match it (too many were silently ignored before; too few panicked a
-	// per-param bounds check).
+	// from assignParamIndices. Exec/Query reject an arg count that does not match
+	// it: extra args would otherwise be silently ignored, and too few would overrun
+	// a per-param bounds check.
 	nparams int
 	// SELECT projection: ordinals into the row, in output order. nil if
 	// SELECT *.
@@ -139,9 +139,9 @@ type plan struct {
 	insertOrdinals []int
 	// insertTmpl is the compiled INSERT VALUES list: one cell template per
 	// VALUES tuple (len 1 for single-row INSERT, N for multi-row), each with one
-	// cell per provided column. Built once at plan time so buildRowFromTmpl
-	// skips per-cell evalExpr dispatch for params and skips eval+validate
-	// entirely for literals. Read-only and shared across concurrent callers.
+	// cell per provided column. Built once at plan time so buildRowFromTmpl binds
+	// params by arg index and only falls back to evalExpr for compound expressions
+	// (? + ?). Read-only and shared across concurrent callers.
 	insertTmpl [][]insCell
 	// UPDATE SET column ordinals matching the sets list.
 	updateOrdinals []int
@@ -155,6 +155,16 @@ type plan struct {
 	// then go straight through tableShard.getByPK and skip the full
 	// scan. pkSource is the expression that yields the key.
 	pkLookup bool
+
+	// pkProbe pins the PK fast path for a WHERE that constrains the PK by equality
+	// inside an AND-chain but is NOT a bare PK equality (so detectPKEq missed it)
+	// and has no index/partition/order path — i.e. it would otherwise full-scan. A
+	// PK equality bounds the result to <=1 row, so the executor fetches that row by
+	// PK and re-checks the FULL WHERE on it (residual conjuncts honoured) instead
+	// of scanning. pkProbe holds the PK value source. Distinct from pkLookup so the
+	// alloc-free PK/JSON/stream fast paths (which never re-check a residual) keep
+	// firing only on a bare PK equality.
+	pkProbe expr
 
 	// countStar is true for SELECT COUNT(*): the WHERE planning below still runs
 	// (pkLookup / idxLookup / partLookup / scan), but the executor counts matches
@@ -259,6 +269,9 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 			if !s.starAll {
 				pl.projOrdinals = make([]int, 0, len(s.cols))
 				for _, c := range s.cols {
+					if !qualifierMatches(c.qual, tname, s.alias) {
+						return nil, fmt.Errorf("%w: %q.%q", ErrUnknownColumn, c.qual, c.col)
+					}
 					ord, ok := rt.colByName[c.col]
 					if !ok {
 						return nil, fmt.Errorf("%w: %q.%q", ErrUnknownColumn, tname, c.col)
@@ -287,13 +300,16 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 			pl.colJSONPrefix[i] = append(appendJSONString(nil, name), ':')
 		}
 		if s.orderCol != "" {
+			if !qualifierMatches(s.orderQual, tname, s.alias) {
+				return nil, fmt.Errorf("%w: %q.%q (ORDER BY)", ErrUnknownColumn, s.orderQual, s.orderCol)
+			}
 			ord, ok := rt.colByName[s.orderCol]
 			if !ok {
 				return nil, fmt.Errorf("%w: %q.%q (ORDER BY)", ErrUnknownColumn, tname, s.orderCol)
 			}
 			pl.orderOrdinal = ord
 		}
-		if err := validateExpr(s.where, rt); err != nil {
+		if err := validateExpr(s.where, rt, s.alias); err != nil {
 			return nil, err
 		}
 		if s.where != nil {
@@ -306,29 +322,33 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 					pl.partSource = src
 				}
 			} else if len(rt.indexes) > 0 {
-				// Secondary-index lookup. Collect every indexed column constrained
-				// by equality in the WHERE's AND-chain; the executor intersects
-				// their buckets and evaluates the FULL WHERE on each candidate
-				// (residual-filtering extra conjuncts). An ORDER BY is honoured by
-				// sorting the candidate set — the filtered-list pattern (WHERE
-				// author = ? ORDER BY date). A query with no indexed equality
-				// conjunct (a bare ORDER BY, or only a range) falls back to scan.
+				// Secondary-index selection. A composite ordered WALK serves
+				// WHERE-prefix + ORDER BY-trailing without a sort (and stops early at
+				// LIMIT), so it beats a single-column index lookup — which resolves
+				// candidates by one column's bucket and then SORTS them for the ORDER
+				// BY (the filtered-list pattern, WHERE author = ? ORDER BY date). Try
+				// the walk first; only when none applies collect single-column indexed
+				// equalities (intersect their buckets, residual-filter the full WHERE),
+				// then fall back to a composite prefix lookup. No indexed equality and
+				// no walk → scan.
 				eqs := map[int]expr{}
 				collectEqConjuncts(s.where, eqs)
-				for i := range rt.indexes {
-					ri := &rt.indexes[i]
-					if len(ri.ordinals) != 1 {
-						continue // composite indexes are handled by planComposite below
+				if !rt.planCompositeWalk(pl, s.where, eqs, pl.orderOrdinal) {
+					for i := range rt.indexes {
+						ri := &rt.indexes[i]
+						if len(ri.ordinals) != 1 {
+							continue // composite indexes handled by the walk/lookup helpers
+						}
+						ord := ri.ordinals[0]
+						if src, has := eqs[ord]; has {
+							pl.idxCols = append(pl.idxCols, ord)
+							pl.idxSrcs = append(pl.idxSrcs, src)
+						}
 					}
-					ord := ri.ordinals[0]
-					if src, has := eqs[ord]; has {
-						pl.idxCols = append(pl.idxCols, ord)
-						pl.idxSrcs = append(pl.idxSrcs, src)
+					pl.idxLookup = len(pl.idxCols) > 0
+					if !pl.idxLookup {
+						rt.planCompositeLookup(pl, eqs)
 					}
-				}
-				pl.idxLookup = len(pl.idxCols) > 0
-				if !pl.idxLookup {
-					rt.planComposite(pl, s.where, eqs, pl.orderOrdinal)
 				}
 				// COUNT(*) WHERE col = ? on a single indexed column, and the WHERE is
 				// exactly that equality (a bare tkEq, no residual conjuncts): the index
@@ -349,6 +369,10 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 		if s.orderCol != "" && !pl.idxLookup && !pl.compLookup && !pl.compWalk && rt.orderedIndexOn(pl.orderOrdinal) && !rt.def.Columns[pl.orderOrdinal].Nullable {
 			pl.orderWalk = true
 		}
+		// PK pinned inside an AND-chain with no cheaper path chosen: probe by PK
+		// and re-check the full WHERE instead of scanning. After every strategy
+		// above so it fills only the would-otherwise-scan gap.
+		rt.planPKProbe(pl, s.where)
 	case *insertStmt:
 		pl.insertOrdinals = make([]int, 0, len(s.cols))
 		provided := make([]bool, len(rt.def.Columns))
@@ -364,9 +388,9 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 			provided[ord] = true
 		}
 		// Compile each VALUES tuple into its own cell template: params bind by
-		// arg index, literals are validated + coerced once here (not per insert),
-		// and anything else falls back to evalExpr. Single-row INSERT is the
-		// len-1 case; multi-row gets one template per tuple.
+		// arg index, anything else (e.g. ? + ?) falls back to evalExpr. Inline
+		// literals are rejected before planning, so none reach here. Single-row
+		// INSERT is the len-1 case; multi-row gets one template per tuple.
 		pl.insertTmpl = make([][]insCell, len(s.rows))
 		for r, tuple := range s.rows {
 			tmpl := make([]insCell, len(pl.insertOrdinals))
@@ -415,14 +439,14 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 			pl.updateOrdinals = append(pl.updateOrdinals, ord)
 			// Validate the right-hand side (catches unknown columns in
 			// arithmetic like SET x = bogus - ?) and note row dependence.
-			if err := validateExpr(a.val, rt); err != nil {
+			if err := validateExpr(a.val, rt, ""); err != nil {
 				return nil, err
 			}
 			if exprRefsColumn(a.val) {
 				pl.setRowDependent = true
 			}
 		}
-		if err := validateExpr(s.where, rt); err != nil {
+		if err := validateExpr(s.where, rt, ""); err != nil {
 			return nil, err
 		}
 		if s.where != nil {
@@ -431,10 +455,11 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 				pl.pkSource = src
 			} else {
 				rt.planIndexEq(pl, s.where) // secondary-index candidates instead of a scan
+				rt.planPKProbe(pl, s.where) // PK pinned in an AND-chain with no index path
 			}
 		}
 	case *deleteStmt:
-		if err := validateExpr(s.where, rt); err != nil {
+		if err := validateExpr(s.where, rt, ""); err != nil {
 			return nil, err
 		}
 		if s.where != nil {
@@ -443,6 +468,7 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 				pl.pkSource = src
 			} else {
 				rt.planIndexEq(pl, s.where) // secondary-index candidates instead of a scan
+				rt.planPKProbe(pl, s.where) // PK pinned in an AND-chain with no index path
 			}
 		}
 	}
@@ -450,8 +476,8 @@ func (db *DB) plan(st stmt, cat *catalog) (*plan, error) {
 }
 
 // detectColEq returns (true, valueSide) when e is a single binOp = between the
-// named column (by ordinal) and a literal/parameter. Walks across AND chains
-// in a future pass — v1 only accepts the bare equality.
+// named column (by ordinal) and a literal/parameter. It matches the bare equality
+// only; an equality inside an AND-chain is found by collectEqConjuncts instead.
 func detectColEq(e expr, rt *resolvedTable, ordinal int) (bool, expr) {
 	bop, ok := e.(*binOp)
 	if !ok || bop.op != tkEq {
@@ -476,6 +502,30 @@ func detectPKEq(e expr, rt *resolvedTable) (bool, expr) {
 	return detectColEq(e, rt, rt.pkOrdinal)
 }
 
+// planPKProbe fills the one gap detectPKEq leaves: a WHERE that pins the PK by
+// equality inside an AND-chain (WHERE id = ? AND age = ?) rather than as the sole
+// equality. It activates only when no cheaper-than-scan path was already chosen
+// (bare pkLookup / index / partition), so it strictly replaces a full scan with a
+// single getByPK plus a residual full-WHERE re-check. Must run after those paths
+// are decided.
+func (rt *resolvedTable) planPKProbe(pl *plan, where expr) {
+	if where == nil || pl.pkLookup || pl.idxLookup || pl.partLookup || pl.compLookup || pl.compWalk || pl.orderWalk {
+		return
+	}
+	// Non-partitioned only: the write candidate paths (updateByCandidates etc.)
+	// locate rows by t.shardOf(pk), which is not how a partitioned table routes a
+	// bare PK (pkDir). Gating here keeps SELECT/UPDATE/DELETE consistent — a
+	// partitioned table takes this shape via the scan, as before.
+	if rt.partitioned() {
+		return
+	}
+	eqs := map[int]expr{}
+	collectEqConjuncts(where, eqs)
+	if src, ok := eqs[rt.pkOrdinal]; ok {
+		pl.pkProbe = src
+	}
+}
+
 // planIndexEq sets idxLookup + idxCols/idxSrcs when the WHERE pins one or more
 // single-column secondary-indexed columns by equality, so UPDATE/DELETE resolve
 // candidates through the index (like SELECT) instead of scanning every row.
@@ -498,64 +548,94 @@ func (rt *resolvedTable) planIndexEq(pl *plan, where expr) {
 	pl.idxLookup = len(pl.idxCols) > 0
 }
 
-// planComposite selects a composite ordered index for a SELECT whose WHERE pins
-// a contiguous leading prefix of its columns by equality (eqs maps a pinned
-// column ordinal to the expr yielding its value). It records the index's ordinals
-// + the prefix value-sources, then chooses compWalk when the ORDER BY is on the
-// first unpinned column (already sorted within the prefix — no sort) or
-// compLookup otherwise. The leading column must be pinned (k ≥ 1). First usable
-// index wins.
-func (rt *resolvedTable) planComposite(pl *plan, where expr, eqs map[int]expr, orderOrdinal int) {
+// compositePrefix returns the length of the contiguous leading prefix of ri's
+// columns the WHERE pins by equality (eqs maps a pinned ordinal to its value
+// expr). It returns 0 — unusable — unless ri is a composite ordered index whose
+// every component is NOT NULL and whose leading column is pinned. The NOT-NULL
+// guard is a correctness rule: a composite index excludes any row with a NULL in
+// any component, so a (a=X, b=NULL) row would match WHERE a=? yet be absent from
+// the index — nullable-component composites must fall back to scan.
+func (rt *resolvedTable) compositePrefix(ri *resolvedIndex, eqs map[int]expr) int {
+	if len(ri.ordinals) < 2 || !ri.ordered || rt.anyNullable(ri.ordinals) {
+		return 0
+	}
+	k := 0
+	for k < len(ri.ordinals) {
+		if _, has := eqs[ri.ordinals[k]]; !has {
+			break
+		}
+		k++
+	}
+	return k
+}
+
+// prefixSrcs returns the value exprs for ri's first k pinned columns, in order.
+func prefixSrcs(ri *resolvedIndex, eqs map[int]expr, k int) []expr {
+	srcs := make([]expr, k)
+	for j := 0; j < k; j++ {
+		srcs[j] = eqs[ri.ordinals[j]]
+	}
+	return srcs
+}
+
+// planCompositeWalk picks a composite ordered index that serves the ORDER BY by
+// walking it in order: the WHERE pins a leading prefix and the ORDER BY column is
+// the next column, so the prefix sub-range is already sorted — no sort, and a
+// LIMIT stops the walk early. Preferred over a single-column index lookup, which
+// would sort the whole candidate set. Scans every index and takes the first that
+// yields such a walk; returns whether one did.
+func (rt *resolvedTable) planCompositeWalk(pl *plan, where expr, eqs map[int]expr, orderOrdinal int) bool {
+	if orderOrdinal < 0 {
+		return false
+	}
 	for i := range rt.indexes {
 		ri := &rt.indexes[i]
-		if len(ri.ordinals) < 2 || !ri.ordered {
+		k := rt.compositePrefix(ri, eqs)
+		if k == 0 || k >= len(ri.ordinals) || ri.ordinals[k] != orderOrdinal {
 			continue
-		}
-		// Correctness guard: a composite index excludes any row with a NULL in any
-		// component, so it can only serve a query completely when every component
-		// is NOT NULL — else a (a=X, b=NULL) row matches WHERE a=? yet is absent
-		// from the index. Nullable-component composites fall back to scan.
-		if rt.anyNullable(ri.ordinals) {
-			continue
-		}
-		k := 0
-		for k < len(ri.ordinals) {
-			if _, has := eqs[ri.ordinals[k]]; !has {
-				break
-			}
-			k++
-		}
-		if k == 0 {
-			continue // leading column not pinned by equality
-		}
-		srcs := make([]expr, k)
-		pinned := make(map[int]bool, k)
-		for j := 0; j < k; j++ {
-			srcs[j] = eqs[ri.ordinals[j]]
-			pinned[ri.ordinals[j]] = true
 		}
 		pl.compOrdinals = ri.ordinals
-		pl.compPrefixSrcs = srcs
-		if orderOrdinal >= 0 && k < len(ri.ordinals) && ri.ordinals[k] == orderOrdinal {
-			pl.compWalk = true // ORDER BY on the trailing column: walk in order, no sort
-			// Residual = WHERE conjuncts the prefix does not already guarantee. Drop
-			// only the EXACT pin equalities (by value-expr identity), so a second
-			// constraint on a pinned column survives and stays correct.
-			var conj []expr
-			collectConjuncts(where, &conj)
-			for _, c := range conj {
-				if b, ok := c.(*binOp); ok && b.op == tkEq {
-					if cr, val := colAndLit(b); cr != nil && pinned[cr.ord] && val == eqs[cr.ord] {
-						continue
-					}
-				}
-				pl.compResidual = append(pl.compResidual, c)
-			}
-		} else {
-			pl.compLookup = true
+		pl.compPrefixSrcs = prefixSrcs(ri, eqs, k)
+		pl.compWalk = true
+		// Residual = WHERE conjuncts the prefix does not already guarantee. Drop
+		// only the EXACT pin equalities (by value-expr identity), so a second
+		// constraint on a pinned column survives and stays correct.
+		pinned := make(map[int]bool, k)
+		for j := 0; j < k; j++ {
+			pinned[ri.ordinals[j]] = true
 		}
-		return
+		var conj []expr
+		collectConjuncts(where, &conj)
+		for _, c := range conj {
+			if b, ok := c.(*binOp); ok && b.op == tkEq {
+				if cr, val := colAndLit(b); cr != nil && pinned[cr.ord] && val == eqs[cr.ord] {
+					continue
+				}
+			}
+			pl.compResidual = append(pl.compResidual, c)
+		}
+		return true
 	}
+	return false
+}
+
+// planCompositeLookup picks a composite ordered index whose leading prefix the
+// WHERE pins by equality, resolving candidates through that prefix instead of
+// scanning. The fallback when no sort-avoiding walk and no single-column index
+// applies. First usable index wins; returns whether one did.
+func (rt *resolvedTable) planCompositeLookup(pl *plan, eqs map[int]expr) bool {
+	for i := range rt.indexes {
+		ri := &rt.indexes[i]
+		k := rt.compositePrefix(ri, eqs)
+		if k == 0 {
+			continue
+		}
+		pl.compOrdinals = ri.ordinals
+		pl.compPrefixSrcs = prefixSrcs(ri, eqs, k)
+		pl.compLookup = true
+		return true
+	}
+	return false
 }
 
 // anyNullable reports whether any of the columns at ords is declared nullable.
@@ -637,28 +717,39 @@ func exprRefsColumn(e expr) bool {
 	return false
 }
 
-func validateExpr(e expr, rt *resolvedTable) error {
+// qualifierMatches reports whether a single-table column qualifier is one this
+// FROM clause exposes: empty (unqualified), the table name, or its alias. Any
+// other qualifier names a table not in the query (SELECT bogus.col FROM users),
+// which is an error rather than a silently-ignored prefix.
+func qualifierMatches(qual, table, alias string) bool {
+	return qual == "" || qual == table || (alias != "" && qual == alias)
+}
+
+func validateExpr(e expr, rt *resolvedTable, alias string) error {
 	if e == nil {
 		return nil
 	}
 	switch x := e.(type) {
 	case *colRef:
+		if !qualifierMatches(x.qual, rt.def.Name, alias) {
+			return fmt.Errorf("%w: %q.%q", ErrUnknownColumn, x.qual, x.name)
+		}
 		ord, ok := rt.colByName[x.name]
 		if !ok {
 			return fmt.Errorf("%w: %q.%q", ErrUnknownColumn, rt.def.Name, x.name)
 		}
 		x.ord = ord // bind once at plan time; evalExpr indexes by ord
 	case *binOp:
-		if err := validateExpr(x.lhs, rt); err != nil {
+		if err := validateExpr(x.lhs, rt, alias); err != nil {
 			return err
 		}
-		if err := validateExpr(x.rhs, rt); err != nil {
+		if err := validateExpr(x.rhs, rt, alias); err != nil {
 			return err
 		}
 	case *notExpr:
-		return validateExpr(x.e, rt)
+		return validateExpr(x.e, rt, alias)
 	case *isNullExpr:
-		return validateExpr(x.e, rt)
+		return validateExpr(x.e, rt, alias)
 	}
 	return nil
 }

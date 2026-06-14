@@ -197,6 +197,26 @@ func (db *DB) streamSelect(pl *plan, args []Value, visit func(row Row) bool) ([]
 		return colNames, nil
 	}
 
+	// PK pinned inside an AND-chain: visit just the one PK-addressed row (consume
+	// applies the full WHERE), instead of scanning. getByPK routes partitioned
+	// tables through pkDir; the single clone is negligible for one row.
+	if pl.pkProbe != nil {
+		keyVal, err := evalExpr(pl.pkProbe, &ctx)
+		if err != nil {
+			return nil, err
+		}
+		if !keyVal.IsNull() {
+			pk, err := coerceToUUID(keyVal)
+			if err != nil {
+				return nil, err
+			}
+			if r, ok := tbl.getByPK(pk); ok {
+				consume(r)
+			}
+		}
+		return colNames, nil
+	}
+
 	// Scan: scanAll / scanPartition call the callback under each shard's read
 	// lock, so consume runs on live rows. (A pinned partition scans only its
 	// rows; otherwise every shard.)

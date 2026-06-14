@@ -574,6 +574,59 @@ func TestOrderedIndexOrderBy(t *testing.T) {
 	}
 }
 
+// The ordered walk seeks to a WHERE range bound on the ORDER BY column instead of
+// scanning from the index head: the result must hold exactly the windowed rows in
+// order (no valid row dropped by the seek, none outside leaked past the residual),
+// across ASC/DESC, inclusive/exclusive bounds, flipped operand order, and a dirty
+// overlay row inside the window.
+func TestOrderedWalkRangeSeek(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE t (id uuid primary key, v int, ORDERED INDEX (v))")
+	for i := 0; i < 100; i++ {
+		db.Exec("INSERT INTO t (id, v) VALUES (?, ?)", NewUUIDv7(), i*2) // 0,2,4,...,198
+	}
+	db.mergeIndexes() // all rows in the sorted snapshot, so the seek (not the dc path) is exercised
+
+	ints := func(sql string, args ...any) []int64 {
+		_, rows, err := db.Query(sql, args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := make([]int64, len(rows))
+		for i, r := range rows {
+			out[i] = r[0].Int()
+		}
+		return out
+	}
+	eq := func(label string, got, want []int64) {
+		if len(got) != len(want) {
+			t.Fatalf("%s: %v, want %v", label, got, want)
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("%s: %v, want %v", label, got, want)
+			}
+		}
+	}
+
+	eq("ASC inclusive", ints("SELECT v FROM t WHERE v >= ? AND v < ? ORDER BY v", 50, 60), []int64{50, 52, 54, 56, 58})
+	eq("ASC exclusive", ints("SELECT v FROM t WHERE v > ? AND v < ? ORDER BY v", 50, 60), []int64{52, 54, 56, 58})
+	eq("DESC inclusive", ints("SELECT v FROM t WHERE v >= ? AND v <= ? ORDER BY v DESC", 50, 58), []int64{58, 56, 54, 52, 50})
+	eq("DESC exclusive", ints("SELECT v FROM t WHERE v >= ? AND v < ? ORDER BY v DESC", 50, 58), []int64{56, 54, 52, 50})
+	eq("flipped operands", ints("SELECT v FROM t WHERE ? <= v AND v < ? ORDER BY v", 50, 60), []int64{50, 52, 54, 56, 58})
+	eq("lower bound + LIMIT", ints("SELECT v FROM t WHERE v >= ? ORDER BY v LIMIT 3", 50), []int64{50, 52, 54})
+
+	// Sparse window: fewer matches than LIMIT, so the upper-bound cut (not LIMIT)
+	// must terminate the walk at the window edge.
+	eq("sparse ASC LIMIT", ints("SELECT v FROM t WHERE v >= ? AND v < ? ORDER BY v LIMIT 20", 50, 60), []int64{50, 52, 54, 56, 58})
+	eq("sparse DESC LIMIT", ints("SELECT v FROM t WHERE v >= ? AND v < ? ORDER BY v DESC LIMIT 20", 50, 60), []int64{58, 56, 54, 52, 50})
+
+	// A dirty (unmerged) row inside the window must still interleave correctly —
+	// it lives in the overlay, not the seeked snapshot.
+	db.Exec("INSERT INTO t (id, v) VALUES (?, ?)", NewUUIDv7(), 53)
+	eq("dirty in window", ints("SELECT v FROM t WHERE v >= ? AND v < ? ORDER BY v", 50, 60), []int64{50, 52, 53, 54, 56, 58})
+}
+
 // O4: the golden invariant for the ordered walk under concurrent writers,
 // readers, and the background merger (run with -race). Live: an ORDER BY result
 // is monotonic (no out-of-order row). Quiescent: the ordered walk equals a

@@ -244,6 +244,63 @@ func TestCompositeWalkPlanAndOrder(t *testing.T) {
 	}
 }
 
+// A redundant single-column index on the leading column must NOT mask the
+// composite ordered walk: WHERE author = ? ORDER BY title still plans as compWalk
+// (no sort), not a single-column idxLookup that sorts the candidate set.
+func TestCompositeWalkPreferredOverSingleIndex(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE posts (id uuid primary key, author text, title text, " +
+		"INDEX (author), ORDERED INDEX (author, title))")
+	for _, ti := range []string{"delta", "alpha", "charlie", "bravo"} {
+		db.Exec("INSERT INTO posts (id, author, title) VALUES (?, ?, ?)", NewUUIDv7(), "alice", ti)
+	}
+	db.mergeIndexes()
+
+	pl, err := db.prepare("SELECT title FROM posts WHERE author = ? ORDER BY title", db.cat.Load())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pl.compWalk || pl.idxLookup || pl.compLookup {
+		t.Fatalf("want compWalk: compWalk=%v idxLookup=%v compLookup=%v", pl.compWalk, pl.idxLookup, pl.compLookup)
+	}
+	_, rows, err := db.Query("SELECT title FROM posts WHERE author = ? ORDER BY title", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := join(strs(rows, 0)); got != "alpha,bravo,charlie,delta" {
+		t.Fatalf("walk order wrong: %q", got)
+	}
+	// Without an ORDER BY the single-column lookup is the right plan (no sort to avoid).
+	pl2, _ := db.prepare("SELECT title FROM posts WHERE author = ?", db.cat.Load())
+	if pl2.compWalk || !pl2.idxLookup {
+		t.Fatalf("no ORDER BY: want idxLookup, got compWalk=%v idxLookup=%v", pl2.compWalk, pl2.idxLookup)
+	}
+}
+
+// planCompositeWalk must prefer a walk over a compLookup-only index that happens
+// to be declared first: with ORDERED INDEX(author, city) (lookup-only for this
+// ORDER BY) before ORDERED INDEX(author, title) (the walk), the walk still wins.
+func TestCompositeWalkPreferredOverEarlierLookup(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE posts (id uuid primary key, author text, city text, title text, " +
+		"ORDERED INDEX (author, city), ORDERED INDEX (author, title))")
+	db.Exec("INSERT INTO posts (id, author, city, title) VALUES (?, ?, ?, ?)", NewUUIDv7(), "alice", "rome", "bravo")
+	db.Exec("INSERT INTO posts (id, author, city, title) VALUES (?, ?, ?, ?)", NewUUIDv7(), "alice", "oslo", "alpha")
+	db.mergeIndexes()
+
+	pl, err := db.prepare("SELECT title FROM posts WHERE author = ? ORDER BY title", db.cat.Load())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pl.compWalk {
+		t.Fatalf("want compWalk over earlier lookup-only composite: compWalk=%v compLookup=%v", pl.compWalk, pl.compLookup)
+	}
+	_, rows, _ := db.Query("SELECT title FROM posts WHERE author = ? ORDER BY title", "alice")
+	if got := join(strs(rows, 0)); got != "alpha,bravo" {
+		t.Fatalf("walk order wrong: %q", got)
+	}
+}
+
 // Step 3b: ASC/DESC + LIMIT + OFFSET windows off the walk.
 func TestCompositeWalkWindows(t *testing.T) {
 	db := seedWalkPosts(t, "delta", "alpha", "charlie", "bravo")

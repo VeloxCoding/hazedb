@@ -41,6 +41,49 @@ func TestStmtParityWithDB(t *testing.T) {
 	}
 }
 
+// Single-table column qualifiers must resolve against the FROM table or its alias
+// and nothing else: a qualifier naming any other table is an error, not a
+// silently-ignored prefix. Covers projection, WHERE, ORDER BY, and the writes.
+func TestQualifierResolution(t *testing.T) {
+	db := openMem(t)
+	// Valid: unqualified, the table name, the alias, and (when aliased) the table
+	// name still qualifying. These must plan + run without error.
+	okCases := []struct {
+		sql  string
+		args []any
+	}{
+		{"SELECT name FROM users", nil},
+		{"SELECT users.name FROM users", nil},
+		{"SELECT users.name, age FROM users WHERE users.age >= ? ORDER BY users.name ASC", []any{0}},
+		{"SELECT u.name FROM users u WHERE u.age >= ? ORDER BY u.name ASC", []any{0}},
+		{"SELECT name FROM users u WHERE users.age >= ?", []any{0}},
+	}
+	for _, c := range okCases {
+		if _, _, err := db.Query(c.sql, c.args...); err != nil {
+			t.Errorf("valid qualifier rejected: %q: %v", c.sql, err)
+		}
+	}
+	// Invalid: a qualifier naming a table not in the FROM clause. Rejected at plan
+	// time, so args are irrelevant.
+	badReads := []string{
+		"SELECT bogus.name FROM users",
+		"SELECT name FROM users WHERE bogus.age >= ?",
+		"SELECT name FROM users ORDER BY bogus.name ASC",
+		"SELECT u.name FROM users u WHERE users2.age >= ?",
+	}
+	for _, q := range badReads {
+		if _, _, err := db.Query(q, 0); !errors.Is(err, ErrUnknownColumn) {
+			t.Errorf("bad qualifier accepted: %q: got %v, want ErrUnknownColumn", q, err)
+		}
+	}
+	if _, err := db.Exec("UPDATE users SET age = ? WHERE bogus.id = ?", 1, tid(1)); !errors.Is(err, ErrUnknownColumn) {
+		t.Errorf("UPDATE with bad WHERE qualifier accepted: %v", err)
+	}
+	if _, err := db.Exec("DELETE FROM users WHERE bogus.id = ?", tid(1)); !errors.Is(err, ErrUnknownColumn) {
+		t.Errorf("DELETE with bad WHERE qualifier accepted: %v", err)
+	}
+}
+
 // A handle must survive DDL: after a DROP it re-binds to a clean ErrUnknownTable,
 // and after the table is re-created it works again — never pointing at stale
 // storage.
