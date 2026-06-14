@@ -33,8 +33,8 @@ $scalar = hazedb_fetch('SELECT name, age FROM users WHERE id = ?', $a);
 ok('fetch_scalar_ok',  $scalar !== null && $scalar['name'] === 'alice' && $scalar['age'] === 30);
 
 // fetchall — list of assoc rows; fetchall_json — byte-identical JSON of the same
-$all = hazedb_fetchall('SELECT name, age FROM users WHERE age >= 30 ORDER BY age ASC');
-$js  = hazedb_fetchall_json('SELECT name, age FROM users WHERE age >= 30 ORDER BY age ASC');
+$all = hazedb_fetchall('SELECT name, age FROM users WHERE age >= ? ORDER BY age ASC', [30]);
+$js  = hazedb_fetchall_json('SELECT name, age FROM users WHERE age >= ? ORDER BY age ASC', [30]);
 ok('fetchall_ok',      is_array($all) && count($all) === 2 && $all[0]['name'] === 'alice' && $all[1]['name'] === 'carol');
 ok('fetchall_json_ok', json_encode($all) === $js);
 
