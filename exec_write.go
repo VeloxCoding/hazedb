@@ -125,9 +125,9 @@ func (db *DB) buildRowFromTmpl(pl *plan, tmpl []insCell, args []Value) (Row, err
 	return row, nil
 }
 
-// buildInsertRow builds the row for a single-row INSERT (tuple 0). Transaction
-// staging and the single-row exec path use it; multi-row INSERT iterates the
-// per-tuple templates directly via buildRowFromTmpl.
+// buildInsertRow builds the row for a single-row INSERT (tuple 0); execInsert is
+// its only caller. Multi-row INSERT and the transaction path build their per-tuple
+// rows via buildRowFromTmpl directly.
 func (db *DB) buildInsertRow(pl *plan, args []Value) (Row, error) {
 	return db.buildRowFromTmpl(pl, pl.insertTmpl[0], args)
 }
@@ -196,12 +196,27 @@ func (db *DB) execInsertBatch(pl *plan, args []Value) (int, error) {
 	return len(staged), nil
 }
 
-// execUpdate evaluates the SET values once, then dispatches on the WHERE
-// shape. A PK-pinned update hits exactly one shard and mutates in place
-// under that shard's lock (hot path, allocation-free). An unpinned predicate
-// update can span shards and goes through updateWhereAll, which holds every
-// shard lock across the journal+apply so the WAL order and in-memory order
-// stay identical — the one-shard-at-a-time form is a replay-divergence bug.
+// --- execUpdate / execDelete: shared dispatch, locking & journaling ----------
+//
+// Both evaluate their per-row work, then dispatch on the WHERE shape:
+//
+//   - PK-pinned    one shard, mutated/tombstoned in place under its lock,
+//                  journal-before-apply (the hot, allocation-free path).
+//   - Index-pinned the candidate set (index bucket ∪ dirty overlay) re-checked
+//                  against the FULL WHERE; dirtyTooDenseForScan falls back to a
+//                  scan when the overlay would cost more than scanning it.
+//   - Unpinned     every shard lock held across journal+apply, the batch written
+//                  as ONE TXN envelope so the statement is atomic on WAL failure
+//                  or crash (a one-shard-at-a-time form diverges on replay).
+//
+// The candidate re-check uses a direct ctx predicate, not rowMatcher's compiled
+// closure: that closure captures ctx and would force execPlan's argument buffer
+// onto the heap on every PK/indexed write. The full-scan fallback instead copies
+// args into an owned slice and uses the compiled matcher. encode/journalAll are
+// nil for a memory-only DB, and journaling is always performed by the store under
+// the lock(s) — never as a side effect of the match predicate.
+
+// execUpdate evaluates the SET values once, then dispatches on the WHERE shape.
 func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 	st := pl.st.(*updateStmt)
 	tbl := pl.rt
@@ -287,9 +302,7 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		compute = func(Row) ([]Value, error) { return buf, nil }
 	}
 
-	// Fast path: PK equality — single shard, journal-before-apply under that
-	// shard's lock (updateByPKJournaled). The zero journal for memory-only
-	// keeps this hot path allocation-free.
+	// PK-pinned fast path (updateByPKJournaled).
 	if pl.pkLookup {
 		keyVal, err := evalExpr(pl.pkSource, &evalCtx{args: args})
 		if err != nil {
@@ -316,10 +329,7 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		return 0, nil
 	}
 
-	// Multi-shard predicate path: updateWhereAll collects every matched row's
-	// new image under all shard locks, journals the batch as ONE TXN envelope,
-	// then applies — so the statement is atomic (all-or-nothing on WAL failure
-	// or crash). encode/journalAll are nil for a memory-only DB.
+	// encode/journalAll for the candidate + full-scan paths (nil = memory-only).
 	var encode func(Row) []byte
 	var journalAll func([][]byte) error
 	if db.wal != nil {
@@ -328,10 +338,7 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		}
 		journalAll = db.journalTxnBodies
 	}
-	// Secondary-index WHERE: update only the index candidates (∪ dirty), re-checked
-	// against the full WHERE, instead of scanning every row. Under a heavy write
-	// burst the dirty overlay can outgrow the table, making the candidate walk
-	// cost more than a scan — dirtyTooDenseForScan falls through to updateWhereAll.
+	// Index-pinned: re-check the candidate set against the full WHERE.
 	if pl.idxLookup && !tbl.dirtyTooDenseForScan() {
 		cand, ok, err := db.idxCandidates(pl, ctx)
 		if err != nil {
@@ -347,10 +354,7 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 			pks = nil
 			cand.emit(func(pk UUID) bool { pks = append(pks, pk); return false })
 		}
-		// Re-check the full WHERE on each candidate with a direct predicate. The
-		// candidate set is narrow, so the compiled scan matcher is not worth its
-		// ctx-capturing closure — which (returned from rowMatcher) would force
-		// execPlan's argument buffer onto the heap for every indexed write.
+		// Re-check the full WHERE on each candidate with a direct ctx predicate.
 		match := func(r Row) bool {
 			if st.where == nil {
 				return true
@@ -381,29 +385,21 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		}
 		return tbl.updateByCandidates(pks, match, pl.updateOrdinals, compute, encode, journalAll)
 	}
-	// Full-scan fallback: the compiled matcher pays off over many rows. Copy the
-	// args into an owned slice so the matcher's captured ctx does not drag
-	// execPlan's fixed argument buffer onto the heap (which would penalise every
-	// PK/indexed write that never reaches this path).
+	// Full-scan fallback: compiled matcher over an owned args copy.
 	matchArgs := make([]Value, len(args))
 	copy(matchArgs, args)
 	match := rowMatcher(st.where, &evalCtx{cols: tbl.def.colByName, args: matchArgs})
 	return tbl.updateWhereAll(match, pl.updateOrdinals, compute, encode, journalAll)
 }
 
-// execDelete dispatches on the WHERE shape, mirroring execUpdate. A
-// PK-pinned delete hits one shard. An unpinned predicate delete goes
-// through deleteWhereAll, which holds every shard lock across journal+apply
-// (the one-shard-at-a-time form diverges on replay). Journaling is done by
-// the store under the locks — never as a side effect of the match predicate.
+// execDelete dispatches on the WHERE shape. deleteByPKJournaled's PK path also
+// closes a getByPK→deleteByPK TOCTOU under the one shard lock.
 func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 	st := pl.st.(*deleteStmt)
 	tbl := pl.rt
 	ctx := &evalCtx{cols: tbl.def.colByName, args: args}
 
-	// Fast path: PK equality — single shard, journal-before-tombstone under
-	// the shard lock (deleteByPKJournaled, which also closes a
-	// getByPK→deleteByPK TOCTOU). nil journal for memory-only.
+	// PK-pinned fast path (deleteByPKJournaled).
 	if pl.pkLookup {
 		keyVal, err := evalExpr(pl.pkSource, &evalCtx{args: args})
 		if err != nil {
@@ -431,9 +427,7 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 		return 0, nil
 	}
 
-	// Multi-shard predicate path: deleteWhereAll collects matched PKs under all
-	// shard locks, journals the batch as ONE TXN envelope, then tombstones — so
-	// the statement is atomic. encode/journalAll are nil for a memory-only DB.
+	// encode/journalAll for the candidate + full-scan paths (nil = memory-only).
 	var encode func(Value) []byte
 	var journalAll func([][]byte) error
 	if db.wal != nil {
@@ -442,15 +436,10 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 		}
 		journalAll = db.journalTxnBodies
 	}
-	// Secondary-index WHERE: delete only the index candidates (∪ dirty), re-checked
-	// against the full WHERE, instead of scanning every row. Under a heavy write
-	// burst the dirty overlay can outgrow the table, making the candidate walk
-	// cost more than a scan — dirtyTooDenseForScan falls through to deleteWhereAll.
+	// Index-pinned: re-check the candidate set against the full WHERE.
 	if pl.idxLookup && !tbl.dirtyTooDenseForScan() {
-		// Direct WHERE re-check applied to each candidate's live row under the lock
-		// (see execUpdate: a narrow candidate set does not warrant the ctx-capturing
-		// compiled matcher that escapes the arg buffer). Scoped to this branch so the
-		// PK and full-scan paths don't pay the ctx-capturing closure's arg escape.
+		// Re-check the full WHERE on each candidate with a direct ctx predicate.
+		// Scoped to this branch so the PK and full-scan paths don't build it.
 		match := func(r Row) bool {
 			if st.where == nil {
 				return true
@@ -507,8 +496,7 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 		}
 		return tbl.deleteByCandidates(pks, match, encode, journalAll)
 	}
-	// Full-scan fallback: compiled matcher over an owned args copy, so the captured
-	// ctx does not drag execPlan's argument buffer onto the heap (see execUpdate).
+	// Full-scan fallback: compiled matcher over an owned args copy.
 	matchArgs := make([]Value, len(args))
 	copy(matchArgs, args)
 	match := rowMatcher(st.where, &evalCtx{cols: tbl.def.colByName, args: matchArgs})
