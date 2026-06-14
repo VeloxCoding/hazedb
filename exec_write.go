@@ -447,6 +447,52 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 	// burst the dirty overlay can outgrow the table, making the candidate walk
 	// cost more than a scan — dirtyTooDenseForScan falls through to deleteWhereAll.
 	if pl.idxLookup && !tbl.dirtyTooDenseForScan() {
+		// Direct WHERE re-check applied to each candidate's live row under the lock
+		// (see execUpdate: a narrow candidate set does not warrant the ctx-capturing
+		// compiled matcher that escapes the arg buffer). Scoped to this branch so the
+		// PK and full-scan paths don't pay the ctx-capturing closure's arg escape.
+		match := func(r Row) bool {
+			if st.where == nil {
+				return true
+			}
+			ctx.row = r
+			v, err := evalExpr(st.where, ctx)
+			return err == nil && truthy(v)
+		}
+		// Single-row fast path: one indexed equality, no dirty overlay, exactly one
+		// index hit → delete it directly (one shard lock, single MUTATION record like
+		// the PK path), skipping the []UUID candidate slice + multi-shard machinery.
+		// match still re-checks the full WHERE, so a residual conjunct is honoured.
+		if len(pl.idxCols) == 1 && tbl.readDirtyCount.Load() == 0 {
+			keyVal, err := evalExpr(pl.idxSrcs[0], ctx)
+			if err != nil {
+				return 0, err
+			}
+			if keyVal.IsNull() {
+				return 0, nil
+			}
+			if si := tbl.indexFor(pl.idxCols[0]); si != nil {
+				pk, found, one := si.lookupOne(keyOf(keyVal))
+				if found && one {
+					var j mutJournal
+					if db.wal != nil {
+						j = mutJournal{db: db, tableID: tbl.tableID, pkVal: UUIDVal(pk)}
+					}
+					ok, err := tbl.deleteOneByCandidate(pk, match, j)
+					if err != nil {
+						return 0, err
+					}
+					if ok {
+						return 1, nil
+					}
+					return 0, nil
+				}
+				if !found {
+					return 0, nil // no index hit and no dirty overlay → nothing matches
+				}
+				// found && !one: multi-hit bucket → fall through to the candidate path.
+			}
+		}
 		cand, ok, err := db.idxCandidates(pl, ctx)
 		if err != nil {
 			return 0, err
@@ -458,16 +504,6 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 		if len(cand.dirty) > 0 {
 			pks = nil
 			cand.emit(func(pk UUID) bool { pks = append(pks, pk); return false })
-		}
-		// Direct WHERE re-check (see execUpdate: a narrow candidate set does not
-		// warrant the ctx-capturing compiled matcher that escapes the arg buffer).
-		match := func(r Row) bool {
-			if st.where == nil {
-				return true
-			}
-			ctx.row = r
-			v, err := evalExpr(st.where, ctx)
-			return err == nil && truthy(v)
 		}
 		return tbl.deleteByCandidates(pks, match, encode, journalAll)
 	}

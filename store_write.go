@@ -277,6 +277,34 @@ func (t *table) deleteByPKJournaled(pk UUID, j mutJournal) (bool, error) {
 	return true, nil
 }
 
+// deleteOneByCandidate deletes a single PK resolved through a secondary index,
+// mirroring deleteByPKJournaled (one shard lock, journal-before-tombstone, single
+// MUTATION record) but re-checking the full WHERE via match first. It is the
+// single-row indexed-delete fast path: it skips idxCandidates' []UUID allocation
+// and the multi-shard candidate machinery. The caller guarantees a non-partitioned
+// table (secondary indexes are non-partitioned), no dirty overlay, and exactly one
+// index hit; match honours any residual WHERE conjunct (delete nothing on no match).
+func (t *table) deleteOneByCandidate(pk UUID, match func(Row) bool, j mutJournal) (bool, error) {
+	s := t.shardOf(pk)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rowID, ok := s.pk.get(pk)
+	if !ok {
+		return false, nil
+	}
+	r := s.rows[rowID]
+	if r == nil || (match != nil && !match(r)) {
+		return false, nil
+	}
+	if err := j.delete(); err != nil {
+		return false, err
+	}
+	s.tombstoneLocked(rowID, len(t.indexes), t.budget)
+	s.pk.del(pk)
+	t.markDelDirtyLocked(s, pk)
+	return true, nil
+}
+
 // update mutates the row at pk using mutate (the WAL-replay apply path).
 // Returns false if the row is absent, OR if mutate violates the storage
 // invariant: it must return a non-nil row whose PK is unchanged (PK and

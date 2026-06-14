@@ -304,6 +304,35 @@ func (si *secIndex) lookup(k indexKey) []UUID {
 	return out
 }
 
+// lookupOne resolves k to a single PK without allocating. found reports whether
+// any entry has key k; one reports whether EXACTLY one does. The single-row
+// indexed-delete fast path uses it to skip lookup's []UUID slice; a multi-hit
+// bucket (found && !one) falls back to the candidate path. Single-column indexes
+// only — the caller guarantees one indexed equality.
+func (si *secIndex) lookupOne(k indexKey) (pk UUID, found, one bool) {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
+	if si.ordered {
+		lo := sort.Search(len(si.sorted), func(i int) bool { return !si.sorted[i].key.less(k) })
+		if lo >= len(si.sorted) || k.less(si.sorted[lo].key) {
+			return UUID{}, false, false // no entry == k
+		}
+		// sorted[lo].key == k. Exactly one iff the next entry has a different key.
+		if lo+1 < len(si.sorted) && !k.less(si.sorted[lo+1].key) {
+			return UUID{}, true, false // >= 2 in the equal run
+		}
+		return si.sorted[lo].pk, true, true
+	}
+	switch b := si.fwd[k]; len(b) {
+	case 0:
+		return UUID{}, false, false
+	case 1:
+		return b[0], true, true
+	default:
+		return UUID{}, true, false
+	}
+}
+
 // prefixLookup returns the PKs whose composite key starts with prefix.s (the
 // encoded leading columns of a composite index — e.g. (a = ?) on an (a, b)
 // index), in sorted-key order. The sorted view groups all keys sharing a byte
