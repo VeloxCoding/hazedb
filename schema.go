@@ -252,3 +252,22 @@ func validateValue(c ColumnDef, v Value) error {
 	}
 	return nil
 }
+
+// validateInsertRow checks a decoded WAL insert row against the schema before it
+// is applied. Width first: a short row would slice out of range while indexing
+// row[pkOrdinal], uncatchable during replay-in-Open and crash-looping the
+// process. Then type every cell, the PK included. Shared by the in-memory replay
+// and the SQLite drain so a tampered or wrong-typed CRC-valid record fails closed
+// (ErrWALCorrupt) on both paths — neither indexes garbage nor mirrors it untyped
+// into the dynamically-typed companion.
+func validateInsertRow(cols []ColumnDef, row Row) error {
+	if len(row) != len(cols) {
+		return fmt.Errorf("%w: insert row width %d != table column count %d", ErrWALCorrupt, len(row), len(cols))
+	}
+	for i := range row {
+		if err := validateValue(cols[i], row[i]); err != nil {
+			return fmt.Errorf("%w: insert %v", ErrWALCorrupt, err)
+		}
+	}
+	return nil
+}

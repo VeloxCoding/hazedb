@@ -109,16 +109,8 @@ func (db *DB) applyMutation(rt *tableRT, op uint8, body []byte) error {
 		if err != nil {
 			return err
 		}
-		// Width first (a short row would slice out-of-range while indexing
-		// row[pkOrdinal] — uncatchable during replay-in-Open, crash-looping the
-		// process), then type every cell, the PK column included.
-		if len(row) != ncols {
-			return fmt.Errorf("%w: insert row width %d != table column count %d", ErrWALCorrupt, len(row), ncols)
-		}
-		for i := range row {
-			if err := validateValue(cols[i], row[i]); err != nil {
-				return fmt.Errorf("%w: insert %v", ErrWALCorrupt, err)
-			}
+		if err := validateInsertRow(cols, row); err != nil {
+			return err
 		}
 		return rt.insert(row)
 	case opUpdate:

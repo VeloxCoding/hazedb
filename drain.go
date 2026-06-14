@@ -458,6 +458,12 @@ func (m *sqliteMirror) dropTable(tx *sql.Tx, name string) error {
 	return nil
 }
 
+// applyMutation mirrors one decoded mutation into SQLite. It validates against
+// the schema first — exactly as the in-memory replay does (validateInsertRow,
+// validateValue, coerceToUUID) — because the companion is dynamically typed and
+// would otherwise store a wrong-typed CRC-valid record without error. A bad record
+// returns ErrWALCorrupt, so drainSegment rolls back and leaves the cursor unmoved
+// rather than committing garbage into the recovery base.
 func (m *sqliteMirror) applyMutation(tx *sql.Tx, payload []byte) error {
 	if len(payload) < 3 {
 		return fmt.Errorf("%w: short mutation payload", ErrWALCorrupt)
@@ -475,6 +481,9 @@ func (m *sqliteMirror) applyMutation(tx *sql.Tx, payload []byte) error {
 		if err != nil {
 			return err
 		}
+		if err := validateInsertRow(dt.cols, row); err != nil {
+			return err
+		}
 		args := make([]any, len(row))
 		for i, v := range row {
 			args[i] = valueToArg(v)
@@ -488,6 +497,9 @@ func (m *sqliteMirror) applyMutation(tx *sql.Tx, payload []byte) error {
 			if ord < 0 || ord >= len(dt.cols) {
 				return fmt.Errorf("%w: update ordinal %d out of range", ErrWALCorrupt, ord)
 			}
+			if err := validateValue(dt.cols[ord], v); err != nil {
+				return fmt.Errorf("%w: update %v", ErrWALCorrupt, err)
+			}
 			if set.Len() > 0 {
 				set.WriteString(", ")
 			}
@@ -499,7 +511,11 @@ func (m *sqliteMirror) applyMutation(tx *sql.Tx, payload []byte) error {
 		if err != nil {
 			return err
 		}
-		args = append(args, valueToArg(pk))
+		pkU, err := coerceToUUID(pk)
+		if err != nil {
+			return fmt.Errorf("%w: update %v", ErrWALCorrupt, err)
+		}
+		args = append(args, valueToArg(UUIDVal(pkU)))
 		sqlStr := "UPDATE " + quoteIdent(dt.name) + " SET " + set.String() +
 			" WHERE " + quoteIdent(dt.cols[dt.pkOrd].Name) + " = ?"
 		_, err = tx.Exec(sqlStr, args...)
@@ -509,7 +525,11 @@ func (m *sqliteMirror) applyMutation(tx *sql.Tx, payload []byte) error {
 		if err != nil {
 			return err
 		}
-		_, err = tx.Exec(dt.deleteSQL, valueToArg(pk))
+		pkU, err := coerceToUUID(pk)
+		if err != nil {
+			return fmt.Errorf("%w: delete %v", ErrWALCorrupt, err)
+		}
+		_, err = tx.Exec(dt.deleteSQL, valueToArg(UUIDVal(pkU)))
 		return err
 	}
 	return fmt.Errorf("%w: unknown op %d", ErrWALCorrupt, op)

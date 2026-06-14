@@ -3,10 +3,12 @@ package hazedb
 import (
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // renderVal / renderAny render an engine cell and a SQLite-scanned value to the
@@ -164,4 +166,33 @@ func TestDrainMirrorMatchesEngine(t *testing.T) {
 		t.Fatalf("engine logs = %d, want 5", len(eng2))
 	}
 	compareMaps(t, "logs", eng2, sqliteRows(t, db.sq.sdb, `SELECT "id","msg" FROM "logs"`))
+}
+
+// The drain validates WAL values against the schema before mirroring, exactly as
+// the in-memory replay does: a wrong-typed CRC-valid record (a UUID in the INT
+// column) is rejected as ErrWALCorrupt and the cursor does not advance, so the
+// corruption is never committed to the dynamically-typed companion base.
+func TestDrainRejectsWrongTypedValue(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(Options{Schema: testSchema(), WALPath: dir, walFlushInterval: time.Hour, drainInterval: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rt := db.cat.Load().byName["users"]
+	// age (TypeInt) receives a UUID — a record the validating write path would
+	// never produce, injected straight into the WAL.
+	bad := encodeInsertMutation(nil, rt.tableID, Row{UUIDVal(tid(1)), Str("alice"), UUIDVal(tid(9)), Bool(true)})
+	if err := db.wal.writeRecord(recMutation, bad); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.wal.flush(); err != nil { // seal the segment so the drain sees it
+		t.Fatal(err)
+	}
+	if err := db.drainOnce(); !errors.Is(err, ErrWALCorrupt) {
+		t.Fatalf("drainOnce on a wrong-typed record: got %v, want ErrWALCorrupt", err)
+	}
+	if db.sq.lastDrained != 0 {
+		t.Fatalf("cursor advanced past corruption: lastDrained = %d, want 0", db.sq.lastDrained)
+	}
 }
