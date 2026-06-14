@@ -9,6 +9,9 @@ type evalCtx struct {
 	args []Value
 }
 
+// evalExpr evaluates e against ctx. Logical (AND/OR/NOT) and comparison ops
+// return a Bool; a nil expr (an absent WHERE) is true; an incomparable
+// comparison (e.g. a NULL operand) is false. AND/OR short-circuit.
 func evalExpr(e expr, ctx *evalCtx) (Value, error) {
 	switch x := e.(type) {
 	case nil:
@@ -124,6 +127,8 @@ func evalExpr(e expr, ctx *evalCtx) (Value, error) {
 	return Value{}, fmt.Errorf("internal: unknown expr type %T", e)
 }
 
+// truthy reduces a value to a WHERE-clause boolean: only a true BOOL or a
+// non-zero INT matches; NULL and every other kind are false.
 func truthy(v Value) bool {
 	if v.Kind == KindBool {
 		return v.Int() == 1

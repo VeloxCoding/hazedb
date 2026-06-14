@@ -4,8 +4,8 @@ import "fmt"
 
 // mutJournal journals one mutation for the PK-pinned live write lanes. It is
 // passed BY VALUE through the store's journaled methods — a stack copy, so a
-// WAL-on write builds no per-call closure (the old func() error shape heap-
-// allocated one per insert/update/delete). The zero value (db nil) journals
+// WAL-on write builds no per-call closure (a func() error closure would heap-
+// allocate one per insert/update/delete). The zero value (db nil) journals
 // nothing: memory-only DBs and the replay path use it. The store invokes the
 // op method under the shard lock, preserving journal-before-apply.
 type mutJournal struct {
@@ -402,7 +402,7 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 	ctx := &evalCtx{cols: tbl.def.colByName, args: args}
 
 	// Fast path: PK equality — single shard, journal-before-tombstone under
-	// the shard lock (deleteByPKJournaled, which also closes the old
+	// the shard lock (deleteByPKJournaled, which also closes a
 	// getByPK→deleteByPK TOCTOU). nil journal for memory-only.
 	if pl.pkLookup {
 		keyVal, err := evalExpr(pl.pkSource, &evalCtx{args: args})

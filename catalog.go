@@ -11,7 +11,8 @@ import (
 // the whole operation — lock-free. DDL (CREATE/DROP) builds a NEW catalog and
 // swaps it in atomically, so schema changes never block or slow reads/writes,
 // and an in-flight query keeps a consistent view. version bumps on every
-// change so a cached plan can tell it is stale and re-bind.
+// change so a cached plan can tell it is stale and re-bind. DB.ddlMu serialises
+// concurrent DDL (the only writers of DB.cat); reads/writes never take it.
 type catalog struct {
 	version uint64
 	byName  map[string]*tableRT
@@ -82,8 +83,7 @@ func (c *catalog) withoutTable(name string) *catalog {
 
 // createTable is the first-class CREATE: validate the definition, allocate a
 // durable table_id, journal the catalog record to the WAL BEFORE publishing,
-// then atomically swap in the new catalog. ddlMu serialises concurrent DDL;
-// reads/writes never take it.
+// then atomically swap in the new catalog.
 func (db *DB) createTable(td TableDef) error {
 	db.ddlMu.Lock()
 	defer db.ddlMu.Unlock()
@@ -142,7 +142,7 @@ func (db *DB) dropTable(name string) error {
 //
 // CREATE: tableID:2 | name(len:2+bytes) | numCols:2 | per col: name(len:2+bytes) | type:1 | flags:1
 //   flags bit 0 = PK, 1 = PartitionKey, 2 = Immutable, 3 = Nullable
-//   then (optional, omitted by pre-index records): numIndexes:2 |
+//   then (optional — absent when the record ends after the columns): numIndexes:2 |
 //        per index: name(len:2+bytes) | numCols:2 | per col: col(len:2+bytes) |
 //        flags:1 (bit 1 = Ordered; bit 0 reserved)
 // DROP:   name(len:2+bytes)
@@ -227,7 +227,7 @@ func decodeCreateTable(b []byte) (uint16, TableDef, error) {
 		c.Nullable = flags&8 != 0
 		td.Columns = append(td.Columns, c)
 	}
-	// Index section is optional: pre-index WAL records end after the columns.
+	// Index section is optional: a record that ends after the columns has zero indexes.
 	if off+2 > len(b) {
 		return tableID, td, nil
 	}

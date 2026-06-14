@@ -1,10 +1,11 @@
 package hazedb
 
 // SQLite companion + data mirror. The companion is a file next to the WAL
-// (Options.CompanionPath; default hazedb.db inside WALPath), present only when
-// WAL is on — there is no in-memory companion. A background loop feeds sealed
-// WAL segments into it as CURRENT state
-// (compacted: an UPDATE overwrites, a DELETE removes), so the mirror is a
+// (Options.CompanionPath; default hazedb.db inside WALPath) and is always
+// present — a real on-disk file in every mode, never in-memory. It always holds
+// the _hz_events operational log; when WAL is on it additionally becomes the
+// data mirror: a background loop feeds sealed WAL segments into it as CURRENT
+// state (compacted: an UPDATE overwrites, a DELETE removes), so the mirror is a
 // queryable, portable, copy-one-file snapshot of the engine. The drain reuses
 // the WAL record framing (scanRecords) and the catalog encoders, and writes one
 // SQLite transaction per segment with the segment number recorded in the same

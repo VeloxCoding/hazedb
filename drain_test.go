@@ -119,8 +119,7 @@ func TestDrainMirrorMatchesEngine(t *testing.T) {
 		Schema:        testSchema(),
 		WALPath:       dir,
 		CompanionPath: sqPath,
-		// rotate manually
-		drainInterval: -1, // drain manually
+		drainInterval: -1, // no background loop; sealed + drained manually below
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -4,7 +4,7 @@ import "sync/atomic"
 
 // byteBudget is the store-wide RAM admission control behind MaxBytes. total is
 // the live byte sum across every table — the same per-row rowCost the per-shard
-// tallies use — kept current by every mutation, so admission is one atomic load,
+// tallies use — kept current by every mutation, so admission is one atomic op,
 // not a walk. max is the hard ceiling: reserve rejects a write that would push
 // total past it.
 //
@@ -26,8 +26,7 @@ type byteBudget struct {
 }
 
 // reserve admits cost bytes, adding them to the total, or returns false having
-// added nothing when the write would exceed max. Unlimited (max == 0) always
-// admits without touching the counter.
+// added nothing when the write would exceed max.
 func (b *byteBudget) reserve(cost int64) bool {
 	if b.max == 0 {
 		return true
@@ -40,7 +39,7 @@ func (b *byteBudget) reserve(cost int64) bool {
 }
 
 // release returns cost bytes to the budget (a delete, or the shrink side of an
-// UPDATE). No-op when unlimited.
+// UPDATE).
 func (b *byteBudget) release(cost int64) {
 	if b.max != 0 {
 		b.total.Add(-cost)
@@ -49,8 +48,7 @@ func (b *byteBudget) release(cost int64) {
 
 // adjust applies a signed delta from an in-place UPDATE that changed a row's
 // size. A grow can push total past max (only inserts are gated); the next insert
-// then sees the over-budget total and is rejected until space frees. No-op when
-// unlimited or when the size did not change.
+// then sees the over-budget total and is rejected until space frees.
 func (b *byteBudget) adjust(delta int64) {
 	if b.max != 0 && delta != 0 {
 		b.total.Add(delta)

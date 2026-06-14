@@ -43,7 +43,7 @@ func TestSQLiteRecoveryAfterCrash(t *testing.T) {
 	db.Exec("UPDATE users SET age = ? WHERE id = ?", 777, tid(5))
 	db.Exec("DELETE FROM users WHERE id = ?", tid(6))
 	db.FlushWAL()
-	// "crash": DrainInterval=-1 means Close runs no final drain, so batch B
+	// "crash": drainInterval=-1 means Close runs no final drain, so batch B
 	// stays in the WAL undrained.
 	if err := db.Close(); err != nil {
 		t.Fatal(err)

@@ -166,12 +166,6 @@ func (t *table) appendMatchJSON(pk UUID, pred func(Row) bool, cols []string, ord
 	return appendRowJSONObjectProject(dst, cols, r, ords), true
 }
 
-// execSelectIdx runs a SELECT whose WHERE pins one or more secondary-indexed
-// columns by equality. It resolves candidate PKs through the index(es)
-// (intersecting buckets for an AND of equalities) plus the dirty overlay, then
-// evaluates the full WHERE on each live row. With an ORDER BY it gathers all
-// matches and sorts before LIMIT (the filtered-list pattern); otherwise it
-// projects and stops at LIMIT.
 // idxCandidateSet is the candidate-PK enumerator for an indexed SELECT: the
 // (intersected) index hits UNION the dirty overlay. Returned by value — pks
 // aliases the index bucket and dirty aliases dirtyPKs(), so constructing it
@@ -275,6 +269,12 @@ func (db *DB) idxCandidates(pl *plan, ctx *evalCtx) (cand idxCandidateSet, ok bo
 	return idxCandidateSet{pks: pks, dirty: dirty}, true, nil
 }
 
+// execSelectIdx runs a SELECT whose WHERE pins one or more secondary-indexed
+// columns by equality. It resolves candidate PKs through the index(es)
+// (intersecting buckets for an AND of equalities) plus the dirty overlay, then
+// evaluates the full WHERE on each live row. With an ORDER BY it gathers all
+// matches and sorts before LIMIT (the filtered-list pattern); otherwise it
+// projects and stops at LIMIT.
 func (db *DB) execSelectIdx(pl *plan, ctx *evalCtx) ([]string, []Row, error) {
 	if pl.st.(*selectStmt).limit == 0 {
 		return pl.colNames, nil, nil
@@ -455,13 +455,6 @@ func (db *DB) execSelectCompositeLookup(pl *plan, ctx *evalCtx) ([]string, []Row
 	return db.execCandidates(pl, ctx, cand)
 }
 
-// execSelectCompositeWalk serves WHERE <leading prefix> = ? ORDER BY <next col>
-// via a composite ordered index: it walks the pinned-prefix sub-range of the
-// sorted index — already ordered by the trailing column — and stops at LIMIT, so
-// no sort runs. The walk reuses orderedWalk with a composite dirty key (the
-// encoded tuple) so dirty rows merge into the same key space as the index
-// entries. Every component is NOT NULL (planComposite's guard), so a matching
-// row always has a fully-encodable key.
 // compositeWalkArgs resolves the (snap, dirtyKey, residual) inputs orderedWalk
 // needs for a composite prefix walk. ok=false means provably empty (missing
 // index or a NULL in the pinned prefix). Shared by the materializing and
@@ -495,6 +488,13 @@ func (db *DB) compositeWalkArgs(pl *plan, args []Value) (snap []ordEntry, dirtyK
 	return si.snapshotPrefix(encodeCompositeKey(prefix)), dirtyKey, pl.compResidual, true, nil
 }
 
+// execSelectCompositeWalk serves WHERE <leading prefix> = ? ORDER BY <next col>
+// via a composite ordered index: it walks the pinned-prefix sub-range of the
+// sorted index — already ordered by the trailing column — and stops at LIMIT, so
+// no sort runs. The walk reuses orderedWalk with a composite dirty key (the
+// encoded tuple) so dirty rows merge into the same key space as the index
+// entries. Every component is NOT NULL (planComposite's guard), so a matching
+// row always has a fully-encodable key.
 func (db *DB) execSelectCompositeWalk(pl *plan, args []Value) ([]string, []Row, error) {
 	snap, dirtyKey, residual, ok, err := db.compositeWalkArgs(pl, args)
 	if err != nil {
@@ -505,14 +505,6 @@ func (db *DB) execSelectCompositeWalk(pl *plan, args []Value) ([]string, []Row, 
 	}
 	return db.orderedWalk(pl, args, snap, dirtyKey, residual)
 }
-
-// execSelectOrderedWalk serves an ORDER BY on an ordered-indexed column by
-// walking the sorted index in order, merged with the dirty overlay (rows
-// mutated since the last merge), applying any residual WHERE, and stopping at
-// LIMIT — touching ~LIMIT rows, not the whole table. A non-dirty index entry is
-// fresh (its key equals the live value), so the index key drives the ordering
-// and the row is fetched only when selected. Dirty PKs are excluded from the
-// index walk (the entry may be stale) and supplied from their live rows.
 
 // dcand is one dirty-overlay candidate for an ordered walk: a row mutated since
 // the last merge, tagged with its sort key.
@@ -619,6 +611,13 @@ func (db *DB) orderedWalkArgs(pl *plan) (snap []ordEntry, dirtyKey func(Row) ind
 	return si.snapshot(), func(r Row) indexKey { return keyOf(r[ord]) }, residual, true
 }
 
+// execSelectOrderedWalk serves an ORDER BY on an ordered-indexed column by
+// walking the sorted index in order, merged with the dirty overlay (rows
+// mutated since the last merge), applying any residual WHERE, and stopping at
+// LIMIT — touching ~LIMIT rows, not the whole table. A non-dirty index entry is
+// fresh (its key equals the live value), so the index key drives the ordering
+// and the row is fetched only when selected. Dirty PKs are excluded from the
+// index walk (the entry may be stale) and supplied from their live rows.
 func (db *DB) execSelectOrderedWalk(pl *plan, args []Value) ([]string, []Row, error) {
 	snap, dirtyKey, residual, ok := db.orderedWalkArgs(pl)
 	if !ok {
@@ -915,9 +914,9 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 		// The partition-pinned and all-shards loops below share an identical
 		// per-row body (match → packed projection → capped view → limit check),
 		// differing only in the row source. It is left inlined on purpose:
-		// factoring the body into a helper measured ~5-8% slower on the scan path
-		// (BenchmarkScanMatchAll / BenchmarkSelectRange_Mem) — the helper does not
-		// inline past the clone calls, so every matched row pays a call.
+		// factoring the body into a helper measured slower on the scan path — the
+		// helper does not inline past the clone calls, so every matched row pays a
+		// call.
 		if partPinned {
 			s := tbl.shardOf(part)
 			s.mu.RLock()

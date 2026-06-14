@@ -33,9 +33,7 @@ func encodeCompositeKey(vals []Value) indexKey {
 // encodeCompositeKeyInto encodes vals into buf[:0] and returns the key plus the
 // (grown) buffer to reuse on the next call. A merge encoding many keys then
 // allocates only the per-key string (string(buf)), not a fresh scratch buffer
-// per row. KindBytes routes less() to the bytewise s compare — exactly what a
-// composite key needs; the component count is fixed per index, so two keys of
-// one index always compare correctly.
+// per row.
 func encodeCompositeKeyInto(buf []byte, vals []Value) (indexKey, []byte) {
 	buf = buf[:0]
 	for i := range vals {
@@ -44,9 +42,8 @@ func encodeCompositeKeyInto(buf []byte, vals []Value) (indexKey, []byte) {
 	return indexKey{kind: KindBytes, s: string(buf)}, buf
 }
 
-// appendOrderedColumn appends v's order-preserving encoding to buf. See the file
-// header for the per-kind scheme. KindNull is a caller bug (precondition) and
-// contributes nothing.
+// appendOrderedColumn appends v's order-preserving encoding to buf. KindNull is a
+// caller bug (precondition) and contributes nothing.
 func appendOrderedColumn(buf []byte, v Value) []byte {
 	switch v.Kind {
 	case KindInt:
@@ -72,9 +69,8 @@ func appendOrderedColumn(buf []byte, v Value) []byte {
 	return buf
 }
 
-// appendEscapedTerminated appends s with 0x00 escaped to 0x00 0xFF, then a
-// 0x00 0x00 terminator, so variable-length fields stay self-delimiting and
-// order-preserving across a column boundary.
+// appendEscapedTerminated appends s as a self-delimiting, order-preserving field,
+// so one column's bytes can never bleed into the next.
 func appendEscapedTerminated(buf []byte, s string) []byte {
 	// Chunked copy: bulk-append the spans between NUL bytes (rare in real keys),
 	// escaping only at each NUL — the common no-NUL string is one append, not a

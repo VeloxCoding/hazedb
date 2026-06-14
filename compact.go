@@ -16,7 +16,7 @@ import "time"
 
 const (
 	// defaultCompactInterval is how often the sweeper looks for dense shards. An
-	// idle sweep is ~9 ns/shard (BenchmarkSweepCompactIdle), so the interval costs
+	// idle sweep only reads a counter per shard, so the interval costs almost
 	// nothing when there is nothing to do; it mainly bounds reclaim latency (how
 	// long dead slots linger after a shard crosses the dead>live threshold). 200ms
 	// keeps that transient small without waking pointlessly often; the dead>live

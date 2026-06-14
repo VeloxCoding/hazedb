@@ -8,8 +8,8 @@ import (
 // Operational event logging. Rare, operator-relevant occurrences — a corrupt WAL
 // segment, a failing drain — are recorded both to the standard logger and, in the
 // always-present SQLite companion, to the _hz_events table, so a dashboard can
-// query a persistent history with a plain SELECT. _hz_events is created in
-// openCompanion (see ensureOps), so it exists in every mode, memory-only included.
+// query a persistent history with a plain SELECT. _hz_events is created during
+// openCompanion, so it exists in every mode, memory-only included.
 //
 // This is NOT the path for metrics or per-request performance counters: those
 // stay in memory and are read through the stats endpoints, and a high-frequency
