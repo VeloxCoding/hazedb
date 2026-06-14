@@ -52,7 +52,16 @@ the one-row semantics — `hazedb_fetch` already stops at the first match.
 | `SELECT` | `*` or an explicit column list, `FROM t [alias]`, optional `WHERE`, `ORDER BY col [ASC\|DESC]`, `LIMIT n`, `OFFSET m` |
 | `JOIN` | **two tables only** (for now) — `[INNER\|LEFT [OUTER]\|RIGHT [OUTER]] JOIN t2 [alias] ON a.col = b.col` (single equi-join); the probed join column **must be the PK or indexed**; columns are `table.col` / `alias.col`. A 3rd+ `JOIN` is rejected. |
 | `WHERE` expressions | comparisons `= != < <= > >=`, `IS [NOT] NULL`, boolean `AND` / `OR` / `NOT`, arithmetic `+ - *`, parentheses, `?` positional parameters |
-| Literals | integer, string, `true`/`false`, `null` |
+| Values | every value is a `?` positional parameter — an inline value literal (`age = 30`, `name = 'x'`, `active = true`) is **rejected**; pass it as a `?` arg. `LIMIT n` / `OFFSET m` take a literal integer (structural, not a value), and `IS [NOT] NULL` is an operator, not a value. |
+
+**Parameters & safety.** Every value goes in as a `?` placeholder, never spliced
+into the SQL text — this is enforced, not just advised. Two reasons: it makes SQL
+injection impossible (a value never reaches the parser as syntax — vital when the
+value comes from a request), and it keeps the plan cache bounded (one cached plan
+per query *shape*, reused for every value). So `hazedb_fetch('… WHERE email = ?',
+$req)` is correct; `'… WHERE email = \'' . $req . '\''` is rejected. A trusted
+boot/seed `.sql` file may use inline literals via the Caddy module's `init_sql`
+(it runs through `ExecScript`), but request data never does.
 
 **Primary key:** every table has exactly one PK, type `uuid`. INSERT
 auto-generates a UUIDv7 when the id is omitted; supply your own (any canonical
