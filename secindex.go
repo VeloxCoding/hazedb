@@ -766,37 +766,59 @@ func (t *table) rebuildIndexes() {
 	if len(t.indexes) == 0 {
 		return
 	}
-	for _, si := range t.indexes {
-		si.mu.Lock()
-		si.fwd = make(map[indexKey][]UUID)
-		si.rev = make(map[UUID]indexKey)
-		si.sorted = nil
-		si.mu.Unlock()
+	// Build each index's maps directly (no per-row lock — rebuild runs at boot,
+	// single-threaded), then publish under one lock per index. This replaces the
+	// N×M si.apply lock/unlock cycles with M publishes + one rebuildSorted per
+	// ordered index. Mirror apply's data: rev for every index; fwd only for hash
+	// indexes (ordered reads go through the sorted view, never fwd).
+	fwds := make([]map[indexKey][]UUID, len(t.indexes))
+	revs := make([]map[UUID]indexKey, len(t.indexes))
+	for k, si := range t.indexes {
+		revs[k] = make(map[UUID]indexKey)
+		if !si.ordered {
+			fwds[k] = make(map[indexKey][]UUID)
+		}
 	}
 	pkOrd := t.def.pkOrdinal
 	var comp []Value // reused composite-component scratch (single-column stays alloc-free)
 	t.scanAll(func(r Row) bool {
 		pk := r[pkOrd].UUID()
-		for _, si := range t.indexes {
+		for k, si := range t.indexes {
+			var key indexKey
+			ok := false
 			if len(si.ordinals) == 1 {
 				if v := r[si.ordinals[0]]; v.Kind != KindNull {
-					si.apply(pk, keyOf(v), true)
+					key, ok = keyOf(v), true
 				}
+			} else {
+				comp = comp[:0]
+				for _, ord := range si.ordinals {
+					comp = append(comp, r[ord])
+				}
+				key, ok = si.keyFromCells(comp)
+			}
+			if !ok {
 				continue
 			}
-			comp = comp[:0]
-			for _, ord := range si.ordinals {
-				comp = append(comp, r[ord])
-			}
-			if key, ok := si.keyFromCells(comp); ok {
-				si.apply(pk, key, true)
+			revs[k][pk] = key
+			if !si.ordered {
+				fwds[k][key] = append(fwds[k][key], pk)
 			}
 		}
 		return true
 	})
-	for _, si := range t.indexes {
+	for k, si := range t.indexes {
+		si.mu.Lock()
+		si.rev = revs[k]
+		si.sorted = nil
 		if si.ordered {
-			si.rebuildSorted()
+			si.fwd = make(map[indexKey][]UUID) // ordered never uses fwd; keep it empty, non-nil
+		} else {
+			si.fwd = fwds[k]
+		}
+		si.mu.Unlock()
+		if si.ordered {
+			si.rebuildSorted() // folds rev into the sorted view under its own lock
 		}
 	}
 	for i := range t.shards {
