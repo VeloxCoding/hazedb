@@ -311,3 +311,22 @@ func (db *DB) prepare(sql string, cat *catalog) (*plan, error) {
 	db.stmtCache.Store(sql, pl) // overwrite any stale-version entry
 	return pl, nil
 }
+
+// prepareTrusted compiles one statement from a trusted boot/seed script (see
+// ExecScript). It skips the inline-literal ban — a seed file legitimately writes
+// constant values and has no ? args to bind — and does NOT touch stmtCache, so an
+// unchecked literal plan can never be served to a later Exec through a cache hit
+// (and the one-shot boot work pays nothing to cache). The caller checks db.closed.
+func (db *DB) prepareTrusted(sql string, cat *catalog) (*plan, error) {
+	st, err := parseSQL(sql)
+	if err != nil {
+		return nil, err
+	}
+	nparams := assignParamIndices(st)
+	pl, err := db.plan(st, cat)
+	if err != nil {
+		return nil, err
+	}
+	pl.nparams = nparams
+	return pl, nil
+}

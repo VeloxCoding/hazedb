@@ -1,10 +1,61 @@
 package hazedb
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Write verbs and arg conversion. Every write enters through Exec/ExecValues,
 // converts its args to typed Value cells, then funnels through execWrite to the
 // per-statement executor. See db.go for the gateway contract.
+
+// ExecScript runs a TRUSTED, operator-supplied multi-statement script — a boot /
+// migration / seed .sql file. It splits on top-level ';' with the lexer, so a ';'
+// inside a string literal does NOT split the script, and runs each statement in
+// order. Unlike Exec it permits inline value literals: a seed file writes constant
+// data and has no ? args to bind. For that reason it must NEVER be fed request or
+// otherwise untrusted input — that reopens the SQL-injection path Exec closes.
+// Statements are not cached (one-shot boot work), so an unchecked literal plan can
+// never reach a later Exec through a cache hit. Returns the summed affected-row
+// count; a failing statement stops the script and is named in the error.
+func (db *DB) ExecScript(script string) (int, error) {
+	if db.closed.Load() {
+		return 0, ErrClosed
+	}
+	toks, err := tokenize(script)
+	if err != nil {
+		return 0, err
+	}
+	total, start := 0, 0
+	run := func(end int) error {
+		s := strings.TrimSpace(script[start:end])
+		start = end + 1
+		if s == "" {
+			return nil
+		}
+		pl, err := db.prepareTrusted(s, db.cat.Load())
+		if err != nil {
+			return fmt.Errorf("statement %q: %w", s, err)
+		}
+		n, err := db.execPlanValues(pl, nil)
+		if err != nil {
+			return fmt.Errorf("statement %q: %w", s, err)
+		}
+		total += n
+		return nil
+	}
+	for _, t := range toks {
+		if t.kind == tkSemi {
+			if err := run(t.pos); err != nil {
+				return total, err
+			}
+		}
+	}
+	if err := run(len(script)); err != nil { // trailing statement (no final ';')
+		return total, err
+	}
+	return total, nil
+}
 
 // Exec runs an INSERT, UPDATE, DELETE, CREATE TABLE, or DROP TABLE. Returns
 // the affected row count (0 for DDL).
