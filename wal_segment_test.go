@@ -3,6 +3,7 @@ package hazedb
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -174,6 +175,33 @@ func TestDrainStopsAtSegmentGap(t *testing.T) {
 	}
 	if db.sq.lastDrained != 1 {
 		t.Fatalf("cursor advanced past gap: lastDrained = %d, want 1", db.sq.lastDrained)
+	}
+}
+
+// removeStaleTemps deletes only segment temp files (seg-<n>.wal.tmp); the SQLite
+// companion, a committed segment, and any foreign .tmp sharing the directory must
+// survive.
+func TestRemoveStaleTempsScoped(t *testing.T) {
+	dir := t.TempDir()
+	keep := []string{"hazedb.db", "hazedb.db-wal", "notes.tmp", "seg-0000000003.wal", "seg-x.wal.tmp"}
+	drop := []string{"seg-0000000001.wal.tmp", "seg-0000000002.wal.tmp"}
+	for _, n := range append(append([]string{}, keep...), drop...) {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := removeStaleTemps(dir); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range keep {
+		if _, err := os.Stat(filepath.Join(dir, n)); err != nil {
+			t.Errorf("removeStaleTemps deleted %q: %v", n, err)
+		}
+	}
+	for _, n := range drop {
+		if _, err := os.Stat(filepath.Join(dir, n)); !os.IsNotExist(err) {
+			t.Errorf("removeStaleTemps kept stale temp %q (err %v)", n, err)
+		}
 	}
 }
 

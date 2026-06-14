@@ -17,8 +17,9 @@ import (
 )
 
 const (
-	segPrefix = "seg-"
-	segSuffix = ".wal"
+	segPrefix    = "seg-"
+	segSuffix    = ".wal"
+	segTmpSuffix = ".wal.tmp" // flushLocked writes seg-<n>.wal.tmp, then renames to seg-<n>.wal
 )
 
 // segPath returns the file path for segment number n.
@@ -65,16 +66,18 @@ func scanMaxSeg(dir string) (uint64, error) {
 	return segs[len(segs)-1], nil
 }
 
-// removeStaleTemps deletes leftover *.tmp files from a flush interrupted by a
-// crash. Their bytes were never renamed into a seg-*.wal, so they belong to no
-// committed segment and are safe — required — to drop before reopening.
+// removeStaleTemps deletes leftover segment temp files (seg-<n>.wal.tmp) from a
+// flush interrupted by a crash. Their bytes were never renamed into a seg-*.wal,
+// so they belong to no committed segment and are safe — required — to drop before
+// reopening. Only our own temp shape is removed; the SQLite companion and any
+// foreign file sharing the directory are left untouched.
 func removeStaleTemps(dir string) error {
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return err
 	}
 	for _, e := range ents {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".tmp") {
+		if e.IsDir() || !isSegmentTemp(e.Name()) {
 			continue
 		}
 		if err := os.Remove(filepath.Join(dir, e.Name())); err != nil && !os.IsNotExist(err) {
@@ -82,6 +85,18 @@ func removeStaleTemps(dir string) error {
 		}
 	}
 	return nil
+}
+
+// isSegmentTemp reports whether name is a segment temp file (seg-<digits>.wal.tmp)
+// as written by flushLocked — the same numbering rigor as listSegments, so only a
+// file this WAL could have created is ever a deletion candidate.
+func isSegmentTemp(name string) bool {
+	if !strings.HasPrefix(name, segPrefix) || !strings.HasSuffix(name, segTmpSuffix) {
+		return false
+	}
+	num := name[len(segPrefix) : len(name)-len(segTmpSuffix)]
+	_, err := strconv.ParseUint(num, 10, 64)
+	return err == nil
 }
 
 // replayFrom replays only segments numbered above minSeg, ascending. Used by
