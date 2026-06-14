@@ -67,9 +67,16 @@ func (j mutJournal) delete() error {
 // single-statement path and the transaction path journal, so replay reproduces
 // the exact same row (including any auto-generated UUID).
 func (db *DB) buildRowFromTmpl(pl *plan, tmpl []insCell, args []Value) (Row, error) {
+	return db.buildRowFromTmplInto(pl, tmpl, args, make(Row, len(pl.rt.def.def.Columns)))
+}
+
+// buildRowFromTmplInto is buildRowFromTmpl writing into a caller-provided row
+// slice (len == column count, zeroed) instead of allocating one. A multi-row
+// INSERT carves all its rows from a single backing []Value, so the batch costs
+// one allocation instead of one per row.
+func (db *DB) buildRowFromTmplInto(pl *plan, tmpl []insCell, args []Value, row Row) (Row, error) {
 	tbl := pl.rt
 	cols := tbl.def.def.Columns
-	row := make(Row, len(cols)) // omitted columns stay zero == Null()
 	pkOrd := tbl.def.pkOrdinal
 	pkProvided := false
 	// Stack-allocated (never escapes); referenced only by the fallback
@@ -174,9 +181,16 @@ func (db *DB) execInsertBatch(pl *plan, args []Value) (int, error) {
 			break
 		}
 	}
+	// Carve every row from one backing slice: each row is an ncols-wide, capped
+	// window into it, so the batch allocates the row storage once instead of per
+	// row. Capped so an in-place cell write or a later append never bleeds into a
+	// neighbouring row.
+	ncols := len(tbl.def.def.Columns)
+	backing := make([]Value, len(pl.insertTmpl)*ncols)
 	staged := make([]stagedMut, len(pl.insertTmpl))
 	for r := range pl.insertTmpl {
-		row, err := db.buildRowFromTmpl(pl, pl.insertTmpl[r], args)
+		off := r * ncols
+		row, err := db.buildRowFromTmplInto(pl, pl.insertTmpl[r], args, backing[off:off+ncols:off+ncols])
 		if err != nil {
 			return 0, err
 		}
