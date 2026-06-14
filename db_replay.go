@@ -49,30 +49,10 @@ func (db *DB) applyReplayRecord(recType uint8, payload []byte) error {
 	case recMutation:
 		return db.applyMutationRecord(payload)
 	case recTxn:
-		// A transaction is a count-prefixed group of sub-mutations, applied
-		// in order. The whole group arrived as one CRC-valid envelope, so it
-		// is all-or-nothing by construction; a torn group was discarded by
-		// the tail check before reaching here.
-		if len(payload) < 2 {
-			return fmt.Errorf("%w: short txn payload", ErrWALCorrupt)
-		}
-		n := int(binary.LittleEndian.Uint16(payload[0:2]))
-		off := 2
-		for i := 0; i < n; i++ {
-			if off+4 > len(payload) {
-				return fmt.Errorf("%w: txn sub-mutation length truncated", ErrWALCorrupt)
-			}
-			mlen := int(binary.LittleEndian.Uint32(payload[off : off+4]))
-			off += 4
-			if mlen < 0 || off+mlen > len(payload) {
-				return fmt.Errorf("%w: txn sub-mutation body truncated", ErrWALCorrupt)
-			}
-			if err := db.applyMutationRecord(payload[off : off+mlen]); err != nil {
-				return err
-			}
-			off += mlen
-		}
-		return nil
+		// A transaction is a count-prefixed group of sub-mutations, applied in order.
+		// The whole group arrived as one CRC-valid envelope, so it is all-or-nothing
+		// by construction; a torn group was discarded by the tail check before here.
+		return forEachTxnMutation(payload, db.applyMutationRecord)
 	}
 	return fmt.Errorf("%w: unknown record type %d", ErrWALCorrupt, recType)
 }
@@ -146,7 +126,7 @@ func (db *DB) applyMutation(rt *tableRT, op uint8, body []byte) error {
 		}
 		return nil
 	case opDelete:
-		pk, _, err := decodeCell(body)
+		pk, err := decodeDeleteBody(body)
 		if err != nil {
 			return err
 		}

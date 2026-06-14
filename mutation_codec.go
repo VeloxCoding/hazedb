@@ -86,6 +86,23 @@ func decodeUpdateMutation(body []byte, set func(ord int, v Value) error) (Value,
 		}
 		body = body[m:]
 	}
+	if len(body) != 0 {
+		return Value{}, fmt.Errorf("%w: update has %d trailing bytes", ErrWALCorrupt, len(body))
+	}
+	return pk, nil
+}
+
+// decodeDeleteBody decodes an opDelete op-body: a single PK cell that must consume
+// the whole body. The shared framing check (replay + drain both call it) keeps a
+// record with trailing bytes from being silently accepted on either path.
+func decodeDeleteBody(body []byte) (Value, error) {
+	pk, n, err := decodeCell(body)
+	if err != nil {
+		return Value{}, err
+	}
+	if n != len(body) {
+		return Value{}, fmt.Errorf("%w: delete has %d trailing bytes", ErrWALCorrupt, len(body)-n)
+	}
 	return pk, nil
 }
 
@@ -104,6 +121,37 @@ func encodeTxn(buf []byte, muts [][]byte) []byte {
 		buf = append(buf, m...)
 	}
 	return buf
+}
+
+// forEachTxnMutation parses a recTxn payload (nmut:2 | (mlen:4 | mutation) × nmut)
+// and invokes apply on each sub-mutation body in order. It enforces full
+// consumption — a truncated length/body, or trailing bytes after the last
+// mutation, is ErrWALCorrupt — so the in-memory replay and the SQLite drain share
+// one framing check and can never disagree about what a transaction contains.
+func forEachTxnMutation(payload []byte, apply func(mut []byte) error) error {
+	if len(payload) < 2 {
+		return fmt.Errorf("%w: short txn payload", ErrWALCorrupt)
+	}
+	nmut := int(binary.LittleEndian.Uint16(payload[0:2]))
+	off := 2
+	for i := 0; i < nmut; i++ {
+		if off+4 > len(payload) {
+			return fmt.Errorf("%w: txn sub-mutation length truncated", ErrWALCorrupt)
+		}
+		mlen := int(binary.LittleEndian.Uint32(payload[off : off+4]))
+		off += 4
+		if mlen < 0 || off+mlen > len(payload) {
+			return fmt.Errorf("%w: txn sub-mutation body truncated", ErrWALCorrupt)
+		}
+		if err := apply(payload[off : off+mlen]); err != nil {
+			return err
+		}
+		off += mlen
+	}
+	if off != len(payload) {
+		return fmt.Errorf("%w: txn has %d trailing bytes", ErrWALCorrupt, len(payload)-off)
+	}
+	return nil
 }
 
 // Cell + row encoding for WAL payloads. A cell is a kind byte + a
@@ -224,6 +272,9 @@ func decodeRow(b []byte) (Row, error) {
 		}
 		row[i] = v
 		off += sz
+	}
+	if off != len(b) {
+		return nil, fmt.Errorf("%w: insert row has %d trailing bytes", ErrWALCorrupt, len(b)-off)
 	}
 	return row, nil
 }

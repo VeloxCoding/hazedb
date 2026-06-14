@@ -227,9 +227,13 @@ func decodeCreateTable(b []byte) (uint16, TableDef, error) {
 		c.Nullable = flags&8 != 0
 		td.Columns = append(td.Columns, c)
 	}
-	// Index section is optional: a record that ends after the columns has zero indexes.
-	if off+2 > len(b) {
+	// Index section is optional: a record that ends exactly after the columns has
+	// zero indexes. Anything left that is not a well-formed index section is corrupt.
+	if off == len(b) {
 		return tableID, td, nil
+	}
+	if off+2 > len(b) {
+		return 0, td, fmt.Errorf("%w: create-table numidx", ErrWALCorrupt)
 	}
 	nidx := int(binary.LittleEndian.Uint16(b[off : off+2]))
 	off += 2
@@ -260,6 +264,9 @@ func decodeCreateTable(b []byte) (uint16, TableDef, error) {
 		off++
 		td.Indexes = append(td.Indexes, IndexDef{Name: name, Columns: cols, Ordered: flags&2 != 0})
 	}
+	if off != len(b) {
+		return 0, td, fmt.Errorf("%w: create-table has %d trailing bytes", ErrWALCorrupt, len(b)-off)
+	}
 	return tableID, td, nil
 }
 
@@ -269,8 +276,14 @@ func encodeDropTable(buf []byte, name string) []byte {
 }
 
 func decodeDropTable(b []byte) (string, error) {
-	name, _, err := getLenStr(b)
-	return name, err
+	name, n, err := getLenStr(b)
+	if err != nil {
+		return "", err
+	}
+	if n != len(b) {
+		return "", fmt.Errorf("%w: drop-table has %d trailing bytes", ErrWALCorrupt, len(b)-n)
+	}
+	return name, nil
 }
 
 // getLenStr reads a uint16-length-prefixed string, returning it and the bytes

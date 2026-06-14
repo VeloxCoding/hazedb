@@ -425,26 +425,9 @@ func (m *sqliteMirror) applyRecord(tx *sql.Tx, recType uint8, payload []byte) er
 	case recMutation:
 		return m.applyMutation(tx, payload)
 	case recTxn:
-		if len(payload) < 2 {
-			return fmt.Errorf("%w: short txn payload", ErrWALCorrupt)
-		}
-		count := int(binary.LittleEndian.Uint16(payload[0:2]))
-		off := 2
-		for i := 0; i < count; i++ {
-			if off+4 > len(payload) {
-				return fmt.Errorf("%w: txn sub-mutation length truncated", ErrWALCorrupt)
-			}
-			mlen := int(binary.LittleEndian.Uint32(payload[off : off+4]))
-			off += 4
-			if mlen < 0 || off+mlen > len(payload) {
-				return fmt.Errorf("%w: txn sub-mutation body truncated", ErrWALCorrupt)
-			}
-			if err := m.applyMutation(tx, payload[off:off+mlen]); err != nil {
-				return err
-			}
-			off += mlen
-		}
-		return nil
+		return forEachTxnMutation(payload, func(mut []byte) error {
+			return m.applyMutation(tx, mut)
+		})
 	}
 	return fmt.Errorf("%w: unknown record type %d", ErrWALCorrupt, recType)
 }
@@ -528,7 +511,7 @@ func (m *sqliteMirror) applyMutation(tx *sql.Tx, payload []byte) error {
 		_, err = tx.Exec(sqlStr, args...)
 		return err
 	case opDelete:
-		pk, _, err := decodeCell(body)
+		pk, err := decodeDeleteBody(body)
 		if err != nil {
 			return err
 		}
