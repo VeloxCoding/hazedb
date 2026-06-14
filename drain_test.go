@@ -197,6 +197,97 @@ func TestDrainRejectsWrongTypedValue(t *testing.T) {
 	}
 }
 
+// Recovery fails closed when a bootstrap table's schema changed between sessions.
+// The mirror still holds rows in the OLD shape; loading them into the NEW runtime
+// table would silently mix shapes. Reopening with a changed column type must
+// return ErrMirrorSchema rather than corrupt the store.
+func TestRecoverRejectsSchemaMismatch(t *testing.T) {
+	dir := t.TempDir()
+	sqPath := filepath.Join(t.TempDir(), "mirror.db")
+	open := func(s Schema) (*DB, error) {
+		return Open(Options{Schema: s, WALPath: dir, CompanionPath: sqPath, drainInterval: -1})
+	}
+	db, err := open(testSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO users (id, name, age, active) VALUES (?, ?, ?, ?)",
+		tid(1), "alice", 30, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.wal.flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.drainOnce(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// age: INT -> STRING. Same table id (0), incompatible shape.
+	changed := testSchema()
+	changed.Tables[0].Columns[2].Type = TypeString
+	db2, err := open(changed)
+	if !errors.Is(err, ErrMirrorSchema) {
+		if db2 != nil {
+			db2.Close()
+		}
+		t.Fatalf("reopen with changed schema: got %v, want ErrMirrorSchema", err)
+	}
+}
+
+// rt.insert (the recovery path) does not validate, so the mirror's typing is the
+// only gate. A companion cell no write could produce must be rejected as
+// ErrMirrorCorrupt on reopen: a BOOL stored as 2 (caught by the strict scan, not
+// coerced to true) and invalid UTF-8 in a TEXT column (caught by validateValue,
+// which the type-only scan does not check). NOT NULL is omitted — SQLite enforces
+// it on the mirror, so a forbidden NULL can never be written there to begin with.
+func TestRecoverRejectsCorruptMirrorValue(t *testing.T) {
+	cases := []struct {
+		name   string
+		tamper string
+	}{
+		{"bool_out_of_range", `UPDATE "users" SET "active" = 2`},
+		{"invalid_utf8", `UPDATE "users" SET "name" = CAST(x'ff' AS TEXT)`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			sqPath := filepath.Join(t.TempDir(), "mirror.db")
+			opt := Options{Schema: testSchema(), WALPath: dir, CompanionPath: sqPath, drainInterval: -1}
+			db, err := Open(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec("INSERT INTO users (id, name, age, active) VALUES (?, ?, ?, ?)",
+				tid(1), "alice", 30, true); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.wal.flush(); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.drainOnce(); err != nil {
+				t.Fatal(err)
+			}
+			// Tamper the drained mirror directly (Close does not re-drain over it).
+			if _, err := db.sq.sdb.Exec(tc.tamper); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			db2, err := Open(opt)
+			if !errors.Is(err, ErrMirrorCorrupt) {
+				if db2 != nil {
+					db2.Close()
+				}
+				t.Fatalf("reopen with %s: got %v, want ErrMirrorCorrupt", tc.name, err)
+			}
+		})
+	}
+}
+
 // The mirror runs synchronous=FULL: the drain reclaims a hazedb WAL segment only
 // after its SQLite commit, so that commit must be power-loss durable, or a reclaim
 // could lose data the WAL had already fsynced (durability.md §5/§6). NORMAL in WAL
