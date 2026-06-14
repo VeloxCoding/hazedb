@@ -1,6 +1,7 @@
 package hazedb
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -466,6 +467,180 @@ func TestReplayUpdateRejectsBadMutate(t *testing.T) {
 	}
 }
 
+// A CRC-valid but tampered/wrong-typed WAL mutation must fail closed on replay:
+// every cell is type-checked against the schema and every PK kind-checked before
+// it reaches typed storage. Exercised directly (the live API can't produce a
+// mistyped record), mirroring TestReplayUpdateRejectsBadMutate.
+func TestReplayRejectsMistypedMutations(t *testing.T) {
+	db := openMem(t)
+	rt := db.cat.Load().byName["users"]
+	ageOrd := rt.def.colByName["age"]
+
+	corrupt := func(name string, err error) {
+		t.Helper()
+		if !errors.Is(err, ErrWALCorrupt) {
+			t.Errorf("%s: got %v, want ErrWALCorrupt", name, err)
+		}
+	}
+
+	// INSERT, non-UUID PK cell (id column gets an Int).
+	corrupt("insert non-UUID pk",
+		db.applyMutation(rt, opInsert, encodeRow(nil, Row{Int(1), Str("n"), Int(30), Bool(true)})))
+	// INSERT, wrong-typed non-PK cell (name column gets an Int).
+	corrupt("insert mistyped cell",
+		db.applyMutation(rt, opInsert, encodeRow(nil, Row{UUIDVal(tid(1)), Int(5), Int(30), Bool(true)})))
+
+	// UPDATE, non-UUID PK (SET cell valid).
+	updPK := make(Row, 4)
+	updPK[ageOrd] = Int(31)
+	corrupt("update non-UUID pk",
+		db.applyMutation(rt, opUpdate, encodeUpdateMutation(nil, rt.tableID, Int(1), []int{ageOrd}, updPK)[3:]))
+	// UPDATE, wrong-typed SET cell (age column gets a String).
+	updSet := make(Row, 4)
+	updSet[ageOrd] = Str("oops")
+	corrupt("update mistyped set cell",
+		db.applyMutation(rt, opUpdate, encodeUpdateMutation(nil, rt.tableID, UUIDVal(tid(1)), []int{ageOrd}, updSet)[3:]))
+
+	// DELETE, non-UUID PK.
+	corrupt("delete non-UUID pk", db.applyMutation(rt, opDelete, encodeCell(nil, Int(1))))
+
+	// Positive control: a well-formed insert still replays and is queryable.
+	if err := db.applyMutation(rt, opInsert, encodeRow(nil, Row{UUIDVal(tid(2)), Str("alice"), Int(30), Bool(true)})); err != nil {
+		t.Fatalf("valid insert rejected: %v", err)
+	}
+	if _, rows, _ := db.Query("SELECT name FROM users WHERE id = ?", tid(2)); len(rows) != 1 || rows[0][0].Str() != "alice" {
+		t.Fatalf("valid replay insert not stored: %v", rows)
+	}
+}
+
+// scanShardsBatched (the streaming join driver) must yield every surviving row
+// exactly once even when the background compaction sweeper renumbers rowIDs
+// between chunks. All rows are forced into ONE shard so the arena order is
+// deterministic; mid-walk we delete the first arena slot and compact, pulling
+// every later row down one index. An arena-index walk resumes at index 1 and
+// skips the row now at index 0; a PK-snapshot walk still yields it.
+func TestScanShardsBatchedSurvivesCompaction(t *testing.T) {
+	db := openMem(t)
+	rt := db.cat.Load().byName["users"]
+	pkOrd := rt.def.pkOrdinal
+
+	// 8 ids that all hash to one shard → a single arena in insert order.
+	target := rt.shardIdxOf(tid(1))
+	var ids []UUID
+	for i := 1; len(ids) < 8; i++ {
+		if rt.shardIdxOf(tid(i)) == target {
+			ids = append(ids, tid(i))
+		}
+	}
+	for k, id := range ids {
+		if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", id, "u", k); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	seen := map[UUID]int{}
+	compacted := false
+	rt.scanShardsBatched(1, func(Row) bool { return true }, func(batch []Row) bool {
+		for _, r := range batch {
+			seen[r[pkOrd].UUID()]++
+		}
+		if !compacted { // after the first row, delete it and renumber the shard
+			compacted = true
+			if _, err := db.Exec("DELETE FROM users WHERE id = ?", ids[0]); err != nil {
+				t.Fatal(err)
+			}
+			rt.compactShard(int(target))
+		}
+		return false
+	})
+
+	// Every id except the deleted ids[0] must be yielded exactly once.
+	for _, id := range ids[1:] {
+		if seen[id] != 1 {
+			t.Errorf("id %v yielded %d times after compaction, want 1", id, seen[id])
+		}
+	}
+}
+
+// A PK-pinned UPDATE that touches no indexed column must NOT enter the dirty
+// overlay (it leaves every index entry valid) — otherwise readDirtyCount grows
+// per update and slows the next indexed lookup. An indexed-column update must
+// still mark dirty. Covers both PK paths: single-column (updateByPKOneJournaled)
+// and multi-column (updateByPKJournaled).
+func TestNonIndexedPKUpdateSkipsDirty(t *testing.T) {
+	db, err := Open(Options{
+		Schema: Schema{Tables: []TableDef{{
+			Name: "t",
+			Columns: []ColumnDef{
+				{Name: "id", Type: TypeUUID, PK: true},
+				{Name: "name", Type: TypeString},
+				{Name: "score", Type: TypeInt},
+				{Name: "extra", Type: TypeInt},
+			},
+			Indexes: []IndexDef{{Name: "by_name", Columns: []string{"name"}}},
+		}}},
+		indexMergeInterval: -1, // keep the dirty overlay so the test can observe it
+		compactInterval:    -1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("INSERT INTO t (id, name, score, extra) VALUES (?, ?, ?, ?)", tid(1), "a", 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	rt := db.cat.Load().byName["t"]
+	base := rt.readDirtyCount.Load()
+
+	// Non-indexed updates: single column (updateByPKOneJournaled) then multi
+	// column (updateByPKJournaled). Neither touches the name index.
+	for i := 0; i < 3; i++ {
+		if _, err := db.Exec("UPDATE t SET score=? WHERE id=?", i, tid(1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := db.Exec("UPDATE t SET score=?, extra=? WHERE id=?", i, i, tid(1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := rt.readDirtyCount.Load(); got != base {
+		t.Errorf("non-indexed PK updates grew readDirtyCount %d -> %d, want unchanged", base, got)
+	}
+
+	// Indexed-column updates still mark dirty: single + multi column = +2.
+	if _, err := db.Exec("UPDATE t SET name=? WHERE id=?", "b", tid(1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("UPDATE t SET name=?, score=? WHERE id=?", "c", 9, tid(1)); err != nil {
+		t.Fatal(err)
+	}
+	if got := rt.readDirtyCount.Load(); got != base+2 {
+		t.Errorf("indexed-column updates: readDirtyCount=%d, want %d", got, base+2)
+	}
+
+	// Same rule inside a transaction (txReplaceLocked).
+	before := rt.readDirtyCount.Load()
+	if err := db.Transaction(func(tx *Tx) error {
+		_, e := tx.Exec("UPDATE t SET score=? WHERE id=?", 42, tid(1)) // non-indexed
+		return e
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := rt.readDirtyCount.Load(); got != before {
+		t.Errorf("txn non-indexed update grew readDirtyCount %d -> %d, want unchanged", before, got)
+	}
+	if err := db.Transaction(func(tx *Tx) error {
+		_, e := tx.Exec("UPDATE t SET name=? WHERE id=?", "z", tid(1)) // indexed
+		return e
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := rt.readDirtyCount.Load(); got != before+1 {
+		t.Errorf("txn indexed update: readDirtyCount=%d, want %d", got, before+1)
+	}
+}
+
 func TestUpdate(t *testing.T) {
 	db := openMem(t)
 	db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "alice", 30)
@@ -610,4 +785,68 @@ func TestParseErrors(t *testing.T) {
 			}
 		}
 	}
+}
+
+// After Close, every public verb must fail with ErrClosed — a use-after-close
+// cannot reach the torn-down WAL/companion. Covers a statement prepared before
+// Close too (Stmt.bound checks closed). Second Close is a no-op.
+func TestClosedRejectsAllVerbs(t *testing.T) {
+	dir := t.TempDir()
+	sqPath := filepath.Join(t.TempDir(), "m.db")
+	db, err := Open(Options{Schema: testSchema(), WALPath: dir, CompanionPath: sqPath, drainInterval: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(1), "a", 1); err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := db.Prepare("SELECT id, name FROM users WHERE id = ?")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("second Close should be a no-op, got %v", err)
+	}
+
+	want := func(name string, err error) {
+		t.Helper()
+		if !errors.Is(err, ErrClosed) {
+			t.Errorf("%s after Close: got %v, want ErrClosed", name, err)
+		}
+	}
+
+	_, e1 := db.Exec("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", tid(2), "b", 2)
+	want("Exec", e1)
+	_, e2 := db.ExecValues("INSERT INTO users (id, name, age) VALUES (?, ?, ?)", UUIDVal(tid(3)), Str("c"), Int(3))
+	want("ExecValues", e2)
+	_, _, e3 := db.Query("SELECT id FROM users")
+	want("Query", e3)
+	_, _, e4 := db.QueryValues("SELECT id FROM users")
+	want("QueryValues", e4)
+	_, _, e5 := db.QueryRow("SELECT id FROM users WHERE id = ?", tid(1))
+	want("QueryRow", e5)
+	_, _, e6 := db.QueryRowValues("SELECT id FROM users WHERE id = ?", UUIDVal(tid(1)))
+	want("QueryRowValues", e6)
+	_, _, e7 := db.QueryRowJSONByPK(nil, "SELECT id, name FROM users WHERE id = ?", tid(1))
+	want("QueryRowJSONByPK", e7)
+	e8 := db.QueryEach("SELECT id FROM users", nil, func([]string, Row) bool { return true })
+	want("QueryEach", e8)
+	_, _, e9 := db.QueryJSON("SELECT id FROM users")
+	want("QueryJSON", e9)
+	want("FlushWAL", db.FlushWAL())
+	_, e10 := db.Prepare("SELECT id FROM users")
+	want("Prepare", e10)
+	want("Transaction", db.Transaction(func(*Tx) error { return nil }))
+
+	// Statement prepared before Close also rejects, via Stmt.bound.
+	_, _, e11 := stmt.Query(tid(1))
+	want("Stmt.Query", e11)
+	_, _, e12 := stmt.QueryRow(tid(1))
+	want("Stmt.QueryRow", e12)
+	_, _, e13 := stmt.QueryRowByPK(tid(1), nil)
+	want("Stmt.QueryRowByPK", e13)
 }
