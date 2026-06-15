@@ -138,29 +138,35 @@ func (m *pkMap) put(k UUID, rowID uint64) {
 	}
 }
 
-// del removes k and returns the rowID it held. The vacated slot is repaired by
-// backward-shift compaction (Knuth 6.4R): walk forward from the gap; any entry
-// whose home slot does NOT lie cyclically in (gap, entry] would become
-// unreachable past the gap, so it moves into the gap and the walk continues
-// from its old position; the first empty slot ends the chain. No tombstones,
-// so probe chains never outlive their entries.
-func (m *pkMap) del(k UUID) (uint64, bool) {
+// find returns the slot index and rowID for k (ok=false if absent). Like get,
+// but it also yields the slot so a caller can delAt it without a second probe —
+// the journaled-delete path finds under the shard lock, journals, then delAt.
+func (m *pkMap) find(k UUID) (slot, rowID uint64, ok bool) {
 	if len(m.slots) == 0 {
-		return 0, false
+		return 0, 0, false
 	}
 	mask := uint64(len(m.slots) - 1)
 	i := pkHome(k, m.shift)
 	for {
 		s := &m.slots[i]
 		if s.ref == 0 {
-			return 0, false
+			return 0, 0, false
 		}
 		if s.key == k {
-			break
+			return i, s.ref - 1, true
 		}
 		i = (i + 1) & mask
 	}
-	rowID := m.slots[i].ref - 1
+}
+
+// delAt removes the entry at slot i (located by find) and repairs the vacated
+// slot by backward-shift compaction (Knuth 6.4R): walk forward from the gap; any
+// entry whose home slot does NOT lie cyclically in (gap, entry] would become
+// unreachable past the gap, so it moves into the gap and the walk continues from
+// its old position; the first empty slot ends the chain. No tombstones, so probe
+// chains never outlive their entries.
+func (m *pkMap) delAt(i uint64) {
+	mask := uint64(len(m.slots) - 1)
 	j := i
 	for {
 		j = (j + 1) & mask
@@ -176,6 +182,16 @@ func (m *pkMap) del(k UUID) (uint64, bool) {
 	}
 	m.slots[i] = pkSlot{}
 	m.used--
+}
+
+// del removes k and returns the rowID it held — one probe (find) plus the chain
+// repair (delAt).
+func (m *pkMap) del(k UUID) (uint64, bool) {
+	i, rowID, ok := m.find(k)
+	if !ok {
+		return 0, false
+	}
+	m.delAt(i)
 	return rowID, true
 }
 

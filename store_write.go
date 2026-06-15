@@ -264,7 +264,10 @@ func (t *table) deleteByPKJournaled(pk UUID, j mutJournal) (bool, error) {
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rowID, ok := s.pk.get(pk)
+	// find yields the slot so delAt removes it without a second probe of the
+	// (large) shard map — get-then-del probed twice. find is read-only, so the WAL
+	// append still precedes the in-memory mutation (tombstone + delAt below).
+	slot, rowID, ok := s.pk.find(pk)
 	if !ok {
 		return false, nil
 	}
@@ -272,7 +275,7 @@ func (t *table) deleteByPKJournaled(pk UUID, j mutJournal) (bool, error) {
 		return false, err
 	}
 	s.tombstoneLocked(rowID, len(t.indexes), t.budget)
-	s.pk.del(pk)
+	s.pk.delAt(slot)
 	t.markDelDirtyLocked(s, pk)
 	return true, nil
 }
@@ -288,7 +291,7 @@ func (t *table) deleteOneByCandidate(pk UUID, match func(Row) bool, j mutJournal
 	s := t.shardOf(pk)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rowID, ok := s.pk.get(pk)
+	slot, rowID, ok := s.pk.find(pk) // find yields the slot so delAt skips a re-probe
 	if !ok {
 		return false, nil
 	}
@@ -300,7 +303,7 @@ func (t *table) deleteOneByCandidate(pk UUID, match func(Row) bool, j mutJournal
 		return false, err
 	}
 	s.tombstoneLocked(rowID, len(t.indexes), t.budget)
-	s.pk.del(pk)
+	s.pk.delAt(slot)
 	t.markDelDirtyLocked(s, pk)
 	return true, nil
 }
