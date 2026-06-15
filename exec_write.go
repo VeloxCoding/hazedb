@@ -278,6 +278,67 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 		return 0, nil
 	}
 
+	// Index single-column fast path: one indexed-equality WHERE, a one-column SET,
+	// and no dirty overlay. Resolve the lone PK with lookupOne — no bucket copy
+	// (lookup's []UUID), no candidate set, and no SET buffer — then update in place
+	// under the shard lock, the same shape as the PK single-column path. lookupOne
+	// reports found/one against the merged view; with no dirty overlay that view is
+	// authoritative, so a single hit is the whole candidate set. A multi-hit bucket
+	// or any dirty row falls through to the general index path below (where a dirty
+	// PK could also be a candidate). updateOneByCandidate re-checks the full WHERE,
+	// so a residual conjunct beyond the indexed equality stays honoured.
+	if pl.idxLookup && len(pl.idxCols) == 1 && len(pl.updateOrdinals) == 1 && tbl.readDirtyCount.Load() == 0 {
+		if si := tbl.indexFor(pl.idxCols[0]); si != nil {
+			keyVal, err := evalLitOrParamValue(pl.idxSrcs[0], args) // index source is always a param/literal
+			if err != nil {
+				return 0, err
+			}
+			if keyVal.IsNull() {
+				return 0, nil
+			}
+			pk, found, one := si.lookupOne(keyOf(keyVal))
+			if !found {
+				return 0, nil
+			}
+			if one {
+				ord := pl.updateOrdinals[0]
+				col := tbl.def.def.Columns[ord]
+				computeOne := func(r Row) (Value, error) {
+					ctx.row = r
+					v, err := evalExpr(st.sets[0].val, ctx)
+					if err != nil {
+						return Value{}, err
+					}
+					if err := validateValue(col, v); err != nil {
+						return Value{}, err
+					}
+					return v, nil
+				}
+				if !pl.setRowDependent {
+					v, err := computeOne(nil)
+					if err != nil {
+						return 0, err
+					}
+					computeOne = func(Row) (Value, error) { return v, nil }
+				}
+				match := func(r Row) bool {
+					if st.where == nil {
+						return true
+					}
+					ctx.row = r
+					v, err := evalExpr(st.where, ctx)
+					return err == nil && truthy(v)
+				}
+				var j mutJournal
+				if db.wal != nil {
+					j = mutJournal{db: db, tableID: tbl.tableID, ords: pl.updateOrdinals, pkOrd: tbl.def.pkOrdinal}
+				}
+				return tbl.updateOneByCandidate(pk, ord, match, computeOne, j)
+			}
+			// found && !one: a multi-hit bucket → fall through to the general path.
+		}
+	}
+
 	// SET right-hand sides evaluate into a reused buffer. evalSet validates
 	// each result against its column. For constant SETs (no column ref) we
 	// evaluate once up front and hand back the same buffer for every row
