@@ -30,9 +30,10 @@ func shardCount() int {
 // UUID primary key's hash so independent keys seldom contend.
 //
 // Row layout: each shard owns a contiguous []Row arena. rowIDs are
-// per-shard indices into that arena. Deleted rows are tombstoned in
-// place (Row=nil) and reclaimed on rebuild — never auto-compacted, so
-// rowIDs stay stable for the indexes that point at them.
+// per-shard indices into that arena. A delete tombstones in place (Row=nil),
+// keeping rowIDs stable for the pkMap / pkDirectory / tails that point at them;
+// a background sweeper (compact.go) later compacts a shard once it has gone
+// mostly dead — relocating the live rows and renumbering, off the write path.
 type table struct {
 	def    *resolvedTable
 	shards []tableShard

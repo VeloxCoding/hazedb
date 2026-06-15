@@ -10,10 +10,12 @@ import "sync"
 // Global lock order (invariant): pkDirectory → data shard → walMu. Every
 // method below acquires in that order and releases in reverse.
 
-// rowLocation pins a row: which shard's arena, and the rowID within it.
-// rowIDs are append-only and never reused before a snapshot restart, so a
-// stale location is detectable (tombstone / PK mismatch) and never silently
-// aliases a different live row.
+// rowLocation pins a row: which shard's arena, and the rowID within it. rowIDs
+// are stable while a row lives; the background compactor (compact.go) can renumber
+// a shard's rows, but only under the pkDirectory + shard write locks (the lock
+// order above), updating every location in lockstep — and a stale location surfaces
+// as a tombstone / PK mismatch that forces a directory re-lookup, so it never
+// silently aliases a different live row.
 type rowLocation struct {
 	shard uint32
 	rowID uint64
