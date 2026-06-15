@@ -574,19 +574,33 @@ func colAndLit(b *binOp) (*colRef, expr) {
 // probe in a join shares it) — re-snapshotting per probe row would RLock all
 // shards and copy the whole overlay on each of O(driver) probes. Ignored on the
 // byPK path. nil is fine (no overlay).
-// reuse is an optional caller-owned buffer for the probe row. When non-nil the
-// live row is copied into it (getByPKProjectInto) instead of freshly cloned, so a
-// caller that CONSUMES each probe row immediately (the join's probe-and-assemble
-// loops, which copy the cells into a concat scratch right away) pays no per-row
-// allocation — only the buffer's one-time growth. nil keeps the owned-clone
-// behaviour for callers that RETAIN the row (the driver fetch appends it).
-func (db *DB) probeRows(tbl *tableRT, onOrd int, byPK bool, key Value, dirty []UUID, reuse *[]Value, fn func(Row) bool) {
+// reuse and collect are mutually-exclusive optional buffers for the fetched row.
+//   - reuse: one caller-owned buffer reused per row (getByPKProjectInto), for a
+//     caller that CONSUMES each row immediately (the probe-and-assemble loops copy
+//     the cells into a concat scratch right away) — no per-row allocation.
+//   - collect: a backing the matched rows are PACKED into (each Row a window),
+//     presized here from the candidate count, for a caller that RETAINS them (the
+//     index-fetched driver) — one allocation for the whole driver set instead of a
+//     getByPK clone per row. A passDriver reject in fn leaves an unused slot (the
+//     backing was sized to the upper bound, so it never regrows).
+//
+// nil for both keeps the owned-clone behaviour. dirty is the table's dirty-PK
+// overlay, snapshotted ONCE by the caller (ignored on the byPK path; nil = none).
+func (db *DB) probeRows(tbl *tableRT, onOrd int, byPK bool, key Value, dirty []UUID, reuse, collect *[]Value, fn func(Row) bool) {
 	if key.IsNull() {
 		return
 	}
 	if byPK {
 		pk, err := coerceToUUID(key)
 		if err != nil {
+			return
+		}
+		if collect != nil {
+			start := len(*collect)
+			if c, ok := tbl.appendMatchProject(pk, nil, nil, true, *collect); ok {
+				*collect = c
+				fn(Row(c[start:len(c):len(c)]))
+			}
 			return
 		}
 		if reuse != nil {
@@ -606,7 +620,24 @@ func (db *DB) probeRows(tbl *tableRT, onOrd int, byPK bool, key Value, dirty []U
 		return
 	}
 	cand := idxCandidateSet{pks: si.lookupLeading(key), dirty: dirty}
+	if collect != nil && cap(*collect) == 0 {
+		*collect = make([]Value, 0, (len(cand.pks)+len(dirty))*len(tbl.def.def.Columns))
+	}
 	cand.emit(func(pk UUID) bool {
+		if collect != nil {
+			start := len(*collect)
+			c, ok := tbl.appendMatchProject(pk, nil, nil, true, *collect)
+			*collect = c
+			if !ok {
+				return false
+			}
+			r := Row(c[start:len(c):len(c)])
+			if !r[onOrd].Equal(key) { // re-check: index entry may be stale / dirty
+				*collect = c[:start] // drop the rejected row's slot
+				return false
+			}
+			return fn(r)
+		}
 		var r Row
 		var ok bool
 		if reuse != nil {
@@ -707,8 +738,11 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		db.probeRows(jp.driverRT, jp.driverIdxOrd, jp.driverIdxByPK, key, jp.driverRT.dirtyPKs(), nil, func(dr Row) bool {
-			if passDriver(dr) { // dr is an owned clone (getByPK) — retained, so no reuse buffer
+		// Pack the retained driver rows into ONE backing (collect) — presized from the
+		// index candidate count inside probeRows — instead of a getByPK clone per row.
+		var driverBacking []Value
+		db.probeRows(jp.driverRT, jp.driverIdxOrd, jp.driverIdxByPK, key, jp.driverRT.dirtyPKs(), nil, &driverBacking, func(dr Row) bool {
+			if passDriver(dr) { // dr is a window into driverBacking
 				drivers = append(drivers, dr)
 			}
 			return false
@@ -782,7 +816,7 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 	drive := func(emit func(left, right Row) bool) {
 		probeAndEmit := func(drow Row) bool { // returns true to stop the whole join
 			matched, stop := false, false
-			db.probeRows(jp.probeRT, jp.probeOnOrd, jp.probeByPK, drow[jp.driverOnOrd], probeDirty, &probeScratch, func(prow Row) bool {
+			db.probeRows(jp.probeRT, jp.probeOnOrd, jp.probeByPK, drow[jp.driverOnOrd], probeDirty, &probeScratch, nil, func(prow Row) bool {
 				matched = true
 				left, right := drow, prow
 				if !jp.driverIsLeft {
@@ -965,7 +999,7 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 			concat := make(Row, nLeft+nRight)
 			appendJoined := func(drow Row) {
 				matched := false
-				db.probeRows(jp.probeRT, jp.probeOnOrd, jp.probeByPK, drow[jp.driverOnOrd], probeDirty, &probeScratch, func(prow Row) bool {
+				db.probeRows(jp.probeRT, jp.probeOnOrd, jp.probeByPK, drow[jp.driverOnOrd], probeDirty, &probeScratch, nil, func(prow Row) bool {
 					matched = true
 					left, right := drow, prow
 					if !jp.driverIsLeft {
