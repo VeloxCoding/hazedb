@@ -63,9 +63,10 @@ func compileCmp(x *binOp, args []Value) (func(Row) bool, bool) {
 	ord := cr.ord
 	switch x.op {
 	case tkEq:
-		return func(row Row) bool { return row[ord].Equal(rhs) }, true
+		return compileEq(ord, rhs), true
 	case tkNeq:
-		return func(row Row) bool { return !row[ord].Equal(rhs) }, true
+		eq := compileEq(ord, rhs)
+		return func(row Row) bool { return !eq(row) }, true
 	case tkLt:
 		return func(row Row) bool { c, ok := row[ord].Compare(rhs); return ok && c < 0 }, true
 	case tkLte:
@@ -76,6 +77,38 @@ func compileCmp(x *binOp, args []Value) (func(Row) bool, bool) {
 		return func(row Row) bool { c, ok := row[ord].Compare(rhs); return ok && c >= 0 }, true
 	}
 	return nil, false
+}
+
+// compileEq builds the per-row predicate for `col = value` once the RHS value is
+// known, specialised by its kind so the per-row test is a direct field compare
+// rather than a Value.Equal call (whose `switch v.Kind` is decided here, at plan
+// time, not re-walked per row). Each branch is bit-identical to Value.Equal for
+// that kind: a kind mismatch is never equal, and within a kind the same payload
+// compare runs (w0 for int/bool, both words for UUID, the bytes for a string).
+// KindBytes and KindNull fall back to Value.Equal (rare on a scanned WHERE).
+func compileEq(ord int, rhs Value) func(Row) bool {
+	switch rhs.Kind {
+	case KindString:
+		rs := rhs.Str()
+		return func(row Row) bool {
+			c := row[ord]
+			return c.Kind == KindString && c.Str() == rs
+		}
+	case KindInt, KindBool:
+		rk, rw := rhs.Kind, rhs.w0
+		return func(row Row) bool {
+			c := row[ord]
+			return c.Kind == rk && c.w0 == rw
+		}
+	case KindUUID:
+		w0, w1 := rhs.w0, rhs.w1
+		return func(row Row) bool {
+			c := row[ord]
+			return c.Kind == KindUUID && c.w0 == w0 && c.w1 == w1
+		}
+	default: // KindBytes, KindNull
+		return func(row Row) bool { return row[ord].Equal(rhs) }
+	}
 }
 
 // resolveOperand resolves a literal or parameter to its Value once. A param index
