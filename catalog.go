@@ -3,6 +3,7 @@ package hazedb
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -24,6 +25,11 @@ func (rt *tableRT) name() string { return rt.table.def.def.Name }
 // newCatalog builds the bootstrap catalog from the Open() schema. Table IDs
 // are the schema order (0..n-1); these are the durable IDs the WAL uses.
 func newCatalog(schema Schema, sizeHint int, budget *byteBudget) (*catalog, error) {
+	// Table IDs are the schema order (0..n-1) and stamp every WAL mutation as a
+	// uint16, so n must fit: n-1 <= MaxUint16, i.e. at most MaxUint16+1 tables.
+	if len(schema.Tables) > math.MaxUint16+1 {
+		return nil, fmt.Errorf("%w: %d bootstrap tables", ErrTooManyTables, len(schema.Tables))
+	}
 	resolved, err := resolveSchema(schema)
 	if err != nil {
 		return nil, err
@@ -97,6 +103,19 @@ func (db *DB) createTable(td TableDef) error {
 	if strings.HasPrefix(strings.ToLower(td.Name), reservedTablePrefix) {
 		return fmt.Errorf("%w: %q", ErrReservedName, td.Name)
 	}
+	// Table IDs are never reused after DROP (a dropped slot stays nil and the slice
+	// keeps its length), so len(byID) is the count of IDs ever handed out — this caps
+	// lifetime creates, not just live tables. A wrapped uint16 ID would overwrite an
+	// existing slot and mis-route that table's WAL mutations.
+	if len(cur.byID) > math.MaxUint16 {
+		return fmt.Errorf("%w: %d table slots used", ErrTooManyTables, len(cur.byID))
+	}
+	// Names/counts must fit the uint16 catalog WAL codec; a silent truncation there
+	// writes a wrong length prefix over full-length bytes and corrupts replay, so the
+	// next Open fails. Reject before journaling.
+	if err := validateCatalogWireDef(td); err != nil {
+		return err
+	}
 	resolved, err := resolveSchema(Schema{Tables: []TableDef{td}})
 	if err != nil {
 		return err
@@ -125,6 +144,11 @@ func (db *DB) dropTable(name string) error {
 	if _, exists := cur.byName[name]; !exists {
 		return fmt.Errorf("%w: %q", ErrUnknownTable, name)
 	}
+	// createTable rejects an oversized name, so an existing name already fits — this
+	// keeps the uint16 codec precondition explicit and local to the encode call.
+	if err := checkU16(len(name), "table name length"); err != nil {
+		return err
+	}
 	if db.wal != nil {
 		bp := db.scratch.get()
 		*bp = encodeDropTable(*bp, name)
@@ -146,6 +170,49 @@ func (db *DB) dropTable(name string) error {
 //        per index: name(len:2+bytes) | numCols:2 | per col: col(len:2+bytes) |
 //        flags:1 (bit 1 = Ordered; bit 0 reserved)
 // DROP:   name(len:2+bytes)
+
+// checkU16 rejects a length or count that would not survive the uint16 the catalog
+// WAL codec encodes it as: a silent truncation there writes a wrong length prefix
+// over full-length bytes, so the record cannot be decoded and replay fails.
+func checkU16(n int, what string) error {
+	if n > math.MaxUint16 {
+		return fmt.Errorf("%w: %s is %d (max %d)", ErrCatalogTooLarge, what, n, math.MaxUint16)
+	}
+	return nil
+}
+
+// validateCatalogWireDef rejects a table definition whose names or counts exceed the
+// uint16 fields of encodeCreateTable. Called before journaling a CREATE.
+func validateCatalogWireDef(td TableDef) error {
+	if err := checkU16(len(td.Name), "table name length"); err != nil {
+		return err
+	}
+	if err := checkU16(len(td.Columns), "column count"); err != nil {
+		return err
+	}
+	for _, c := range td.Columns {
+		if err := checkU16(len(c.Name), "column name length"); err != nil {
+			return err
+		}
+	}
+	if err := checkU16(len(td.Indexes), "index count"); err != nil {
+		return err
+	}
+	for _, ix := range td.Indexes {
+		if err := checkU16(len(ix.Name), "index name length"); err != nil {
+			return err
+		}
+		if err := checkU16(len(ix.Columns), "index column count"); err != nil {
+			return err
+		}
+		for _, col := range ix.Columns {
+			if err := checkU16(len(col), "index column name length"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
 
 func encodeCreateTable(buf []byte, tableID uint16, td TableDef) []byte {
 	buf = appendU16LE(buf, tableID)

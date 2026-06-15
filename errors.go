@@ -23,4 +23,6 @@ var (
 	ErrClosed            = errors.New("hazedb: database is closed")
 	ErrMirrorSchema      = errors.New("hazedb: mirror schema mismatch; migration required")
 	ErrMirrorCorrupt     = errors.New("hazedb: SQLite mirror corrupted")
+	ErrTooManyTables     = errors.New("hazedb: table count exceeds the uint16 table-id limit")
+	ErrCatalogTooLarge   = errors.New("hazedb: catalog name or count exceeds the uint16 WAL-codec limit")
 )
