@@ -38,6 +38,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 )
@@ -45,12 +46,12 @@ import (
 // RowsToJSON renders a result set as {"columns":[...],"rows":[[...],...]}.
 //
 // Hand-rolled: it appends each Value straight into one capacity-hinted buffer,
-// with no [][]any intermediate, no interface boxing, and no reflection. On a
-// hot read path (one PHP call per request) that is ~1.5–3× faster than
-// encoding/json and turns ~4 allocations per row into a single buffer
-// allocation. The returned []byte is the caller's to keep or copy (the PHP
-// adapter copies it into a zend_string immediately). Never errors — the
-// signature keeps the error for API symmetry with the rest of wire.go.
+// with no [][]any intermediate, no interface boxing, and no reflection. On a hot
+// read path (one PHP call per request) that is faster than encoding/json and
+// collapses the per-row allocations into a single buffer allocation. The returned
+// []byte is the caller's to keep or copy (the PHP adapter copies it into a
+// zend_string immediately). Never errors — the signature keeps the error for API
+// symmetry with the rest of wire.go.
 func RowsToJSON(cols []string, rows []Row) ([]byte, error) {
 	ncols := len(cols)
 	// Rough capacity: envelope + columns + ~24 B per cell. Over-estimating
@@ -197,8 +198,8 @@ func appendUUIDJSON(b []byte, u UUID) []byte {
 	return append(b, '"')
 }
 
-// appendValueJSON appends one cell. Bytes render as a base64 string (parity
-// with the prior encoding/json path); all other kinds append with no alloc.
+// appendValueJSON appends one cell. Bytes render as a base64 string (the wire
+// format for byte columns); every kind appends straight into b with no alloc.
 func appendValueJSON(b []byte, v Value) []byte {
 	switch v.Kind {
 	case KindNull:
@@ -253,9 +254,9 @@ func appendJSONRows(b []byte, cols []string, rows []Row) []byte {
 	return append(b, ']', '}')
 }
 
-// ExecResultJSON renders a write result as {"affected":n}. Hand-appended — the
-// shape is fixed, so the reflection-based json.Marshal it used was pure overhead
-// on every HTTP write response.
+// ExecResultJSON renders a write result as {"affected":n}. Hand-appended: the
+// shape is fixed, so reflection (json.Marshal) would be pure overhead on every
+// HTTP write response.
 func ExecResultJSON(affected int) []byte {
 	b := make([]byte, 0, 24)
 	b = append(b, `{"affected":`...)
@@ -276,7 +277,8 @@ func ErrorJSON(msg string) []byte {
 //   - ""                  → no args
 //   - starts with '['     → a JSON array (ArgsFromJSON; multi-arg / typed / writes)
 //   - anything else       → ONE positional arg passed directly: a canonical
-//     UUID string → UUID, otherwise STRING
+//     UUID string → UUID, otherwise the STRING verbatim (any surrounding
+//     whitespace is part of the value and is preserved)
 //
 // The direct form lets a caller pass a key it already has — e.g. the UUID from
 // a clicked link — straight into `WHERE id = ?` with no json_encode wrapping,
@@ -293,7 +295,9 @@ func QueryArgs(s string) ([]any, error) {
 	if u, ok := ParseUUIDOk(t); ok {
 		return []any{u}, nil
 	}
-	return []any{t}, nil
+	// Direct string: return the ORIGINAL s, not the trimmed t — leading/trailing
+	// spaces can be part of the value. The trim only classifies (empty / '[' / UUID).
+	return []any{s}, nil
 }
 
 // ArgsFromJSON parses a JSON array of positional SQL args into the []any
@@ -308,6 +312,12 @@ func ArgsFromJSON(raw []byte) ([]any, error) {
 	var arr []any
 	if err := dec.Decode(&arr); err != nil {
 		return nil, fmt.Errorf("args: %w", err)
+	}
+	// Decode consumes only the FIRST JSON value, so "[1] 2" would otherwise pass
+	// silently with args=[1]. A well-formed stream reads EOF next; anything else
+	// (a second value, or junk) is malformed.
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, fmt.Errorf("args: unexpected data after the JSON array")
 	}
 	out := make([]any, len(arr))
 	for i, a := range arr {
