@@ -67,16 +67,114 @@ func compileCmp(x *binOp, args []Value) (func(Row) bool, bool) {
 	case tkNeq:
 		eq := compileEq(ord, rhs)
 		return func(row Row) bool { return !eq(row) }, true
-	case tkLt:
-		return func(row Row) bool { c, ok := row[ord].Compare(rhs); return ok && c < 0 }, true
-	case tkLte:
-		return func(row Row) bool { c, ok := row[ord].Compare(rhs); return ok && c <= 0 }, true
-	case tkGt:
-		return func(row Row) bool { c, ok := row[ord].Compare(rhs); return ok && c > 0 }, true
-	case tkGte:
-		return func(row Row) bool { c, ok := row[ord].Compare(rhs); return ok && c >= 0 }, true
+	case tkLt, tkLte, tkGt, tkGte:
+		return compileOrd(ord, x.op, rhs), true
 	}
 	return nil, false
+}
+
+// compileOrd builds the per-row predicate for an ordered comparison (col OP value,
+// OP one of < <= > >=) once the RHS value is known, specialised by its kind so a
+// same-kind row tests with an inlined field compare instead of a Value.Compare
+// call (whose null + kind-pair dispatch is decided here, at plan time). A cell
+// whose kind differs from the RHS — or is NULL — falls back to Value.Compare per
+// row, so the result stays bit-identical to the interpreted path, INCLUDING
+// Compare's cross-kind string coercion (unlike Equal, Compare does not reject a
+// kind mismatch). A KindUUID/KindBytes RHS (rare in a scanned range filter) uses
+// the generic Compare path throughout.
+func compileOrd(ord int, op tokenKind, rhs Value) func(Row) bool {
+	switch rhs.Kind {
+	case KindInt, KindBool:
+		rk, rw := rhs.Kind, rhs.Int()
+		switch op {
+		case tkLt:
+			return func(row Row) bool {
+				if c := row[ord]; c.Kind == rk {
+					return c.Int() < rw
+				}
+				cc, ok := row[ord].Compare(rhs)
+				return ok && cc < 0
+			}
+		case tkLte:
+			return func(row Row) bool {
+				if c := row[ord]; c.Kind == rk {
+					return c.Int() <= rw
+				}
+				cc, ok := row[ord].Compare(rhs)
+				return ok && cc <= 0
+			}
+		case tkGt:
+			return func(row Row) bool {
+				if c := row[ord]; c.Kind == rk {
+					return c.Int() > rw
+				}
+				cc, ok := row[ord].Compare(rhs)
+				return ok && cc > 0
+			}
+		case tkGte:
+			return func(row Row) bool {
+				if c := row[ord]; c.Kind == rk {
+					return c.Int() >= rw
+				}
+				cc, ok := row[ord].Compare(rhs)
+				return ok && cc >= 0
+			}
+		}
+	case KindString:
+		rs := rhs.Str()
+		switch op {
+		case tkLt:
+			return func(row Row) bool {
+				if c := row[ord]; c.Kind == KindString {
+					return c.Str() < rs
+				}
+				cc, ok := row[ord].Compare(rhs)
+				return ok && cc < 0
+			}
+		case tkLte:
+			return func(row Row) bool {
+				if c := row[ord]; c.Kind == KindString {
+					return c.Str() <= rs
+				}
+				cc, ok := row[ord].Compare(rhs)
+				return ok && cc <= 0
+			}
+		case tkGt:
+			return func(row Row) bool {
+				if c := row[ord]; c.Kind == KindString {
+					return c.Str() > rs
+				}
+				cc, ok := row[ord].Compare(rhs)
+				return ok && cc > 0
+			}
+		case tkGte:
+			return func(row Row) bool {
+				if c := row[ord]; c.Kind == KindString {
+					return c.Str() >= rs
+				}
+				cc, ok := row[ord].Compare(rhs)
+				return ok && cc >= 0
+			}
+		}
+	}
+	return compileOrdGeneric(ord, op, rhs)
+}
+
+// compileOrdGeneric is the unspecialised ordered predicate: a Value.Compare per
+// row. Used for a KindUUID/KindBytes/KindNull RHS, where a scanned range filter is
+// rare enough that the per-kind inline is not worth the code.
+func compileOrdGeneric(ord int, op tokenKind, rhs Value) func(Row) bool {
+	switch op {
+	case tkLt:
+		return func(row Row) bool { c, ok := row[ord].Compare(rhs); return ok && c < 0 }
+	case tkLte:
+		return func(row Row) bool { c, ok := row[ord].Compare(rhs); return ok && c <= 0 }
+	case tkGt:
+		return func(row Row) bool { c, ok := row[ord].Compare(rhs); return ok && c > 0 }
+	case tkGte:
+		return func(row Row) bool { c, ok := row[ord].Compare(rhs); return ok && c >= 0 }
+	}
+	return nil
 }
 
 // compileEq builds the per-row predicate for `col = value` once the RHS value is

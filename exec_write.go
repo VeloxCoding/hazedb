@@ -558,7 +558,7 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 		// the PK path), skipping the []UUID candidate slice + multi-shard machinery.
 		// match still re-checks the full WHERE, so a residual conjunct is honoured.
 		if len(pl.idxCols) == 1 && tbl.readDirtyCount.Load() == 0 {
-			keyVal, err := evalExpr(pl.idxSrcs[0], ctx)
+			keyVal, err := evalLitOrParamValue(pl.idxSrcs[0], args) // index source is always a param/literal — no eval context needed
 			if err != nil {
 				return 0, err
 			}

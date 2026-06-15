@@ -422,6 +422,36 @@ func BenchmarkFetchByScan_SQLiteMem(b *testing.B) {
 	}
 }
 
+// ---- RANGE filter by scan (col OP ?, unindexed int column, full scan) ----
+// age is unindexed and holds 0..99; `age > 1000` matches nothing, so every one of
+// the compareN rows pays the compiled ordered comparison and the result stays
+// empty — isolating the per-row range comparator (the < <= > >= path) the way
+// FetchByScan isolates the equality comparator.
+func BenchmarkRangeScan_hazedb_Mem(b *testing.B) {
+	db := newIdxScanDB(b)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, r, err := db.Query("SELECT age FROM t WHERE age > ?", 1000); err != nil || len(r) != 0 {
+			b.Fatalf("rows=%d err=%v", len(r), err)
+		}
+	}
+}
+func BenchmarkRangeScan_SQLiteMem(b *testing.B) {
+	s, _ := newIdxScanSQLite(b).Prepare("SELECT age FROM t WHERE age > ?")
+	defer s.Close()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		rows, _ := s.Query(1000)
+		for rows.Next() {
+			var a int64
+			rows.Scan(&a)
+		}
+		rows.Close()
+	}
+}
+
 // ---- COUNT(*) over an indexed column (compareN/countBuckets rows per key) ----
 // A separate table c(id PK, bucket [INDEX], n) with compareN rows spread over
 // countBuckets buckets, so COUNT(*) WHERE bucket = ? counts ~100 rows resolved
