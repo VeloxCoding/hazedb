@@ -284,8 +284,13 @@ func (db *DB) planJoin(pl *plan, st *selectStmt, cat *catalog) error {
 		}
 	}
 	// An equality on an indexed/PK driver column lets us FETCH the driver through
-	// that index/PK (driverIdxSrc → key) instead of scanning.
-	var fetchConj expr
+	// that index/PK (driverIdxSrc → key) instead of scanning. A PK equality fetches at
+	// most one row — maximally selective — so it wins over any secondary index
+	// outright; otherwise the first secondary-indexed equality is used. (Picking the
+	// smallest of several secondary buckets would need the param values, known only at
+	// exec time — deferred.)
+	var fetchConj, secondaryConj, secondaryVal expr
+	secondaryOrd := -1
 	for _, p := range driverConj {
 		b, ok := p.(*binOp)
 		if !ok || b.op != tkEq {
@@ -299,25 +304,22 @@ func (db *DB) planJoin(pl *plan, st *selectStmt, cat *catalog) error {
 		if within < 0 || within >= len(driverDef.def.Columns) {
 			continue
 		}
-		// probeIndexFor (not indexFor): a composite index's LEADING column drives
-		// the pushdown too — the fetch below (probeRows) already resolves it via a
-		// prefix lookup, so the detection must match or the driver falls back to a
-		// full scan (the slow composite-only LEFT case).
-		if within == driverDef.pkOrdinal || jp.driverRT.probeIndexFor(within) != nil {
-			jp.driverIdxOrd, jp.driverIdxSrc, jp.driverIdxByPK = within, val, within == driverDef.pkOrdinal
+		if within == driverDef.pkOrdinal {
+			jp.driverIdxOrd, jp.driverIdxSrc, jp.driverIdxByPK = within, val, true
 			fetchConj = p
-			break
+			break // a PK fetch is the best possible key — stop looking
+		}
+		// probeIndexFor (not indexFor): a composite index's LEADING column drives the
+		// pushdown too — the fetch (probeRows) resolves it via a prefix lookup, so the
+		// detection must match or the driver falls back to a full scan (the slow
+		// composite-only LEFT case). Remember the first one but keep scanning for a PK.
+		if secondaryConj == nil && jp.driverRT.probeIndexFor(within) != nil {
+			secondaryConj, secondaryVal, secondaryOrd = p, val, within
 		}
 	}
-	// driverPreds = driverConj MINUS the fetch-key equality: the fetch already
-	// guarantees it (the byPK fetch is exact; the secondary-index fetch re-checks
-	// r[idxOrd] == key in probeRows), so re-checking it in passDriver is wasted
-	// work. A point/feed lookup whose only driver conjunct IS the fetch key then has
-	// an empty driverPreds — no passDriver scratch row, no compiled matcher.
-	for _, c := range driverConj {
-		if c != fetchConj {
-			jp.driverPreds = append(jp.driverPreds, c)
-		}
+	if fetchConj == nil && secondaryConj != nil {
+		jp.driverIdxOrd, jp.driverIdxSrc, jp.driverIdxByPK = secondaryOrd, secondaryVal, false
+		fetchConj = secondaryConj
 	}
 
 	// Projection + output names (global ordinals). SELECT * qualifies names as
@@ -375,9 +377,43 @@ func (db *DB) planJoin(pl *plan, st *selectStmt, cat *catalog) error {
 	// Driver composite-prefix walk: the driver's WHERE pins the leading column(s)
 	// of a composite ordered index and ORDER BY is the next column — walk that
 	// prefix in order (this is the lever for a filtered LEFT join, where probeWalk
-	// does not apply). driverWalk (unfiltered single-column) takes precedence.
-	if jp.orderOrdinal >= 0 && !jp.probeWalk && !jp.driverWalk {
+	// does not apply). driverWalk (unfiltered single-column) takes precedence, and a
+	// PK fetch (≤1 driver row, already bounded) beats walking a whole prefix range.
+	if jp.orderOrdinal >= 0 && !jp.probeWalk && !jp.driverWalk && !jp.driverIdxByPK {
 		jp.planDriverCompWalk(driverConj, driverOff)
+	}
+
+	// driverPreds = the driver conjuncts NOT already guaranteed by the chosen driver
+	// access path, so passDriver does not re-check them. Built after walk planning,
+	// since which conjuncts are guaranteed depends on the path:
+	//   - composite-prefix walk: the walk pins the leading prefix columns to exact
+	//     values, so drop those equalities. It does NOT run the index-fetch re-check,
+	//     so a fetch-key equality on a column OUTSIDE the prefix must stay — otherwise
+	//     it would be enforced nowhere.
+	//   - otherwise (index-fetch or plain scan): drop the fetch-key equality — the
+	//     fetch guarantees it (the byPK fetch is exact; the secondary-index fetch
+	//     re-checks r[idxOrd] == key in probeRows). A point lookup whose only driver
+	//     conjunct IS the fetch key then has empty driverPreds — no passDriver scratch
+	//     row, no compiled matcher.
+	if jp.driverCompWalk {
+		prefix := make(map[int]bool, len(jp.driverCompPrefixSrcs))
+		for i := range jp.driverCompPrefixSrcs {
+			prefix[jp.driverCompOrdinals[i]] = true
+		}
+		for _, c := range driverConj {
+			if b, ok := c.(*binOp); ok && b.op == tkEq {
+				if cr, _ := colAndLit(b); cr != nil && prefix[cr.ord-driverOff] {
+					continue // guaranteed by the prefix walk
+				}
+			}
+			jp.driverPreds = append(jp.driverPreds, c)
+		}
+	} else {
+		for _, c := range driverConj {
+			if c != fetchConj {
+				jp.driverPreds = append(jp.driverPreds, c)
+			}
+		}
 	}
 
 	// Pre-escape the output column names for the streaming JSON encoder, as the
@@ -742,7 +778,9 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 	// and stops at offset+limit instead of materialising the whole table up front
 	// (the result order is undefined, so any offset+limit rows are valid). With an
 	// ORDER BY every driver must be seen to sort, and an index-fetched driver is
-	// already bounded — both materialise here.
+	// already bounded — both materialise here. (Streaming the ordered driver was
+	// measured 2x slower / ~3000x more allocs: the top-N never early-stops, so
+	// scanShardsBatched only trades one presized backing for many per-chunk clones.)
 	ordered := jp.orderOrdinal >= 0
 	streaming := jp.driverIdxSrc == nil && !ordered
 	var drivers []Row
@@ -899,8 +937,11 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 		}
 		if si := jp.probeRT.indexByOrdinals(jp.probeWalkOrdinals); si != nil {
 			ords := si.ordinals
+			// cells is reused across dirty rows: encodeCompositeKey copies into its own
+			// key bytes and never retains the slice, and buildDirtyCands calls this
+			// serially — so one scratch instead of a make() per dirty candidate.
+			cells := make([]Value, len(ords))
 			dirtyKey := func(r Row) indexKey {
-				cells := make([]Value, len(ords))
 				for i, o := range ords {
 					cells[i] = r[o]
 				}
@@ -983,8 +1024,9 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 				}
 				ords := si.ordinals
 				snap = si.snapshotPrefix(encodeCompositeKey(prefix))
+				// cells reused across dirty rows (see the probe-walk note above).
+				cells := make([]Value, len(ords))
 				dirtyKey = func(r Row) indexKey {
-					cells := make([]Value, len(ords))
 					for i, o := range ords {
 						cells[i] = r[o]
 					}
@@ -1027,7 +1069,11 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 					if passResidual(concat) {
 						out, packed = appendProjected(out, packed, concat, pl.projOrdinals, st.starAll, bounded)
 					}
-					return false // collect every match for this driver
+					// Every match of one driver row shares the ORDER BY value (it is a
+					// driver column), so the walk is still in order once out is full.
+					// Stop the probe instead of draining a high-fanout driver's whole
+					// bucket (LIMIT 10 must not collect a first driver's 100k hits).
+					return bounded && len(out) >= eff
 				})
 				if !matched { // OUTER miss: pad the probed side
 					pad := false

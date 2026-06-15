@@ -205,6 +205,36 @@ func TestJoinOrderLimitOffset(t *testing.T) {
 	}
 }
 
+// Regression: when a composite-prefix walk drives the join, a driver WHERE
+// equality on an indexed column OUTSIDE the walked prefix must still filter. The
+// pushdown picks that column as the fetch key and drops it from driverPreds, but
+// the composite walk does NOT run the index fetch — so the equality has to be
+// re-checked by passDriver, or rows failing it leak into the result.
+func TestJoinCompositeWalkEnforcesNonPrefixFilter(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE users (id uuid primary key, name text)")
+	// region: a single secondary index — first in the WHERE, so the pushdown picks
+	// it as the fetch key. (status, created): the ordered composite the driver walks
+	// for ORDER BY created. region is NOT part of that index.
+	db.Exec("CREATE TABLE posts (id uuid primary key, author uuid, region text, status text, created int, title text, INDEX (region), ORDERED INDEX (status, created))")
+	db.Exec("INSERT INTO users (id, name) VALUES (?, ?)", tid(1), "u1")
+	// Two posts, same author + status (so both fall in the walked prefix), DIFFERENT
+	// region. WHERE region='eu' must keep only the first.
+	db.Exec("INSERT INTO posts (id, author, region, status, created, title) VALUES (?, ?, ?, ?, ?, ?)", tid(101), tid(1), "eu", "open", 1, "keep")
+	db.Exec("INSERT INTO posts (id, author, region, status, created, title) VALUES (?, ?, ?, ?, ?, ?)", tid(102), tid(1), "us", "open", 2, "drop")
+	db.mergeIndexes()
+
+	_, rows, err := db.Query(
+		"SELECT p.title FROM posts p JOIN users u ON p.author = u.id WHERE p.region = ? AND p.status = ? ORDER BY p.created",
+		"eu", "open")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strs(rows, 0); !eqStrSet(got, []string{"keep"}) {
+		t.Fatalf("region filter not enforced under composite walk: titles=%v (want [keep])", got)
+	}
+}
+
 // SELECT * over a join yields both tables' columns, qualified to avoid collision.
 func TestJoinStarColumns(t *testing.T) {
 	db := joinFixture(t)
