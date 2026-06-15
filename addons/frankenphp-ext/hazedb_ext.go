@@ -99,6 +99,11 @@ static zend_array *hzd_build_row(uint32_t n,
 // --- read a PHP array of args (PHP -> Go) ---
 static uint32_t hzd_arr_count(zend_array *a) { return zend_hash_num_elements(a); }
 static zval *hzd_arr_get(zend_array *a, uint32_t i) { return zend_hash_index_find(a, i); }
+// hzd_arr_is_list reports whether a is a real positional list — sequential
+// integer keys 0..n-1, array_is_list() semantics. Positional params require it;
+// a sparse or associative array is rejected rather than read by index, which
+// would map every missing index to NULL and silently drop the caller's values.
+static int hzd_arr_is_list(zend_array *a) { return zend_array_is_list(a) ? 1 : 0; }
 // hzd_zval_kind normalises the zval type to a small stable code (avoids
 // depending on cgo exposing the IS_* macros):
 //   0 null  1 false  2 true  3 long  4 string  5 double  6 other  7 array
@@ -192,7 +197,9 @@ func valueFromZval(z *C.zval) (hazedb.Value, bool) {
 // argsFromMixed reads the $args param, which may be a native PHP array of
 // positional params ([$a, $b]) OR a single bare scalar ($id) — the latter is
 // the fast path for single-key reads (one zval, no array build/iteration). A
-// nil (omitted) or null $args yields no args.
+// nil (omitted) or null $args yields no args. The array must be a true list
+// (keys 0..n-1); a sparse or associative array is rejected (ok=false), never
+// read positionally.
 func argsFromMixed(a *C.zval) ([]hazedb.Value, bool) {
 	if a == nil {
 		return nil, true
@@ -202,6 +209,13 @@ func argsFromMixed(a *C.zval) ([]hazedb.Value, bool) {
 		return nil, true
 	case 7: // array of positional params
 		arr := C.hzd_zval_arr(a)
+		// Positional params must be a real list (keys 0..n-1). Reject a sparse or
+		// associative array — reading it by index would turn every missing index
+		// into NULL and silently drop the caller's values (e.g. [1=>$id] reads
+		// index 0 as NULL; ['id'=>$id] has no index 0 at all).
+		if C.hzd_arr_is_list(arr) == 0 {
+			return nil, false
+		}
 		n := int(C.hzd_arr_count(arr))
 		if n == 0 {
 			return nil, true
@@ -210,8 +224,7 @@ func argsFromMixed(a *C.zval) ([]hazedb.Value, bool) {
 		for i := 0; i < n; i++ {
 			z := C.hzd_arr_get(arr, C.uint32_t(i))
 			if z == nil {
-				vals = append(vals, hazedb.Null())
-				continue
+				return nil, false // list verified above; a hole is unexpected — reject, never guess NULL
 			}
 			v, ok := valueFromZval(z)
 			if !ok {
