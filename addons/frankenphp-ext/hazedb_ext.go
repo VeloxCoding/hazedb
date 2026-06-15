@@ -288,11 +288,44 @@ type rowScratch struct {
 
 var scratchPool = sync.Pool{New: func() any { return new(rowScratch) }}
 
+// Pool buffers are reused across calls on a long-lived worker, so a single outlier
+// query (a huge BLOB/string cell, or an enormous result) would otherwise pin its
+// grown backing in the pool indefinitely. putScratch / putJSONBuf drop a backing
+// that grew past these caps before returning it — trading a rare re-grow for
+// bounded steady-state pool memory. A normal row/result stays well under the caps
+// and is pooled intact.
+const (
+	maxPooledValbuf  = 1 << 20  // 1 MiB — one row's packed value bytes
+	maxPooledKeybuf  = 64 << 10 // 64 KiB — packed column names (large only for absurd schemas)
+	maxPooledJSONBuf = 1 << 20  // 1 MiB — one fetchall_json body
+)
+
+// putScratch returns sc to the pool, dropping the value/key backings if an outlier
+// row grew them past the caps so they do not linger on this worker.
+func putScratch(sc *rowScratch) {
+	if cap(sc.valbuf) > maxPooledValbuf {
+		sc.valbuf = nil
+	}
+	if cap(sc.keybuf) > maxPooledKeybuf {
+		sc.keybuf = nil
+	}
+	scratchPool.Put(sc)
+}
+
 // jsonBufPool holds reusable JSON output buffers for hazedb_fetchall_json, so a
 // worker reuses one backing array instead of allocating (and growing from a tiny
 // seed) per call. *[]byte, not []byte, so Put stores the grown slice header
 // without boxing it into a fresh allocation.
 var jsonBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 1024); return &b }}
+
+// putJSONBuf returns bp to the pool, dropping the body backing if an outlier result
+// grew it past the cap (the New seed re-grows from nil on the next big call).
+func putJSONBuf(bp *[]byte) {
+	if cap(*bp) > maxPooledJSONBuf {
+		*bp = nil
+	}
+	jsonBufPool.Put(bp)
+}
 
 // fillKeys packs the column names into keybuf + (n+1) offsets, once per query
 // since the keys are identical for every row.
@@ -391,7 +424,7 @@ func hazedb_fetch(sql *C.zend_string, args *C.zval) (ret unsafe.Pointer) {
 	sc := scratchPool.Get().(*rowScratch)
 	sc.fillKeys(cols)
 	res := unsafe.Pointer(sc.rowToAssoc(row))
-	scratchPool.Put(sc)
+	putScratch(sc)
 	return res
 }
 
@@ -427,7 +460,7 @@ func hazedb_fetchall(sql *C.zend_string, args *C.zval) (ret unsafe.Pointer) {
 		C.hzd_push_arr(out, sc.rowToAssoc(row))
 		return true
 	})
-	scratchPool.Put(sc)
+	putScratch(sc)
 	if err != nil {
 		return nil
 	}
@@ -460,12 +493,12 @@ func hazedb_fetchall_json(sql *C.zend_string, args *C.zval) (ret unsafe.Pointer)
 	bp := jsonBufPool.Get().(*[]byte)
 	_, body, err := db.QueryJSONInto((*bp)[:0], zendStringView(sql), vals...)
 	if err != nil {
-		jsonBufPool.Put(bp)
+		putJSONBuf(bp)
 		return nil
 	}
 	*bp = body // keep the grown backing for the next call on this worker
 	res := phpStringFromBytes(body)
-	jsonBufPool.Put(bp)
+	putJSONBuf(bp)
 	return res
 }
 
