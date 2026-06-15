@@ -15,6 +15,7 @@ var (
 	ErrWALVersion        = errors.New("hazedb: WAL version mismatch")
 	ErrTableExists       = errors.New("hazedb: table already exists")
 	ErrTxUnsupported     = errors.New("hazedb: operation not supported in a transaction")
+	ErrTxConflict        = errors.New("hazedb: table changed (dropped/recreated) during the transaction")
 	ErrBatchTooLarge     = errors.New("hazedb: atomic batch too large")
 	ErrCapacity          = errors.New("hazedb: store byte capacity exceeded")
 	ErrReservedName      = errors.New("hazedb: table name uses the reserved _hz_ prefix")

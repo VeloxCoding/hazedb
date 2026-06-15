@@ -444,6 +444,94 @@ func TestTransactionConcurrentConserves(t *testing.T) {
 	}
 }
 
+// --- Regression: commit hardening (txn.go review findings) ---
+
+// A TXN whose WAL write fails must leave the byte budget intact: budget.total
+// must still equal the sum of the shard tallies, because nothing was applied.
+// Covers both a net-positive batch (the reservation is rolled back) and a
+// net-negative one (the release is deferred until the WAL write succeeds).
+func TestTxnWALFailureBudgetReconciles(t *testing.T) {
+	tdef := TableDef{Name: "t", Columns: []ColumnDef{
+		{Name: "id", Type: TypeUUID, PK: true}, {Name: "n", Type: TypeInt}}}
+	for _, dir := range []string{"insert", "delete"} {
+		t.Run(dir, func(t *testing.T) {
+			db, err := Open(Options{
+				Schema:  Schema{Tables: []TableDef{tdef}},
+				WALPath: filepath.Join(t.TempDir(), "t.wal"), drainInterval: -1,
+				MaxBytes: 1 << 30, // generous: reserve never rejects, isolating the WAL-failure rollback
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if _, err := db.Exec("INSERT INTO t (id, n) VALUES (?, ?)", tid(1), 1); err != nil {
+				t.Fatal(err)
+			}
+			db.wal.failWrites = true // the commit's WAL write will fail
+			terr := db.Transaction(func(tx *Tx) error {
+				if dir == "insert" {
+					_, e := tx.Exec("INSERT INTO t (id, n) VALUES (?, ?)", tid(2), 2)
+					return e
+				}
+				_, e := tx.Exec("DELETE FROM t WHERE id = ?", tid(1))
+				return e
+			})
+			if terr == nil {
+				t.Fatal("expected a WAL failure error from the commit")
+			}
+			if total, walk := db.budget.total.Load(), budgetTotal(db); total != walk {
+				t.Fatalf("budget corrupted after WAL failure: total=%d, sum-of-shards=%d", total, walk)
+			}
+		})
+	}
+}
+
+// A transaction whose table is dropped after staging must NOT commit (it would
+// write a TXN mutation for a tableID a concurrent DROP already removed, failing
+// replay). The commit rejects with ErrTxConflict.
+func TestTxnRejectsDroppedTable(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE t (id uuid primary key, n int)")
+	err := db.Transaction(func(tx *Tx) error {
+		if _, e := tx.Exec("INSERT INTO t (id, n) VALUES (?, ?)", tid(1), 1); e != nil {
+			return e
+		}
+		db.Exec("DROP TABLE t") // table dropped while the tx is staged
+		return nil
+	})
+	if !errors.Is(err, ErrTxConflict) {
+		t.Fatalf("want ErrTxConflict, got %v", err)
+	}
+}
+
+// A commit must not apply (or write a WAL record) after the DB is closed.
+func TestTxnRejectsCommitAfterClose(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE t (id uuid primary key, n int)")
+	tx := &Tx{db: db, cat: db.cat.Load()}
+	if _, err := tx.stage("INSERT INTO t (id, n) VALUES (?, ?)", tid(1), 1); err != nil {
+		t.Fatal(err)
+	}
+	db.Close() // close between staging and commit
+	if err := tx.commit(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("want ErrClosed, got %v", err)
+	}
+}
+
+// tx.Exec must reject an arg-count mismatch in either direction, like the normal
+// write path — extra args are not silently accepted.
+func TestTxnRejectsArgCountMismatch(t *testing.T) {
+	db := openEmpty(t)
+	db.Exec("CREATE TABLE t (id uuid primary key, n int)")
+	err := db.Transaction(func(tx *Tx) error {
+		_, e := tx.Exec("INSERT INTO t (id, n) VALUES (?, ?)", tid(1), 1, "extra")
+		return e
+	})
+	if !errors.Is(err, ErrParamMismatch) {
+		t.Fatalf("want ErrParamMismatch, got %v", err)
+	}
+}
+
 // Measures the commit path (lock-all-shards + one TXN envelope) for a 2-row
 // transfer. This is the number that justifies (or revisits) the lock-all-shards
 // v1 choice; transactions are opt-in, so this is not the point-op hot path.

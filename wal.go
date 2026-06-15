@@ -265,6 +265,9 @@ func (w *wal) close() error {
 		w.mu.Lock()
 		defer w.mu.Unlock()
 		w.closeErr = w.flushLocked()
+		if w.err == nil {
+			w.err = ErrClosed // reject any post-close writeRecord (e.g. a commit racing Close)
+		}
 	})
 	return w.closeErr
 }

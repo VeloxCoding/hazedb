@@ -109,6 +109,12 @@ func (tx *Tx) stage(sql string, args ...any) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	// Same arg-count guard as the normal write path (execWrite → checkArgs): a
+	// transaction must reject a count mismatch in either direction, not silently
+	// accept extra args.
+	if err := pl.checkArgs(len(vargs)); err != nil {
+		return 0, err
+	}
 	switch pl.st.(type) {
 	case *insertStmt:
 		// One stagedMut per VALUES tuple (multi-row INSERT stages every row).
@@ -198,6 +204,24 @@ func (tx *Tx) commit() error {
 		return fmt.Errorf("%w: %d mutations exceeds the %d-row limit; split into smaller INSERTs/transactions",
 			ErrBatchTooLarge, len(tx.staged), maxTxnMutations)
 	}
+	// Close may have run while the closure was staging (Transaction only checks
+	// closed before fn). Re-check here so a commit never applies to — or writes a
+	// WAL record into — a closing DB. The WAL itself also rejects writes after
+	// close (wal.close sets the sticky error), closing the narrow race where Close
+	// lands between this check and the WAL write.
+	if tx.db.closed.Load() {
+		return ErrClosed
+	}
+	// Reject if the staged table was dropped (or dropped+recreated) since tx start:
+	// the staged plans bound tx.rt/tableID against tx.cat, and committing a TXN
+	// mutation for a tableID a concurrent DROP already removed (its drop record
+	// precedes our envelope in the WAL) would fail replay with "unknown table id".
+	// Check tx.rt is still the live table at its tableID (pointer identity), so an
+	// unrelated CREATE/DROP of a different table does not falsely abort.
+	cur := tx.db.cat.Load()
+	if int(tx.rt.tableID) >= len(cur.byID) || cur.byID[tx.rt.tableID] != tx.rt {
+		return fmt.Errorf("%w: %q", ErrTxConflict, tx.rt.name())
+	}
 	t := tx.rt.table
 	if t.pkDir != nil {
 		t.pkDir.mu.Lock()
@@ -286,16 +310,17 @@ func (tx *Tx) commit() error {
 
 	// Admission control, BEFORE the WAL write so an over-cap batch is rejected
 	// with nothing applied — the txn path's counterpart to insertJournaled's
-	// reserve. A net-positive batch reserves against MaxBytes (rejects on
-	// overflow); a net-negative one (mostly deletes) just releases. budget.total
-	// moves by byteDelta either way, and the apply below moves each shard's tally
-	// by the same per-act costs, so the two stay equal.
+	// reserve. A net-positive batch reserves against MaxBytes now (rejects on
+	// overflow) and ROLLS THE RESERVATION BACK if the WAL write then fails. A
+	// net-negative batch (mostly deletes) DEFERS its release until the WAL write
+	// succeeds — releasing before would free capacity for rows that, on a WAL
+	// failure, stay live. Either way budget.total ends up moved by byteDelta exactly
+	// when the apply below moves the shard tallies by the same total, so they stay
+	// equal (and a failed commit moves neither).
 	if byteDelta > 0 {
 		if !t.budget.reserve(byteDelta) {
 			return ErrCapacity
 		}
-	} else if byteDelta < 0 {
-		t.budget.release(-byteDelta)
 	}
 
 	if tx.db.wal != nil {
@@ -323,8 +348,14 @@ func (tx *Tx) commit() error {
 		werr := tx.db.wal.writeRecord(recTxn, buf)
 		tx.db.scratch.put(bp)
 		if werr != nil {
+			if byteDelta > 0 {
+				t.budget.release(byteDelta) // roll back the reservation — nothing applied
+			}
 			return werr // nothing applied yet
 		}
+	}
+	if byteDelta < 0 {
+		t.budget.release(-byteDelta) // WAL committed: now release the freed capacity
 	}
 
 	// Apply in statement order; an earlier INSERT is physically present before
