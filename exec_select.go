@@ -492,6 +492,36 @@ func (db *DB) execSelectIdxOne(pl *plan, args []Value) ([]string, Row, error) {
 	if st.limit == 0 {
 		return colNames, nil, nil
 	}
+	// Point-read fast path (mirrors execSelectIdx): a single indexed equality that
+	// fully covers the WHERE (idxExact) with no dirty overlay and a single live hit
+	// → fetch + project that one row directly — no eval context, bucket copy, or
+	// per-row matcher. A multi-hit bucket or any dirty row falls through to the
+	// general first-match loop below. The caller (queryRowPlanV) guarantees no
+	// ORDER BY / OFFSET for this path, so the lone hit is the answer.
+	if pl.idxExact && len(pl.idxCols) == 1 && tbl.readDirtyCount.Load() == 0 {
+		keyVal, err := evalLitOrParamValue(pl.idxSrcs[0], args)
+		if err != nil {
+			return nil, nil, err
+		}
+		if keyVal.IsNull() {
+			return colNames, nil, nil
+		}
+		if si := tbl.indexFor(pl.idxCols[0]); si != nil {
+			pk, found, one := si.lookupOne(keyOf(keyVal))
+			if !found {
+				return colNames, nil, nil
+			}
+			if one {
+				if st.starAll {
+					r, _ := tbl.getByPK(pk)
+					return colNames, r, nil
+				}
+				pr, _ := tbl.getByPKProject(pk, pl.projOrdinals)
+				return colNames, pr, nil
+			}
+			// found && !one: a multi-hit bucket → fall through to the general path.
+		}
+	}
 	ctx := evalCtx{cols: tbl.def.colByName, args: args}
 	var pks []UUID
 	for i, ord := range pl.idxCols {
