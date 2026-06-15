@@ -38,6 +38,24 @@ $js  = hazedb_fetchall_json('SELECT name, age FROM users WHERE age >= ? ORDER BY
 ok('fetchall_ok',      is_array($all) && count($all) === 2 && $all[0]['name'] === 'alice' && $all[1]['name'] === 'carol');
 ok('fetchall_json_ok', json_encode($all) === $js);
 
+// --- new behaviour: mandatory placeholders, UUID coercion by column type ---
+
+// Inline value literals are rejected at prepare — exec returns -1 (not applied).
+ok('literal_rejected_ok', hazedb_exec("UPDATE users SET age = 99 WHERE name = 'alice'") === -1);
+
+// $args must be a positional LIST — an associative array is rejected (null), not
+// read by index (which would turn the missing index 0 into NULL and miss).
+ok('assoc_rejected_ok', hazedb_fetch('SELECT name FROM users WHERE id = ?', ['id' => $a]) === null);
+
+// A UUID-shaped value in a TEXT column stays a STRING (coercion is by column type,
+// not value shape): store one, then look it up by that same string and match it.
+hazedb_exec('DROP TABLE notes');
+hazedb_exec('CREATE TABLE notes (id uuid primary key, ref text, INDEX (ref))');
+$reflike = make_uuid();   // a canonical-UUID-form string, but the column is TEXT
+hazedb_exec('INSERT INTO notes (id, ref) VALUES (?, ?)', [make_uuid(), $reflike]);
+$note = hazedb_fetch('SELECT ref FROM notes WHERE ref = ?', $reflike);
+ok('uuid_text_ok', $note !== null && $note['ref'] === $reflike);
+
 // meta — store-size overview as a JSON string; decode and find the users table.
 $meta = hazedb_meta();
 $m = $meta !== null ? json_decode($meta, true) : null;

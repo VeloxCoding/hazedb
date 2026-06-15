@@ -34,6 +34,7 @@ MSYS_NO_PATHCONV=1 docker run --rm \
         ok=1
         for marker in ping=pong exec_ok=yes exec_int_ok=yes fetch_ok=yes \
                       fetch_missing_ok=yes fetch_scalar_ok=yes fetchall_ok=yes fetchall_json_ok=yes \
+                      literal_rejected_ok=yes assoc_rejected_ok=yes uuid_text_ok=yes \
                       meta_ok=yes; do
             echo "$OUT" | grep -q "^$marker$" || { echo "MISSING: $marker"; ok=0; }
         done
