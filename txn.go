@@ -166,9 +166,8 @@ func (tx *Tx) resolvePK(pl *plan, args []Value) (UUID, error) {
 // txAct is a resolved, ready-to-apply effect produced by the commit walk.
 // cost is the signed byte-tally change this effect makes (insert +rowCost,
 // delete -rowCost, update the new−old delta) — computed once during the walk,
-// summed for the budget reserve, and reused in apply so the tally and the cap
-// counter both move with the transaction (the single-row paths do this; the txn
-// path used to bypass both).
+// summed for the budget reservation, and reused in apply so the per-shard byte
+// tally and the cap counter both move with the transaction by the same amount.
 type txAct struct {
 	kind uint8
 	pk   UUID
@@ -176,6 +175,13 @@ type txAct struct {
 	ords []int // opUpdate: the SET column ordinals, for the WAL update encoding
 	cost int64 // signed byte delta (see txAct doc)
 }
+
+// maxTxnMutations caps the mutations in one atomic commit (a transaction or a
+// multi-row INSERT). It bounds how long the touched shard locks are held and
+// the commit's transient memory, and keeps the count well under the uint16 the
+// recTxn envelope encodes it in. Large loads are split into smaller batches —
+// the per-batch fsync amortisation is already near-complete by ~1000 rows.
+const maxTxnMutations = 1000
 
 // commit applies every staged mutation atomically. It holds the table's
 // pkDirectory write lock (partitioned tables) and only the shards the
@@ -189,13 +195,6 @@ type txAct struct {
 // journal the whole group as ONE TXN envelope BEFORE applying — so a WAL
 // failure aborts with nothing applied, and a committed envelope always replays
 // cleanly.
-// maxTxnMutations caps the mutations in one atomic commit (a transaction or a
-// multi-row INSERT). It bounds how long the touched shard locks are held and
-// the commit's transient memory, and keeps the count well under the uint16 the
-// recTxn envelope encodes it in. Large loads are split into smaller batches —
-// the per-batch fsync amortisation is already near-complete by ~1000 rows.
-const maxTxnMutations = 1000
-
 func (tx *Tx) commit() error {
 	if len(tx.staged) == 0 {
 		return nil
@@ -324,11 +323,10 @@ func (tx *Tx) commit() error {
 	}
 
 	if tx.db.wal != nil {
-		// Encode the TXN envelope directly into one pooled buffer — nmut, then each
+		// Encode the TXN envelope into one pooled buffer: nmut, then each
 		// sub-mutation as a length-prefixed op|tableID|body, backpatching the length
-		// after encoding in place. Avoids the old per-row encode-into-nil ([]byte
-		// per act) plus a second copy into the envelope, and is skipped entirely
-		// when there is no WAL (memory-only built the bodies for nothing).
+		// in place after encoding. One buffer, so no per-act []byte and no second
+		// copy into the envelope. Skipped entirely when there is no WAL.
 		bp := tx.db.scratch.get()
 		buf := appendU16LE((*bp)[:0], uint16(len(acts)))
 		for _, a := range acts {
@@ -447,13 +445,14 @@ func computeSets(pl *plan, args []Value, row Row) ([]Value, error) {
 
 // --- lock-free apply/read helpers for transaction commit ---
 //
-// commit holds the pkDirectory write lock (partitioned) and every shard lock,
-// so these take NO lock themselves — they are the lock-free bodies of the
-// corresponding store methods. Replace/Delete assume the PK exists (commit's
-// overlay walk guarantees it).
+// commit holds the pkDirectory write lock (partitioned) and the lock of every
+// shard the transaction touches — which is every shard these helpers address,
+// since they only ever run on staged PKs. So they take NO lock themselves: they
+// are the lock-free bodies of the corresponding store methods. Replace/Delete
+// assume the PK exists (commit's overlay walk guarantees it).
 
-// txGetLocked returns the live row for pk without cloning (caller is under all
-// locks). The caller clones before mutating.
+// txGetLocked returns the live row for pk without cloning (caller already holds
+// pk's shard lock). The caller clones before mutating.
 func (t *table) txGetLocked(pk UUID) (Row, bool) {
 	if t.pkDir != nil {
 		loc, ok := t.pkDir.idx[pk]
