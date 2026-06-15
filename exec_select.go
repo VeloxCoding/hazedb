@@ -921,40 +921,48 @@ func (db *DB) orderedWalk(pl *plan, args []Value, snap []ordEntry, dirtyKey func
 	dc, dirtySet := tbl.buildDirtyCands(matches, dirtyKey)
 
 	eff := fetchBound(st.limit, st.offset) // collect offset+limit, drop offset at the end
+	width := len(pl.projOrdinals)
+	if st.starAll {
+		width = len(tbl.def.def.Columns)
+	}
+	// A bounded walk (eff>=0) carves every kept row from ONE presized backing — one
+	// allocation for the result instead of one per row; it collects exactly eff rows
+	// (done() stops the merge), so the backing never regrows. An unbounded walk
+	// projects per row (a regrowing shared backing would retain superseded
+	// generations). Mirrors the join ordered-walk paths.
+	bounded := eff >= 0
+	var packed []Value
 	capHint := eff
-	if capHint < 0 || capHint > 1024 {
+	if !bounded || capHint > 1024 {
 		capHint = 1024
+	}
+	if bounded {
+		packed = make([]Value, 0, eff*width)
 	}
 	out := make([]Row, 0, capHint)
 	done := func() bool { return eff >= 0 && len(out) >= eff }
 	emitIdx := func(pk UUID) {
-		if len(residual) == 0 { // snap fully satisfies the filter: one clone, projected
-			if st.starAll {
-				if r, ok := tbl.getByPK(pk); ok {
-					out = append(out, r)
-				}
-			} else if pr, ok := tbl.getByPKProject(pk, pl.projOrdinals); ok {
-				out = append(out, pr)
+		// nil pred when the snap fully satisfies the filter (no residual): the fetch
+		// just projects. With a residual, appendMatchProject re-checks it under the
+		// shard lock and clones only the projection in one pass.
+		var pred func(Row) bool
+		if len(residual) != 0 {
+			pred = passResidual
+		}
+		if bounded {
+			start := len(packed)
+			var ok bool
+			if packed, ok = tbl.appendMatchProject(pk, pred, pl.projOrdinals, st.starAll, packed); ok {
+				out = append(out, Row(packed[start:len(packed):len(packed)]))
 			}
 			return
 		}
-		// Residual present: filter under the shard lock and clone only the
-		// projection in one pass (appendMatchProject), instead of cloning the whole
-		// row (getByPK) and then cloning the projection again.
-		n := len(pl.projOrdinals)
-		if st.starAll {
-			n = len(tbl.def.def.Columns)
-		}
-		if cells, ok := tbl.appendMatchProject(pk, passResidual, pl.projOrdinals, st.starAll, make([]Value, 0, n)); ok {
+		if cells, ok := tbl.appendMatchProject(pk, pred, pl.projOrdinals, st.starAll, make([]Value, 0, width)); ok {
 			out = append(out, cells)
 		}
 	}
 	emitDirty := func(row Row) { // dc rows are owned clones, already matched
-		if st.starAll {
-			out = append(out, row)
-		} else {
-			out = append(out, projectClone(row, pl.projOrdinals))
-		}
+		out, packed = appendProjected(out, packed, row, pl.projOrdinals, st.starAll, bounded)
 	}
 	mergeOrderedStreams(snap, dc, dirtySet, st.orderDesc, done, emitIdx, emitDirty)
 	return colNames, sliceOffsetLimit(out, st.offset, st.limit), nil
