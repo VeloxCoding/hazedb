@@ -12,24 +12,13 @@
 // BYTES→base64 string, UUID→canonical string.
 //
 // JSON arg → Value: number→INT (integers only — hazedb has no float type),
-// bool→BOOL, null→NULL, string→STRING UNLESS it parses as a canonical UUID, in
-// which case→UUID. The UUID rule lets the string-only PHP/HTTP surface address
-// and insert UUID columns; the canonical 36-char hyphenated form is specific
-// enough that a real text value rarely collides.
-//
-// KNOWN LIMITATION (adapter builders, ArgsFromJSON + QueryArgs): this is a
-// format GUESS, not schema-driven coercion — the column type is unknown at
-// arg-decode. So a STRING column holding a value in exact canonical-UUID form
-// is offered to a WHERE/lookup as a UUID on these text surfaces, and because
-// `=`/`!=` compare by Kind (Value.Equal, never matches a STRING column) while
-// range / ORDER BY compare by text (Value.Compare, matches), results are
-// INCONSISTENT for that edge value: `col = ?` misses it, `col != ?` over-
-// includes the row. It is a parameter-smuggling edge, not RCE. The native
-// []any / typed-Value path (toValue) does NOT guess — pass a UUID for a UUID
-// column; a string stays STRING. The principled fix is to coerce by the target
-// column's type, as buildRowFromTmpl already does for INSERT; until then,
-// treat canonical-UUID-form text in STRING columns as unsupported on the text
-// adapters.
+// bool→BOOL, null→NULL, string→STRING. A string stays a STRING here regardless of
+// shape; the type is NOT guessed at the arg boundary. A string destined for a UUID
+// column is parsed into a UUID later, driven by the COLUMN type the planner knows
+// (coerceParams / coerceToUUID / buildRowFromTmpl), so a UUID column addressed by a
+// string works and a STRING column holding a canonical-UUID-form value stays text.
+// Same rule for the native []any / typed-Value path (toValue) — one consistent
+// behaviour across every arg surface.
 
 package hazedb
 
@@ -276,9 +265,10 @@ func ErrorJSON(msg string) []byte {
 //
 //   - ""                  → no args
 //   - starts with '['     → a JSON array (ArgsFromJSON; multi-arg / typed / writes)
-//   - anything else       → ONE positional arg passed directly: a canonical
-//     UUID string → UUID, otherwise the STRING verbatim (any surrounding
-//     whitespace is part of the value and is preserved)
+//   - anything else       → ONE positional arg passed directly as a STRING,
+//     verbatim (surrounding whitespace is part of the value). A UUID column
+//     addressed this way is parsed from the string downstream by column type —
+//     see the file header.
 //
 // The direct form lets a caller pass a key it already has — e.g. the UUID from
 // a clicked link — straight into `WHERE id = ?` with no json_encode wrapping,
@@ -292,17 +282,14 @@ func QueryArgs(s string) ([]any, error) {
 	if t[0] == '[' {
 		return ArgsFromJSON([]byte(t))
 	}
-	if u, ok := ParseUUIDOk(t); ok {
-		return []any{u}, nil
-	}
-	// Direct string: return the ORIGINAL s, not the trimmed t — leading/trailing
-	// spaces can be part of the value. The trim only classifies (empty / '[' / UUID).
+	// One positional STRING arg, returned verbatim (the trim only classified
+	// empty / '['). A UUID column receiving it is coerced downstream by column type.
 	return []any{s}, nil
 }
 
 // ArgsFromJSON parses a JSON array of positional SQL args into the []any
-// db.Query / db.Exec accept. Empty/nil input yields no args. See the file
-// header for the type mapping (notably the canonical-UUID-string rule).
+// db.Query / db.Exec accept. Empty/nil input yields no args. See the file header
+// for the type mapping (strings stay STRING here; UUID coercion is by column type).
 func ArgsFromJSON(raw []byte) ([]any, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil, nil
@@ -327,11 +314,7 @@ func ArgsFromJSON(raw []byte) ([]any, error) {
 		case bool:
 			out[i] = x
 		case string:
-			if u, ok := ParseUUIDOk(x); ok {
-				out[i] = u
-			} else {
-				out[i] = x
-			}
+			out[i] = x
 		case json.Number:
 			n, err := x.Int64()
 			if err != nil {

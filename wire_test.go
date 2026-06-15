@@ -175,34 +175,24 @@ func TestQueryArgsPreservesStringSpaces(t *testing.T) {
 	}
 }
 
-// TestUUIDLookingStringArgCoercesToUUID pins the documented KNOWN LIMITATION: a
-// string in exact canonical-UUID form is coerced to UUID at the text-adapter
-// boundary (a format guess, not schema-aware), on both arg surfaces. A real STRING
-// column holding such a value is unsupported there — this keeps the edge intentional.
-func TestUUIDLookingStringArgCoercesToUUID(t *testing.T) {
+// TestArgsKeepStringsVerbatim pins the boundary contract: the text/JSON arg
+// surfaces do NOT guess types by shape — a canonical-UUID-form string stays a
+// STRING here. UUID coercion happens downstream, driven by the column type (see
+// the param-coercion DB tests for the end-to-end resolution).
+func TestArgsKeepStringsVerbatim(t *testing.T) {
 	id := tid(42).String()
 	qa, err := QueryArgs(id)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(qa) != 1 || qa[0] != id {
+		t.Fatalf("QueryArgs should keep the string verbatim (not a UUID), got %#v", qa)
+	}
 	ja, err := ArgsFromJSON([]byte(`["` + id + `"]`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, args := range [][]any{qa, ja} {
-		if len(args) != 1 {
-			t.Fatalf("args=%v", args)
-		}
-		if _, ok := args[0].(UUID); !ok {
-			t.Fatalf("canonical-UUID string should coerce to UUID, got %T", args[0])
-		}
-	}
-	// A non-UUID string stays a string.
-	na, err := QueryArgs("not-a-uuid")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if na[0] != "not-a-uuid" {
-		t.Fatalf("non-UUID string should stay verbatim, got %#v", na[0])
+	if len(ja) != 1 || ja[0] != id {
+		t.Fatalf("ArgsFromJSON should keep the string verbatim (not a UUID), got %#v", ja)
 	}
 }

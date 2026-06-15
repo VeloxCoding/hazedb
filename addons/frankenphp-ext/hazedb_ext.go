@@ -169,10 +169,13 @@ func phpStringFromBytes(b []byte) unsafe.Pointer {
 }
 
 // valueFromZval converts one scalar zval to a Value. Type mapping: int -> INT,
-// true/false -> BOOL, null -> NULL, string -> STRING unless it parses as a
-// canonical UUID -> UUID. Strings are copied (GoStringN) so storage never
-// aliases PHP memory. ok=false on a non-scalar / unsupported type (float,
-// nested array).
+// true/false -> BOOL, null -> NULL, string -> STRING. A PHP string stays a STRING
+// regardless of shape; the type is not guessed here. A string destined for a UUID
+// column is parsed into a UUID downstream, driven by the column type the planner
+// knows (the core's coerceParams), so a UUID column addressed by a PHP string works
+// and a TEXT column holding a canonical-UUID-form value stays text. Strings are
+// copied (GoStringN) so storage never aliases PHP memory. ok=false on a non-scalar /
+// unsupported type (float, nested array).
 func valueFromZval(z *C.zval) (hazedb.Value, bool) {
 	switch C.hzd_zval_kind(z) {
 	case 0:
@@ -184,11 +187,7 @@ func valueFromZval(z *C.zval) (hazedb.Value, bool) {
 	case 3:
 		return hazedb.Int(int64(C.hzd_zval_long(z))), true
 	case 4:
-		s := C.GoStringN(C.hzd_zval_strptr(z), C.int(C.hzd_zval_strlen(z)))
-		if u, ok := hazedb.ParseUUIDOk(s); ok {
-			return hazedb.UUIDVal(u), true
-		}
-		return hazedb.Str(s), true
+		return hazedb.Str(C.GoStringN(C.hzd_zval_strptr(z), C.int(C.hzd_zval_strlen(z)))), true
 	default: // double, array, or other — not a positional scalar
 		return hazedb.Value{}, false
 	}

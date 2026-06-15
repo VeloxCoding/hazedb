@@ -129,6 +129,9 @@ func (db *DB) execWrite(pl *plan, vargs []Value) (int, error) {
 	if err := pl.checkArgs(len(vargs)); err != nil {
 		return 0, err
 	}
+	if err := coerceParams(pl, vargs); err != nil {
+		return 0, err
+	}
 	switch s := pl.st.(type) {
 	case *createStmt:
 		return 0, db.createTable(s.def)

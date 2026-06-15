@@ -90,6 +90,9 @@ func (db *DB) queryPlanV(pl *plan, vargs []Value) ([]string, []Row, error) {
 	if err := pl.checkArgs(len(vargs)); err != nil {
 		return nil, nil, err
 	}
+	if err := coerceParams(pl, vargs); err != nil {
+		return nil, nil, err
+	}
 	if pl.countStar {
 		n, err := db.countRows(pl, vargs)
 		if err != nil {
@@ -168,6 +171,9 @@ func (db *DB) queryRowPlanV(pl *plan, vargs []Value) ([]string, Row, error) {
 	if err := pl.checkArgs(len(vargs)); err != nil {
 		return nil, nil, err
 	}
+	if err := coerceParams(pl, vargs); err != nil {
+		return nil, nil, err
+	}
 	if pl.countStar {
 		n, err := db.countRows(pl, vargs)
 		if err != nil {
@@ -244,7 +250,11 @@ func (db *DB) QueryRowJSONByIndex(dst []byte, sql string, key Value) (out []byte
 		return dst, false, fmt.Errorf("hazedb: QueryRowJSONByIndex requires a single-indexed-equality point lookup (WHERE <indexed> = ? LIMIT 1), no ORDER BY or OFFSET")
 	}
 	tbl := pl.rt
-	ctx := evalCtx{cols: tbl.def.colByName, args: []Value{key}}
+	kargs := []Value{key}
+	if err := coerceParams(pl, kargs); err != nil {
+		return dst, false, err
+	}
+	ctx := evalCtx{cols: tbl.def.colByName, args: kargs}
 	keyVal, err := evalExpr(pl.idxSrcs[0], &ctx)
 	if err != nil {
 		return dst, false, err
@@ -333,6 +343,7 @@ func (db *DB) prepare(sql string, cat *catalog) (*plan, error) {
 		return nil, err
 	}
 	pl.nparams = nparams
+	pl.bindParamUUIDCoercion()
 	db.stmtCache.Store(sql, pl) // overwrite any stale-version entry
 	return pl, nil
 }
@@ -353,5 +364,6 @@ func (db *DB) prepareTrusted(sql string, cat *catalog) (*plan, error) {
 		return nil, err
 	}
 	pl.nparams = nparams
+	pl.bindParamUUIDCoercion()
 	return pl, nil
 }

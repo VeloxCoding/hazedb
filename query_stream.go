@@ -22,6 +22,9 @@ import (
 // selectEach runs a SELECT plan and calls visit once per result row. A COUNT(*)
 // plan emits exactly one row, [count]; every other plan streams via streamSelect.
 func (db *DB) selectEach(pl *plan, args []Value, visit func(row Row) bool) ([]string, error) {
+	if err := coerceParams(pl, args); err != nil {
+		return nil, err
+	}
 	if pl.countStar {
 		n, err := db.countRows(pl, args)
 		if err != nil {

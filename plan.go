@@ -122,6 +122,12 @@ type plan struct {
 	// it: extra args would otherwise be silently ignored, and too few would overrun
 	// a per-param bounds check.
 	nparams int
+	// paramWantUUID[i] marks parameter i as bound to a UUID column — compared to it
+	// in WHERE or assigned to it in SET — so coerceParams parses its string arg into
+	// a UUID before execution. The text/JSON/PHP arg surfaces no longer guess UUIDs
+	// by string shape; the column type decides, recorded here at plan time where it
+	// is known. nil when no parameter targets a UUID column. See bindParamUUIDCoercion.
+	paramWantUUID []bool
 	// SELECT projection: ordinals into the row, in output order. nil if
 	// SELECT *.
 	projOrdinals []int
@@ -710,6 +716,133 @@ func coerceToUUID(v Value) (UUID, error) {
 		return ParseUUID(v.Str())
 	}
 	return UUID{}, fmt.Errorf("%w: PK lookup expects UUID, got kind %d", ErrTypeMismatch, v.Kind)
+}
+
+// bindParamUUIDCoercion records, per parameter, whether its value must be coerced
+// to a UUID before execution — i.e. the parameter is compared to a UUID column in
+// WHERE or assigned to one in SET. String LITERALS in those same positions are
+// rewritten to UUIDs in place (once; the plan is cached, and inline literals reach
+// only a trusted seed script — the normal path bans them). Parameters and literals
+// anywhere else are left untouched. Called once per plan, after the WHERE colRefs
+// are bound (validateExpr / planJoin) and nparams is set.
+func (pl *plan) bindParamUUIDCoercion() {
+	// isUUIDCol reports whether a colRef names a UUID column. Join: ord is a bound
+	// global concat ordinal into left||right. Single-table: the bound ordinal, or a
+	// name lookup if it is unbound.
+	isUUIDCol := func(cr *colRef) bool {
+		if jp := pl.joinPlan; jp != nil {
+			ord := cr.ord
+			if ord < 0 {
+				return false
+			}
+			if ord < jp.nLeft {
+				cols := jp.leftRT.def.def.Columns
+				return ord < len(cols) && cols[ord].Type == TypeUUID
+			}
+			cols := jp.rightRT.def.def.Columns
+			r := ord - jp.nLeft
+			return r < len(cols) && cols[r].Type == TypeUUID
+		}
+		ord := cr.ord
+		if ord < 0 {
+			var ok bool
+			if ord, ok = pl.table.colByName[cr.name]; !ok {
+				return false
+			}
+		}
+		cols := pl.table.def.Columns
+		return ord >= 0 && ord < len(cols) && cols[ord].Type == TypeUUID
+	}
+	// markValue marks the param (or rewrites a string literal) when its target column
+	// is UUID.
+	markValue := func(val expr) {
+		switch v := val.(type) {
+		case *paramRef:
+			if v.index >= 0 && v.index < len(pl.paramWantUUID) {
+				pl.paramWantUUID[v.index] = true
+			}
+		case *litValue:
+			if v.v.Kind == KindString {
+				if u, err := ParseUUID(v.v.Str()); err == nil {
+					v.v = UUIDVal(u) // a non-UUID literal stays a string; compare/validate handles it
+				}
+			}
+		}
+	}
+	// walkWhere visits each `col OP value` comparison (either operand order) under
+	// AND/OR/NOT; a param inside any other expression has no single column type and
+	// is left untyped.
+	var walkWhere func(e expr)
+	walkWhere = func(e expr) {
+		switch x := e.(type) {
+		case *binOp:
+			switch x.op {
+			case tkAnd, tkOr:
+				walkWhere(x.lhs)
+				walkWhere(x.rhs)
+			case tkEq, tkNeq, tkLt, tkLte, tkGt, tkGte:
+				if cr, ok := x.lhs.(*colRef); ok && isUUIDCol(cr) {
+					markValue(x.rhs)
+				}
+				if cr, ok := x.rhs.(*colRef); ok && isUUIDCol(cr) {
+					markValue(x.lhs)
+				}
+			}
+		case *notExpr:
+			walkWhere(x.e)
+		}
+	}
+
+	if pl.nparams > 0 {
+		pl.paramWantUUID = make([]bool, pl.nparams)
+	}
+	switch s := pl.st.(type) {
+	case *selectStmt:
+		walkWhere(s.where)
+	case *deleteStmt:
+		walkWhere(s.where)
+	case *updateStmt:
+		walkWhere(s.where)
+		cols := pl.table.def.Columns
+		for i := range s.sets {
+			if ord, ok := pl.table.colByName[s.sets[i].col]; ok && ord < len(cols) && cols[ord].Type == TypeUUID {
+				markValue(s.sets[i].val)
+			}
+		}
+	}
+	// Drop the slice when no parameter targets a UUID column, so coerceParams' empty
+	// fast path fires and a plan with no UUID params carries no per-plan baggage.
+	allFalse := true
+	for _, w := range pl.paramWantUUID {
+		if w {
+			allFalse = false
+			break
+		}
+	}
+	if allFalse {
+		pl.paramWantUUID = nil
+	}
+}
+
+// coerceParams parses any string arg bound to a UUID column into a UUID, once,
+// before execution — the column type (recorded in pl.paramWantUUID at plan time)
+// decides, so a string destined for a non-UUID column stays a string. Mutates the
+// caller's private args copy in place. A string that is not a valid UUID against a
+// UUID column is a type error, consistent with the PK (coerceToUUID) and INSERT
+// (buildRowFromTmpl) paths. A non-string arg (e.g. NULL) is left as-is. Ranges over
+// nil when no param needs it — a no-op.
+func coerceParams(pl *plan, args []Value) error {
+	for i, want := range pl.paramWantUUID {
+		if !want || i >= len(args) || args[i].Kind != KindString {
+			continue
+		}
+		u, err := ParseUUID(args[i].Str())
+		if err != nil {
+			return fmt.Errorf("%w: argument %d for a UUID column is not a valid UUID", ErrTypeMismatch, i)
+		}
+		args[i] = UUIDVal(u)
+	}
+	return nil
 }
 
 // exprRefsColumn reports whether e reads any column (vs only literals and
