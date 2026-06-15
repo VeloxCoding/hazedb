@@ -122,8 +122,9 @@ func (v Value) uuidWords() (hi, lo uint64) { return v.w0, v.w1 }
 
 func (v Value) IsNull() bool { return v.Kind == KindNull }
 
-// AsString returns the value formatted as text. Used for PK keys in
-// the map index and for display.
+// AsString returns the value formatted as text: int via strconv, UUID in its
+// canonical form, string/bytes as their raw contents, bool as "true"/"false",
+// null as "".
 func (v Value) AsString() string {
 	switch v.Kind {
 	case KindNull:
@@ -146,8 +147,8 @@ func (v Value) AsString() string {
 	return ""
 }
 
-// AsInt returns the value as int64, coercing strings via strconv.
-// Used for ORDER BY / range comparisons.
+// AsInt returns the value as int64: int and bool directly, a string parsed via
+// strconv. Null and any other kind are an error.
 func (v Value) AsInt() (int64, error) {
 	switch v.Kind {
 	case KindInt, KindBool:
@@ -214,8 +215,7 @@ func (v Value) Compare(o Value) (int, bool) {
 		}
 		return 0, true
 	}
-	// Fall through to string compare. Lexicographic is correct for strings;
-	// for mixed int/string callers should not rely on the result.
+	// Mixed kinds: compare their text forms lexicographically.
 	a, b := v.AsString(), o.AsString()
 	switch {
 	case a < b:
