@@ -268,7 +268,6 @@ func (db *DB) planJoin(pl *plan, st *selectStmt, cat *catalog) error {
 	if !jp.driverIsLeft {
 		driverConj, driverDef, driverOff = rightConj, rightDef, nLeft
 	}
-	jp.driverPreds = driverConj
 	// residualPreds = every conjunct NOT pushed into the driver. driverConj ⊂ conj,
 	// so this is conj \ driverConj (probe-only + cross-table + constant conjuncts).
 	// passDriver already enforces driverConj; the phase-2 filter only needs these.
@@ -284,6 +283,9 @@ func (db *DB) planJoin(pl *plan, st *selectStmt, cat *catalog) error {
 			jp.residualPreds = append(jp.residualPreds, c)
 		}
 	}
+	// An equality on an indexed/PK driver column lets us FETCH the driver through
+	// that index/PK (driverIdxSrc → key) instead of scanning.
+	var fetchConj expr
 	for _, p := range driverConj {
 		b, ok := p.(*binOp)
 		if !ok || b.op != tkEq {
@@ -303,7 +305,18 @@ func (db *DB) planJoin(pl *plan, st *selectStmt, cat *catalog) error {
 		// full scan (the slow composite-only LEFT case).
 		if within == driverDef.pkOrdinal || jp.driverRT.probeIndexFor(within) != nil {
 			jp.driverIdxOrd, jp.driverIdxSrc, jp.driverIdxByPK = within, val, within == driverDef.pkOrdinal
+			fetchConj = p
 			break
+		}
+	}
+	// driverPreds = driverConj MINUS the fetch-key equality: the fetch already
+	// guarantees it (the byPK fetch is exact; the secondary-index fetch re-checks
+	// r[idxOrd] == key in probeRows), so re-checking it in passDriver is wasted
+	// work. A point/feed lookup whose only driver conjunct IS the fetch key then has
+	// an empty driverPreds — no passDriver scratch row, no compiled matcher.
+	for _, c := range driverConj {
+		if c != fetchConj {
+			jp.driverPreds = append(jp.driverPreds, c)
 		}
 	}
 
@@ -596,6 +609,9 @@ func (db *DB) probeRows(tbl *tableRT, onOrd int, byPK bool, key Value, dirty []U
 			return
 		}
 		if collect != nil {
+			if cap(*collect) == 0 { // presize so appendRowClone fills in one shot, no per-cell realloc
+				*collect = make([]Value, 0, len(tbl.def.def.Columns))
+			}
 			start := len(*collect)
 			if c, ok := tbl.appendMatchProject(pk, nil, nil, true, *collect); ok {
 				*collect = c
@@ -780,8 +796,10 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 	// One reusable buffer for the probe row across every probe in phase 2: each
 	// probe row is copied into it and consumed immediately (fillConcat into the
 	// concat scratch), never retained, so the whole probe phase allocates the probe
-	// row once instead of once per matched pair. Probes run sequentially.
-	var probeScratch []Value
+	// row once instead of once per matched pair. Probes run sequentially. Presized to
+	// the probe table's width so the first fetch fills it in one shot (getByPKProjectInto
+	// appends cell-by-cell — an unsized buffer would realloc several times).
+	probeScratch := make([]Value, 0, len(jp.probeRT.def.def.Columns))
 
 	// passResidual applies the WHERE conjuncts NOT already pushed into the driver
 	// (probe-side / cross-table / constant). Driver conjuncts ran in passDriver, so
