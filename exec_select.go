@@ -8,19 +8,26 @@ import (
 // execSelectPK reads the single PK-matched row, projected (or the whole row for
 // SELECT *). Returns no rows for LIMIT 0, any OFFSET, or a NULL key.
 func (db *DB) execSelectPK(pl *plan, keyVal Value) ([]string, []Row, error) {
+	if keyVal.IsNull() {
+		return pl.colNames, nil, nil
+	}
+	pk, err := coerceToUUID(keyVal)
+	if err != nil {
+		return nil, nil, err
+	}
+	return db.execSelectPKResolved(pl, pk)
+}
+
+// execSelectPKResolved serves a PK SELECT once the key is a resolved UUID — the
+// shared core of execSelectPK and the direct-UUID read fast path (which skips the
+// Value round-trip + coerce).
+func (db *DB) execSelectPKResolved(pl *plan, pk UUID) ([]string, []Row, error) {
 	st := pl.st.(*selectStmt)
 	tbl := pl.rt
 	colNames := pl.colNames
 	// A PK match is at most one row, so LIMIT 0 or any OFFSET drops it.
 	if st.limit == 0 || st.offset > 0 {
 		return colNames, nil, nil
-	}
-	if keyVal.IsNull() {
-		return colNames, nil, nil
-	}
-	pk, err := coerceToUUID(keyVal)
-	if err != nil {
-		return nil, nil, err
 	}
 	if st.starAll {
 		r, ok := tbl.getByPK(pk)

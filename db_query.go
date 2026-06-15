@@ -58,6 +58,16 @@ func (db *DB) queryPlan(pl *plan, args []any) ([]string, []Row, error) {
 		return nil, nil, fmt.Errorf("hazedb: Query used with non-SELECT — use Exec instead")
 	}
 	if pl.pkLookup && !pl.countStar {
+		// Direct-UUID fast path: when the single PK arg is already a UUID, a single
+		// type assertion replaces the Value round-trip (toValue's 8-case switch +
+		// coerceToUUID's reconstruction) — the common Caddy/PHP point read.
+		if pl.nparams == 1 && len(args) == 1 {
+			if u, isUUID := args[0].(UUID); isUUID {
+				if _, isParam := pl.pkSource.(*paramRef); isParam {
+					return db.execSelectPKResolved(pl, u)
+				}
+			}
+		}
 		keyVal, ok, err := pl.pkKeyFromArgs(args)
 		if err != nil {
 			return nil, nil, err
