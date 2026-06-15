@@ -628,6 +628,30 @@ func (db *DB) probeRows(tbl *tableRT, onOrd int, byPK bool, key Value, dirty []U
 	})
 }
 
+// appendProjected appends src's projection (or a full clone for SELECT *) to out,
+// already in output shape — so an ordered-walk join needs no projectRows pass. A
+// bounded result (the caller presized packed to offset+limit × width) carves each
+// row from the one shared packed backing — one allocation for the whole result
+// instead of one per row; the backing never regrows, so no earlier row view points
+// at a superseded generation. An unbounded result allocates per row, since a
+// regrowing shared backing would retain every doubling generation. Returns the
+// grown out and packed.
+func appendProjected(out []Row, packed []Value, src Row, ords []int, starAll, bounded bool) ([]Row, []Value) {
+	if !bounded {
+		if starAll {
+			return append(out, src.Clone()), packed
+		}
+		return append(out, projectClone(src, ords)), packed
+	}
+	start := len(packed)
+	if starAll {
+		packed = appendRowClone(packed, src)
+	} else {
+		packed = appendProjectClone(packed, src, ords)
+	}
+	return append(out, Row(packed[start:len(packed):len(packed)])), packed
+}
+
 // execJoin runs a two-table indexed nested-loop join: feed driver rows (never
 // holding a driver lock across the probe), probe the other side per row, assemble
 // [left..right..] concat rows, filter by the full WHERE, then sort / OFFSET /
@@ -834,7 +858,23 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 			dc, dirtySet := jp.probeRT.buildDirtyCands(matchKey, dirtyKey)
 			snap := si.snapshotPrefix(encodeCompositeKey([]Value{key}))
 			scratch := make(Row, nLeft+nRight)
-			var out []Row
+			// Project each kept row straight into one presized backing during the walk —
+			// no full-concat clone per row and no projectRows pass afterwards (the walk is
+			// already in ORDER BY order, so collecting offset+limit rows is the result).
+			// Bounded (eff>=0) packs into one backing; unbounded projects per row (a
+			// regrowing backing would retain superseded generations, so it is not packed).
+			width := len(pl.projOrdinals)
+			if st.starAll {
+				width = nLeft + nRight
+			}
+			bounded := eff >= 0
+			outCap := 0
+			var packed []Value
+			if bounded {
+				outCap = eff
+				packed = make([]Value, 0, eff*width)
+			}
+			out := make([]Row, 0, outCap)
 			done := func() bool { return eff >= 0 && len(out) >= eff }
 			keep := func(prow Row) {
 				left, right := drow, prow
@@ -843,9 +883,7 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 				}
 				fillConcat(scratch, left, right)
 				if passResidual(scratch) {
-					row := make(Row, nLeft+nRight)
-					copy(row, scratch)
-					out = append(out, row)
+					out, packed = appendProjected(out, packed, scratch, pl.projOrdinals, st.starAll, bounded)
 				}
 			}
 			mergeOrderedStreams(snap, dc, dirtySet, st.orderDesc, done,
@@ -859,8 +897,7 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 				},
 				func(r Row) { keep(r) },
 			)
-			out = sliceOffsetLimit(out, st.offset, st.limit)
-			return colNames, projectRows(out, st.starAll, pl.projOrdinals), nil
+			return colNames, sliceOffsetLimit(out, st.offset, st.limit), nil
 		}
 	}
 
@@ -910,7 +947,21 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 			walkable = true
 		}
 		if walkable {
-			var out []Row
+			// Project each kept row into one presized backing during the walk (already
+			// in ORDER BY order) — no full-concat clone per row and no projectRows pass.
+			// Bounded packs into one backing; unbounded projects per row (see appendProjected).
+			width := len(pl.projOrdinals)
+			if st.starAll {
+				width = nLeft + nRight
+			}
+			bounded := eff >= 0
+			outCap := 0
+			var packed []Value
+			if bounded {
+				outCap = eff
+				packed = make([]Value, 0, eff*width)
+			}
+			out := make([]Row, 0, outCap)
 			concat := make(Row, nLeft+nRight)
 			appendJoined := func(drow Row) {
 				matched := false
@@ -922,9 +973,7 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 					}
 					fillConcat(concat, left, right)
 					if passResidual(concat) {
-						row := make(Row, nLeft+nRight)
-						copy(row, concat)
-						out = append(out, row)
+						out, packed = appendProjected(out, packed, concat, pl.projOrdinals, st.starAll, bounded)
 					}
 					return false // collect every match for this driver
 				})
@@ -939,9 +988,7 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 						pad = true
 					}
 					if pad && passResidual(concat) {
-						row := make(Row, nLeft+nRight)
-						copy(row, concat)
-						out = append(out, row)
+						out, packed = appendProjected(out, packed, concat, pl.projOrdinals, st.starAll, bounded)
 					}
 				}
 			}
@@ -955,8 +1002,7 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 				},
 				func(r Row) { appendJoined(r) },
 			)
-			out = sliceOffsetLimit(out, st.offset, st.limit)
-			return colNames, projectRows(out, st.starAll, pl.projOrdinals), nil
+			return colNames, sliceOffsetLimit(out, st.offset, st.limit), nil
 		}
 	}
 
