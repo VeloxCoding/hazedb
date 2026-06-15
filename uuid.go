@@ -99,11 +99,8 @@ func ParseUUID(s string) (UUID, error) {
 }
 
 // ParseUUIDOk is ParseUUID without the error: it returns ok=false instead of
-// formatting an error. The text adapters guess UUID-ness by trying to parse
-// every string arg (the WHERE email=? case parses-and-fails on the hot path), so
-// the discarded error string in ParseUUID was an allocation per non-UUID arg.
-// Callers that only branch on success use this; callers that surface the error
-// (DDL/coercion) use ParseUUID.
+// formatting (and allocating) an error string, for a caller that only branches on
+// success. Callers that surface the error (DDL, column-type coercion) use ParseUUID.
 func ParseUUIDOk(s string) (UUID, bool) {
 	var u UUID
 	if len(s) != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {

@@ -68,8 +68,8 @@ func TestParamCoerceCompositeUUIDPrefix(t *testing.T) {
 	}
 }
 
-// UPDATE SET on a UUID column with a string arg (the SET path has no coercion of
-// its own; it relied on the guess) plus a PK key as a string.
+// UPDATE SET on a UUID column with a string arg — the SET path has no coercion of
+// its own, so it depends on coerceParams — plus a PK key as a string.
 func TestParamCoerceUpdateSetUUID(t *testing.T) {
 	db := seedRefTable(t)
 	n, err := db.Exec("UPDATE t SET ref = ? WHERE id = ?", tid(999).String(), tid(2).String())
