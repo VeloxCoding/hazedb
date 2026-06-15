@@ -135,6 +135,16 @@ func (db *DB) queryRowPlan(pl *plan, args []any) ([]string, Row, error) {
 		return nil, nil, fmt.Errorf("hazedb: QueryRow used with non-SELECT — use Exec instead")
 	}
 	if pl.pkLookup && !pl.countStar {
+		// Direct-UUID fast path (mirrors queryPlan): a single UUID arg bound to the
+		// PK param skips toValue's type switch + the Value round-trip + coerceToUUID —
+		// the common Caddy/PHP single-row point read.
+		if pl.nparams == 1 && len(args) == 1 {
+			if u, isUUID := args[0].(UUID); isUUID {
+				if _, isParam := pl.pkSource.(*paramRef); isParam {
+					return db.execSelectPKOneResolved(pl, u)
+				}
+			}
+		}
 		keyVal, ok, err := pl.pkKeyFromArgs(args)
 		if err != nil {
 			return nil, nil, err

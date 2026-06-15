@@ -46,19 +46,26 @@ func (db *DB) execSelectPKResolved(pl *plan, pk UUID) ([]string, []Row, error) {
 // execSelectPKOne is execSelectPK for QueryRow: it returns the single matched
 // row directly (nil if none), skipping the []Row result slice Query allocates.
 func (db *DB) execSelectPKOne(pl *plan, keyVal Value) ([]string, Row, error) {
+	if keyVal.IsNull() {
+		return pl.colNames, nil, nil
+	}
+	pk, err := coerceToUUID(keyVal)
+	if err != nil {
+		return nil, nil, err
+	}
+	return db.execSelectPKOneResolved(pl, pk)
+}
+
+// execSelectPKOneResolved serves a single-row PK SELECT once the key is a resolved
+// UUID — the shared core of execSelectPKOne and the QueryRow direct-UUID fast path
+// (which skips the Value round-trip + coerce), mirroring execSelectPKResolved.
+func (db *DB) execSelectPKOneResolved(pl *plan, pk UUID) ([]string, Row, error) {
 	st := pl.st.(*selectStmt)
 	tbl := pl.rt
 	colNames := pl.colNames
 	// A PK match is at most one row, so LIMIT 0 or any OFFSET drops it.
 	if st.limit == 0 || st.offset > 0 {
 		return colNames, nil, nil
-	}
-	if keyVal.IsNull() {
-		return colNames, nil, nil
-	}
-	pk, err := coerceToUUID(keyVal)
-	if err != nil {
-		return nil, nil, err
 	}
 	if st.starAll {
 		r, _ := tbl.getByPK(pk)
