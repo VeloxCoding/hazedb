@@ -1028,10 +1028,17 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 			}
 			dc, dirtySet := jp.driverRT.buildDirtyCands(passDriver, dirtyKey)
 			done := func() bool { return eff >= 0 && len(out) >= eff }
+			// appendJoined consumes the driver row immediately (fillConcat copies it),
+			// so reuse one buffer for the walk's index-row fetches instead of a
+			// throwaway getByPK clone per step. Dirty rows are owned clones already.
+			var driverScratch []Value
 			mergeOrderedStreams(snap, dc, dirtySet, st.orderDesc, done,
 				func(pk UUID) {
-					if r, ok := jp.driverRT.getByPK(pk); ok && passDriver(r) {
-						appendJoined(r)
+					if out, ok := jp.driverRT.getByPKProjectInto(pk, nil, driverScratch); ok {
+						driverScratch = out
+						if r := Row(out); passDriver(r) {
+							appendJoined(r)
+						}
 					}
 				},
 				func(r Row) { appendJoined(r) },
