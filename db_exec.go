@@ -84,7 +84,11 @@ func (db *DB) ExecValues(sql string, args ...Value) (int, error) {
 // execPlan runs a non-SELECT plan against raw args. Shared by Exec (which looks
 // the plan up by SQL each call) and *Stmt.Exec (which holds a compiled plan).
 func (db *DB) execPlan(pl *plan, args []any) (int, error) {
-	vargs, err := toValues(args)
+	// Convert into a stack buffer for the common small-arg write (like
+	// execPlanValues): the converted slice does not outlive this call, so a
+	// statement with <= 8 params binds its args without a heap allocation.
+	var argBuf [8]Value
+	vargs, err := toValuesInto(args, argBuf[:])
 	if err != nil {
 		return 0, err
 	}

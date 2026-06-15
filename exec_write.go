@@ -253,7 +253,7 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 			}
 			computeOne = func(Row) (Value, error) { return v, nil }
 		}
-		keyVal, err := evalExpr(pl.pkSource, &evalCtx{args: args})
+		keyVal, err := evalLitOrParamValue(pl.pkSource, args) // PK source is always a param/literal — no eval context needed
 		if err != nil {
 			return 0, err
 		}
@@ -311,7 +311,7 @@ func (db *DB) execUpdate(pl *plan, args []Value) (int, error) {
 
 	// PK-pinned fast path (updateByPKJournaled).
 	if pl.pkLookup {
-		keyVal, err := evalExpr(pl.pkSource, &evalCtx{args: args})
+		keyVal, err := evalLitOrParamValue(pl.pkSource, args) // PK source is always a param/literal — no eval context needed
 		if err != nil {
 			return 0, err
 		}
@@ -445,7 +445,7 @@ func (db *DB) execDelete(pl *plan, args []Value) (int, error) {
 
 	// PK-pinned fast path (deleteByPKJournaled).
 	if pl.pkLookup {
-		keyVal, err := evalExpr(pl.pkSource, &evalCtx{args: args})
+		keyVal, err := evalLitOrParamValue(pl.pkSource, args) // PK source is always a param/literal
 		if err != nil {
 			return 0, err
 		}
