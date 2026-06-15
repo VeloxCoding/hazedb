@@ -1,6 +1,6 @@
 package hazedb
 
-// Two-table joins (INNER / LEFT, single equi-join). The result row is the LEFT
+// Two-table joins (INNER / LEFT / RIGHT, single equi-join). The result row is the LEFT
 // table's columns concatenated with the RIGHT table's (nLeft+nRight wide); every
 // colRef in the projection, WHERE, and ORDER BY is bound at plan time to a
 // GLOBAL ordinal into that concat row, so evalExpr runs unchanged on it.
@@ -9,10 +9,11 @@ package hazedb
 // row probe the other side through its PK map or a secondary index. The
 // indexed-only law (enforced in planJoin) guarantees the probed side's join
 // column is the PK or indexed, so a join is always O(driver) probes — never an
-// O(A×B) scan. The driver is fully materialised first so no driver shard lock is
-// held across the probe (which locks the other table) — avoiding cross-table
-// lock cycles. A join is therefore per-shard-consistent, not point-in-time
-// (the same contract as any multi-shard read).
+// O(A×B) scan. The driver is read without holding its shard lock across the probe
+// (which locks the other table) — materialised up front, or cloned chunk by chunk
+// and released before probing — avoiding cross-table lock cycles. A join is
+// therefore per-shard-consistent, not point-in-time (the same contract as any
+// multi-shard read).
 //
 // v1 scope: one JOIN (two tables), single `ON a.col = b.col` equality, INNER,
 // LEFT, or RIGHT. FULL/CROSS, N-way joins, and non-equi conditions are deferred.
@@ -283,10 +284,9 @@ func (db *DB) planJoin(pl *plan, st *selectStmt, cat *catalog) error {
 			jp.residualPreds = append(jp.residualPreds, c)
 		}
 	}
-	// An equality on an indexed/PK driver column lets us FETCH the driver through
-	// that index/PK (driverIdxSrc → key) instead of scanning. A PK equality fetches at
-	// most one row — maximally selective — so it wins over any secondary index
-	// outright; otherwise the first secondary-indexed equality is used. (Picking the
+	// Pick the fetch key among the driver's indexed equalities: a PK equality fetches
+	// at most one row — maximally selective — so it wins over any secondary index
+	// outright; otherwise the first secondary-indexed equality is used. (Choosing the
 	// smallest of several secondary buckets would need the param values, known only at
 	// exec time — deferred.)
 	var fetchConj, secondaryConj, secondaryVal expr
@@ -633,8 +633,7 @@ func colAndLit(b *binOp) (*colRef, expr) {
 //     getByPK clone per row. A passDriver reject in fn leaves an unused slot (the
 //     backing was sized to the upper bound, so it never regrows).
 //
-// nil for both keeps the owned-clone behaviour. dirty is the table's dirty-PK
-// overlay, snapshotted ONCE by the caller (ignored on the byPK path; nil = none).
+// nil for both keeps the owned-clone behaviour.
 func (db *DB) probeRows(tbl *tableRT, onOrd int, byPK bool, key Value, dirty []UUID, reuse, collect *[]Value, fn func(Row) bool) {
 	if key.IsNull() {
 		return
@@ -778,9 +777,9 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 	// and stops at offset+limit instead of materialising the whole table up front
 	// (the result order is undefined, so any offset+limit rows are valid). With an
 	// ORDER BY every driver must be seen to sort, and an index-fetched driver is
-	// already bounded — both materialise here. (Streaming the ordered driver was
-	// measured 2x slower / ~3000x more allocs: the top-N never early-stops, so
-	// scanShardsBatched only trades one presized backing for many per-chunk clones.)
+	// already bounded — both materialise here. (Streaming an ordered driver would only
+	// swap the one presized backing for many per-chunk clones: the top-N never
+	// early-stops, so there is no scan left to cut short.)
 	ordered := jp.orderOrdinal >= 0
 	streaming := jp.driverIdxSrc == nil && !ordered
 	var drivers []Row
@@ -1024,7 +1023,7 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 				}
 				ords := si.ordinals
 				snap = si.snapshotPrefix(encodeCompositeKey(prefix))
-				// cells reused across dirty rows (see the probe-walk note above).
+				// cells reused across dirty rows: encodeCompositeKey copies, so it is safe.
 				cells := make([]Value, len(ords))
 				dirtyKey = func(r Row) indexKey {
 					for i, o := range ords {
