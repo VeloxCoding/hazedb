@@ -60,9 +60,9 @@ scalar** (`$id`). The scalar form is the fast path: no array is built in PHP or
 read in Go, ~80 ns/call cheaper, so `hazedb_fetch($sql, $id)` beats
 `hazedb_fetch($sql, [$id])` for the hot single-key read. Both are accepted; use
 the array whenever there is more than one param. `$args` is optional (omit it for
-no-arg statements like `CREATE TABLE`). Type mapping: PHP `int` → INT,
-`true`/`false` → BOOL, `null` → NULL, `string` → STRING **unless** it parses as a
-canonical UUID → UUID. hazedb has no float type, so a `float` arg is rejected.
+no-arg statements like `CREATE TABLE`). The arg type mapping and the full SQL
+surface — accepted statements, `CREATE TABLE` syntax (one required `uuid` PK),
+indexes, joins — have one owner: [docs/php-sql-layer.md](../../docs/php-sql-layer.md).
 
 **Native types out.** Result cells come back as the real PHP type — `int`,
 `bool`, `string` — not stringified. (PDO + SQLite returns everything as a string

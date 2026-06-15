@@ -419,5 +419,8 @@ $page = hazedb_fetchall(
 
 `$args` (`mixed`, optional): a native PHP **array** of positional params, or a
 **bare scalar** for a single param (the fast path). Type mapping: number→INT,
-bool→BOOL, null→NULL, string→STRING unless it parses as a canonical UUID.
+bool→BOOL, null→NULL, string→STRING. A string stays a STRING regardless of shape;
+one addressed to a `uuid` column is parsed to a UUID by the column type (so a TEXT
+column holding a UUID-shaped value stays text), and an invalid UUID string against
+a `uuid` column is an error. hazedb has no float type — a float arg is rejected.
 See [../addons/frankenphp-ext/README.md](../addons/frankenphp-ext/README.md).
