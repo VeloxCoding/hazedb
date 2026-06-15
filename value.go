@@ -86,7 +86,9 @@ func boolToWord(b bool) uint64 {
 //   - Int   — KindInt value, or a KindBool as 0/1
 //   - Bool  — KindBool value
 //   - Str   — KindString value (shares the backing; immutable, so safe)
-//   - Bytes — KindBytes value (the live backing slice; clone before escaping a lock)
+//   - Bytes — KindBytes value: the live backing slice, READ-ONLY. Never mutate it,
+//     and never mutate a streamed row's cells — both alias stored memory, so a write
+//     corrupts the row in place. Clone anything that outlives the storage lock.
 //   - UUID  — KindUUID value
 
 func (v Value) Int() int64 { return int64(v.w0) }
@@ -158,9 +160,11 @@ func (v Value) AsInt() (int64, error) {
 	return 0, fmt.Errorf("value of kind %d cannot be coerced to int", v.Kind)
 }
 
-// Compare returns -1/0/1 for v < o, v == o, v > o. Coerces along the
-// most-precise route: int-int → numeric, otherwise string-string.
-// Null comparisons return 0 with comparable=false to let callers decide.
+// Compare returns -1/0/1 for v < o, v == o, v > o. Same-kind pairs take a direct
+// fast path — int/bool numeric, UUID by big-endian words, bytes and string
+// lexicographic; mixed kinds fall back to string comparison (callers should not
+// rely on a mixed int/string result). Null returns 0 with comparable=false so the
+// caller decides null handling.
 func (v Value) Compare(o Value) (int, bool) {
 	if v.Kind == KindNull || o.Kind == KindNull {
 		return 0, false
@@ -237,7 +241,7 @@ func (v Value) Equal(o Value) bool {
 	case KindString:
 		return v.Str() == o.Str()
 	case KindBytes:
-		return string(v.Bytes()) == string(o.Bytes())
+		return bytes.Equal(v.Bytes(), o.Bytes())
 	case KindUUID:
 		return v.w0 == o.w0 && v.w1 == o.w1
 	}

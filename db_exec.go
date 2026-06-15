@@ -191,6 +191,13 @@ func toValue(a any, index int) (Value, error) {
 	case int32:
 		return Int(int64(x)), nil
 	case string:
+		// Stored by reference: a string is immutable, so the cell aliases the caller's
+		// backing rather than copying it (keeps the write path lean — no per-string
+		// alloc). The caller owns the backing-size contract: a substring of a large
+		// buffer (e.g. a field sliced out of a whole file) pins that entire buffer
+		// while rowCost charges only the substring length, so strings.Clone it first
+		// if the parent should be freed. []byte below is cloned instead, because a
+		// caller can mutate it after the call.
 		return Str(x), nil
 	case []byte:
 		// Clone at the write boundary: storage must not alias a caller slice
