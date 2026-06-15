@@ -850,8 +850,11 @@ func (db *DB) execJoin(pl *plan, args []Value) ([]string, []Row, error) {
 			}
 			mergeOrderedStreams(snap, dc, dirtySet, st.orderDesc, done,
 				func(pk UUID) {
-					if r, ok := jp.probeRT.getByPK(pk); ok {
-						keep(r)
+					// keep consumes the probe row immediately (copies into scratch), so
+					// reuse one buffer instead of a throwaway getByPK clone per walk step.
+					if out, ok := jp.probeRT.getByPKProjectInto(pk, nil, probeScratch); ok {
+						probeScratch = out
+						keep(Row(out))
 					}
 				},
 				func(r Row) { keep(r) },
