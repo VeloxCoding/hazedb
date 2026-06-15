@@ -1282,13 +1282,15 @@ func (db *DB) execSelect(pl *plan, args []Value) ([]string, []Row, error) {
 	return colNames, sliceOffsetLimit(top.sorted(), st.offset, st.limit), nil
 }
 
-// sortRowsByCol stable-sorts rows by column ord (ascending, or descending when
-// desc). Incomparable cells (NULL) sort as "not less".
+// sortRowsByCol sorts rows by column ord (ascending, or descending when desc).
+// Incomparable cells (NULL) compare equal. Unstable: SQL leaves the order of
+// equal ORDER BY keys unspecified, so the stability bookkeeping is pure cost —
+// the same reasoning that put topN.sorted on slices.SortFunc.
 func sortRowsByCol(rows []Row, ord int, desc bool) {
-	slices.SortStableFunc(rows, func(a, b Row) int {
+	slices.SortFunc(rows, func(a, b Row) int {
 		c, ok := a[ord].Compare(b[ord])
 		if !ok {
-			return 0 // incomparable (NULL): equal → stable order preserved
+			return 0 // incomparable (NULL): treat as equal
 		}
 		if desc {
 			return -c
