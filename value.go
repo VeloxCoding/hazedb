@@ -197,6 +197,19 @@ func (v Value) Compare(o Value) (int, bool) {
 		// would give, without allocating a string per side.
 		return bytes.Compare(v.Bytes(), o.Bytes()), true
 	}
+	if v.Kind == KindString && o.Kind == KindString {
+		// Same-kind strings (the common ORDER BY / range case): compare the bytes
+		// directly, skipping AsString's per-side kind switch. Bit-identical to the
+		// fallthrough, where AsString(KindString) is exactly Str().
+		a, b := v.Str(), o.Str()
+		switch {
+		case a < b:
+			return -1, true
+		case a > b:
+			return 1, true
+		}
+		return 0, true
+	}
 	// Fall through to string compare. Lexicographic is correct for strings;
 	// for mixed int/string callers should not rely on the result.
 	a, b := v.AsString(), o.AsString()
