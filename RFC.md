@@ -1,167 +1,87 @@
 # hazedb RFC
 
-**Status:** M1–M7 implemented (store, SQL, WAL durability, UUIDv7 PK, partitioning, runtime catalog + `CREATE`/`DROP TABLE`, single-table transactions, segmented WAL + SQLite-mirror recovery); M8 open. See *Implementation status* for what is running vs designed.  
-**Module:** `github.com/VeloxCoding/hazedb`  
-**Updated:** 2026-06-15 (rev. 49 — **arena-reclamation doc drift fixed**. The body still said tombstone slots are reclaimed only on a snapshot restart ("the arena never shrinks"; "not reclaimed in a running process") — stale since rev. 38's background compaction sweeper. Corrected *Tombstone on delete*, the *Arena slots* limitation paragraph (now "reclaimed by a background sweeper"), and the rowLocation ABA note (renumbering happens under the pkDirectory + shard write locks; a tombstone/PK-mismatch re-lookup covers it). Synced the matching `store.go` / `partition_store.go` comments; no code-behaviour change. rev. 48 — **`?` placeholders mandatory; inline value literals rejected**. Every value in an `Exec`/`Query` statement must now be a `?` placeholder; an inline literal (`WHERE email = 'a@b'`, `SET age = 30`, `VALUES ('x', 1)`) is rejected at `prepare()` with `ErrParse` (`rejectValueLiterals`). `LIMIT`/`OFFSET`/`ORDER BY` and `IS NULL`/`IS NOT NULL` are structural, not values, and stay. Two properties follow: the plan cache stays bounded (the key is the SQL string, so a finite parameterized statement set converges instead of growing a new key per spliced value), and SQL injection is structurally impossible (a `?` value binds as a typed `Value` at execution and never reaches the parser as syntax). A trusted operator boot/seed file uses the new `db.ExecScript(sql)`, which runs a multi-statement script — split on top-level `;` with the lexer, so a `;` inside a string literal is safe — with inline literals allowed (uncached, never for request input). Also dropped the now-dead literal-INSERT plan path (`insCellLit`). New *Parameterize all values* section under *Query API*; the gateway *Validation* guarantee updated. rev. 47 — **on-disk companion enforced; stale WAL-only mode removed from the docs**. `Open()` now rejects an in-memory `CompanionPath` (`:memory:`, or any DSN with `mode=memory`) with the new `ErrCompanionInMemory` (`Options.validate`), so the always-a-file guarantee can no longer be configured away — the companion must survive a restart to serve logging, health, and the data mirror. Also corrected two stale references to a *WAL-on + no-companion, uncompacted full-replay* mode that rev. 45 removed: with WAL on the companion is always present and the drain always bounds the WAL to the undrained tail, so there is no unbounded WAL-only mode. Updated *Recovery — SQLite mirror + WAL tail* (the companion paragraph) and the *WAL bounding* note. rev. 46 — **companion is an always-present file**. The SQLite companion is now a real file present in EVERY mode (`Options.CompanionPath`; default `hazedb.db` inside WALPath when WAL is on, else in the working directory) — hazedb's always-on store for the `_hz_events` log (logging, health, later perf) plus, when WAL is on, the data mirror + recovery base. With no WAL the companion file still exists (events/ops only; data in RAM). Never in-memory. Supersedes rev. 45's WAL-gating — the file is always there. rev. 45 — **companion is a file, never in-memory**. The SQLite companion is now always a real file and exists only when WAL is on (at `<WALPath>/hazedb.db`, or `Options.CompanionPath`); with no WAL there is no companion and operational events go to the standard log. Removed `:memory:` entirely — the in-memory-companion default, the WAL-only/no-mirror recovery branch, and the `noWALCompanionDefault` test seam are all gone (WAL on always means a companion file + mirror). Updated *Recovery — SQLite mirror + WAL tail*. rev. 44 — **companion defaults to a file when durable**. With WAL on and `CompanionPath` left empty, the companion now defaults to a file: `hazedb.db` inside `WALPath` when WAL is on (data mirror + events persist, recovery base), or `hazedb.db` in the working directory when there is no WAL (rows stay in RAM, but the events log persists) — instead of in-memory. Set `":memory:"` explicitly to keep the companion in-memory (with WAL that is WAL-only mode). The mirror gate is now `WAL on && CompanionPath != ":memory:"`. rev. 43 — **Always-present SQLite companion + `_hz_events`**. SQLite is now hazedb's always-present companion (`Options.CompanionPath`; an in-memory DB when empty), open in every mode. The data mirror is the part active when WAL is on AND the companion is a persistent file — replacing the `SQLitePath` knob; WAL with no companion path stays WAL-only (full replay). The companion holds the new `_hz_events` operational log (`ts, level, kind, message`) — a corrupt-segment skip, a drain failure — queryable by a dashboard regardless of durability; the reserved `_hz_` table-name prefix stops user tables colliding. Metrics/counters stay in memory (stats endpoints), not per-event rows. Updated *Recovery — SQLite mirror + WAL tail* and the replication `Open(...)` call. rev. 42 — **WAL corruption is survivable, not fatal**. A bad magic or CRC mismatch on a sealed segment (bit-rot) no longer aborts `Open()` or stalls the SQLite drain: the good prefix before the break is applied, the unreadable suffix is skipped, the event is logged, and both recovery and the drain continue with the next segment — fixing a silent-stall bug where the drain swallowed the error and retried the same corrupt segment forever. Version mismatch is split into its own `ErrWALVersion` and, with an unknown record type or a CRC-valid-but-undecodable payload, stays FATAL: those carry intact, intentional bytes, so silently dropping them would be a data-loss bug. New `events.go` / `logEvent` surfaces such operator events (a SQLite `_hz_events` table to follow). Updated the *Logical typed-mutation WAL* running bullet and the *Tail-recovery robustness* paragraph. rev. 41 — **born-sealed WAL rewrite, implemented**. The WAL durability surface collapses from six knobs (`WALLevel`/`WALSync`/`WALSyncPerWrite`/`WALFlushInterval`/`WALRotateInterval`) to one: `WALPath` on/off. The WAL is now a directory of immutable born-sealed segments — a write buffers in RAM and the buffer seals into the next segment via temp-file → fsync → atomic rename at 1 MiB or ~0.5s, whichever first. There is no "active" appended-to file and no rotate step (flush *is* seal), so every `seg-*.wal` is complete by construction: recovery drops the torn-tail special case, and a parse failure is unambiguous corruption. Per-write fsync (acknowledge-after-durable) is removed — out of scope for an in-memory store whose source of truth is elsewhere. Updated *WAL — durability* (born-sealed model, off/on table), the *Running today* WAL bullets, the durability-cost table, the settled-decision row, and the M3 milestone note. rev. 40 — new *Replication — read-only standby from snapshot + WAL tail* section (**proposed, not implemented**): a second host runs a read-only standby rebuilt from a `VACUUM INTO` snapshot of the mirror (a consistent, immutable, standard SQLite copy that carries its own drain cursor via `_hz_meta`) plus the WAL segments past that cursor — the standby's `Open(SQLitePath=snap, WALPath=copied)` reuses `recoverFromSQLite` + tail-replay verbatim, near-zero new code. The one correctness gate: retain WAL by cursor (`min(drain, oldest snapshot cursor)`), never by wall-clock age, or the live drain deletes a segment the snapshot still needs. Single-writer (standby is read-only), freshness bounded by snapshot + shipped tail; not multi-master. Tracked in *Deferred to v1.1+*. rev. 39 — RFC now documents the IMPLEMENTED recovery model. A new *Recovery — SQLite mirror + WAL tail* section: a background drain mirrors sealed WAL segments into an on-disk SQLite database holding compacted current state, keyed by a durable drain cursor committed in the same SQLite transaction as each segment; `Open()` rebuilds memory base-first from the mirror, then replays the undrained WAL tail on top (a tail UPDATE/DELETE of an already-drained row lands correctly because newer mutations apply last). Without `SQLitePath` the WAL itself replays (uncompacted). This supersedes the never-built `CHECKPOINT`-record→snapshot-file design — the record type stays reserved, and the original M7 consistent-cut design block is kept only as rationale, banner-marked superseded. M7 reclassified designed→running; the unbounded-WAL/linear-cold-start caveat is resolved by the mirror (WAL-only mode still unbounded). rev. 38 — a background sweeper now compacts dead arena slots: each tick it rebuilds any more-than-half-dead shard with only live rows, renumbering rowIDs and rewriting the pkMap / pkDirectory + tails — off the write path, so a delete never pays the O(live) relocation. With rev. 37's tails-prune (scanPartition O(live)) this closes the tombstone-reclamation gap: `/meta`'s `tombstones` is now a gauge the sweeper drives down, not a number only a restart resets. rev. 37 — partitioned `tails` scan lists pruned of dead rowIDs on the delete path (~12× on a churned partition). rev. 36 — `/meta` reports `tombstones` + `total_tombstones`, surfacing that deleted rows are not reclaimed in a running process. rev. 35 — WAL replay validates DECODED records before applying them: an out-of-range UPDATE ordinal or a wrong-width INSERT row fails closed with `ErrWALCorrupt` instead of panicking inside `Open()`, mirroring the SQLite drain path's guard. rev. 34 — the parser bounds expression nesting (`maxExprDepth` = 256), closing a stack-overflow remote-kill DoS. rev. 33 — `MaxBytes` byte cap + `/meta` store stats: every insert reserves its byte cost against a store-wide budget and is rejected with `ErrCapacity` / HTTP 507 over the cap; the store never auto-evicts. rev. 32 — `walVersion` 1→2 and replay rejects ANY non-current version)
+hazedb compiles into your Go binary, keeps all data in RAM, writes a WAL for durability, and serves SQL at sub-µs p50 / <50 µs p99 under concurrent mixed workload.
+
+This RFC is the **design spec** — how hazedb works, as built and as targeted. Dense by intent.
 
 ---
 
 ## What it is
 
-hazedb is a **general-purpose embedded SQL database**, not a domain or
-application-specific store. It happens to be memory-resident with a WAL for
-durability, but the data model, query language, and features are generic —
-tables, columns, a primary key, optional partitioning and indexes, SQL.
+A **general-purpose, embedded, memory-resident SQL database** for a single Go process. Generic data model (tables, columns, one PK, optional partitioning + indexes, SQL) — not domain-specific. All reads come from RAM; disk holds only append-only WAL segments + a log-derived SQLite mirror, never table pages or a buffer pool. No network protocol, no separate process.
 
-> **About the examples in this document.** Concrete tables like
-> `messages(thread_id, seq, body)`, sessions, or leaderboards are *only
-> illustrations* chosen to make a mechanism easy to picture. They are not
-> built-in features, a target domain, or a product focus. Read every example
-> as "for instance, a table shaped like this" — the feature it demonstrates
-> is always generic.
-
-An embedded, memory-resident SQL store for single-process Go applications.
-All reads come from RAM. Disk stores append-only WAL segments and log-derived snapshots — never table pages or a buffer pool. No network protocol, no separate
-process, no buffer pool.
-
-**Target:** latency-sensitive OLTP where the working set fits in RAM. Compile
-it directly into a Caddy module, FrankenPHP extension, or standalone Go
-binary. (Workloads like session state, hot leaderboards, or append-and-scan
-tables are *examples* of that profile, not the scope.)
-
----
+**Target:** latency-sensitive OLTP with the working set in RAM. Compiled directly into a Caddy module, FrankenPHP extension, or standalone Go binary. (Concrete tables in examples — `messages`, sessions, leaderboards — are *illustrations of the profile*, not built-in features or scope.)
 
 ## Non-goals (load-bearing)
 
 | | |
 |---|---|
-| Not a PostgreSQL/SQLite replacement | Only two-table indexed equi-joins; no window functions, no ad-hoc query performance guarantee |
-| Not for data > RAM | WAL + checkpoints only; no page eviction |
-| Not multi-process | One Go process owns the DB |
-| Not OLAP | No aggregation engine, no columnar storage |
-| No `ALTER TABLE` in v1 | `CREATE TABLE` / `DROP TABLE` run at runtime (WAL-logged, survive restart); no in-place column add/drop/retype |
-| No `FULL OUTER` / `CROSS` / N-way joins | Two-table `INNER`/`LEFT`/`RIGHT` equi-joins only; the probed column must be indexed |
-| No migration tooling | Write your own transfer script; store your old PK as a regular column |
-
----
+| Not a PostgreSQL/SQLite replacement | only two-table indexed equi-joins; no window functions; no ad-hoc-query perf guarantee |
+| Not for data > RAM | WAL + mirror only; no page eviction |
+| Not multi-process | one Go process owns the DB |
+| Not OLAP | no aggregation engine, no columnar storage |
+| No `ALTER TABLE` in v1 | `CREATE`/`DROP TABLE` run at runtime (WAL-logged, survive restart); no in-place column change |
+| No `FULL OUTER` / `CROSS` / N-way joins | two-table `INNER`/`LEFT`/`RIGHT` equi-joins only; the probed column must be indexed |
+| No migration tooling | write your own transfer script; keep your old PK as a regular column |
 
 ## Implementation status
 
-The remainder of this RFC describes the **target architecture** — the full design hazedb is being built toward. Not all of it is implemented. This section is the single source of truth on what runs today vs what is planned.
-
-### Running today (M1–M7)
-
-- Sharded RWMutex storage: `[]Value` typed rows, append-only arena, tombstone deletes, per-shard `map[UUID]uint64` PK index, `uint64` rowID
-- **UUIDv7 PK, enforced** — `[16]byte` stored inline in `Value` (no per-cell alloc); INSERT auto-generates a monotonic UUIDv7 when omitted (resolved before the WAL write), or accepts a client UUID; a canonical-string PK is parsed to UUID at the API boundary, never in storage
-- Immutable order column (`seq`) support: an `Immutable` column flag rejects `UPDATE SET` at plan time (PK is implicitly immutable) — the stable schema M5's tail index builds against
-- **Logical typed-mutation WAL**: versioned self-delimiting envelope (`magic|type|version|length|payload|crc32c`); MUTATION payload is `op|tableID|op-body` (insert=full row, update=pk+changed-column deltas, delete=pk); CRC32C; replay fails loud (aborts `Open`) on a non-current `walVersion` or an unknown record type — intact bytes this binary cannot apply, never silently dropped; a bad magic or CRC mismatch on a complete record is bit-rot, so the good prefix is kept and the unreadable suffix is skipped + logged (recovery and the drain both continue, never stall); a truncated tail is tolerated (a format change bumps `walVersion` so a pre-change WAL is rejected, never misparsed)
-- **Born-sealed WAL** (one switch — `WALPath` on/off): writes buffer in RAM and seal into an immutable segment (temp-file → fsync → atomic rename) at 1 MiB or ~0.5s, whichever first, so a crash loses ≤ that window and every on-disk segment is complete by construction. No durability levels, no per-write-fsync mode, no flush/rotate-interval knobs. Sticky WAL error state aborts the write pipeline before it touches memory.
-- Write pipeline enforces validate → WAL append → apply under the relevant shard lock(s); multi-shard predicate writes hold every shard lock so WAL order == in-memory order
-- Runtime SQL engine (the hot path): `SELECT` / `INSERT` / `UPDATE` / `DELETE` with arithmetic in `SET` and `WHERE` (`col +/-/* ?`); plans cached per SQL string in a `sync.Map`, parsed once then reused. `INSERT` accepts multiple `VALUES` tuples; a multi-row insert commits atomically through the transaction path (one `recTxn` WAL envelope, each touched shard locked once), so a duplicate/invalid row anywhere fails the whole statement. This amortises per-row WAL overhead — one `recTxn` envelope, one `walMu` acquisition, one buffer append, and one parse across all k rows. An atomic batch is capped at 1000 mutations (`maxTxnMutations`): it bounds shard-lock hold time and transient memory, keeps the count under the `recTxn` envelope's uint16, and costs no real throughput (the fsync amortisation is near-complete by ~1000 rows — split larger loads). Over the cap is a clean `ErrBatchTooLarge`, never a silent truncation
-- PK fast path (`WHERE id = ?` → pk-map lookup, one shard) and indexed partition scan (`WHERE partkey = ?`), both as compiled-plan properties available to runtime-created tables
-- **PartitionKey shard routing + table-wide `pkDirectory` + per-partition tail index** (M5) — partition-routed shards, `map[UUID]rowLocation` directory for table-wide PK uniqueness + O(1) `WHERE id = ?`, indexed `WHERE partkey = ?` scan
-- **Runtime catalog + first-class DDL** — `CREATE TABLE` / `DROP TABLE` over an `atomic.Pointer[catalog]` (RCU swap), durable append-only table IDs, catalog-version plan invalidation, WAL-logged and replayed before mutations; runtime tables are not second-class (insert/read benchmarks identical to predeclared)
-- *Measured benchmarks* were re-measured at rev. 12. Historical note: the M4 switch to a 16-byte UUID in every `Value` cell added ~10-22% ns / +50-100 B/op vs M3 (`bench/baseline_m4.txt`); an optional typed-struct wrapper could reclaim the `[]Value` overhead later (post-1.0, not on the hot path).
-- Read-path clone-under-lock: a PK/partition lookup clones the matched row while still holding the shard read lock, so a returned row never aliases storage a concurrent write could mutate. A projected `SELECT` clones only its projected columns under the lock (no full-row clone), and a point-read `Query` evaluates just the PK argument from the raw args (no full `[]Value` conversion, no `evalCtx`) → ~198 ns / 4 allocs on a 3-col table projecting 2; `SELECT *` still takes the full-row clone
-- `LIMIT` without `ORDER BY` is applied during the scan (stop at the limit, project under the lock) instead of materialising the whole match set then truncating — fewer allocations and an early exit
-
-- **Transactions (M6, v1 scope)** — `db.Transaction(func(tx *Tx) error)` closure; `tx.Exec` only (write-only API), PK-pinned statements, single table per tx; staged overlay for read-your-writes; arithmetic `SET` evaluated under the commit locks; poison-on-first-error; one `TXN` WAL envelope (atomic across crash, replayed all-or-nothing). Commit locks only the shards the transaction touches, ascending (deadlock-safe against the all-shard acquirers).
-
-- **Born-sealed WAL + SQLite-mirror recovery (M7)** — writes seal into immutable segments (1 MiB / ~0.5s, temp-file → fsync → atomic rename) that a background **drain** feeds into an on-disk SQLite mirror holding compacted current state (`modernc.org/sqlite`, no cgo), keyed by a durable **drain cursor** committed in the same SQLite transaction as each segment. `Open()` rebuilds memory **base-first** from the mirror, then replays the **undrained WAL tail** on top. See *Recovery — SQLite mirror + WAL tail*.
-
-### Designed, not yet implemented
-
-| Feature | Milestone |
-|---|---|
-| FrankenPHP cgo binding — native-array API (`hazedb_fetch`/`hazedb_fetchall`/`hazedb_exec`) shipped; `hazedb_exec_transaction` open | M8 |
-| Optional typed-struct query wrapper (ergonomics; not a speed mechanism) | post-1.0 |
+This RFC describes the **target architecture**; not all of it is built. What is built, what is open, and the milestone roadmap live in [rfc-status-roadmap.md](rfc-status-roadmap.md) — kept out of the design doc so it needs no upkeep here.
 
 ---
 
 ## Store foundation
 
-### Sharded RWMutex over generic rows (typed generated structs planned)
+### Sharded RWMutex over generic rows
 
 ```
 shards = runtime.NumCPU() * 4   (floor 64, cap 1024, rounded to power-of-two)
 ```
 
-The shard count is computed once at `Open()` and fixed for the process lifetime (power-of-two so routing is a mask, not a modulo). It is **runtime-derived, not persisted**: nothing shard-specific is written to the WAL or snapshot (both are logical — typed mutations / row dumps, never shard ids), so a WAL/snapshot written on a 32-core box (128 shards) replays correctly on an 8-core box (64 shards). Every row simply re-routes under the new count, and since PK lookups, `pkDirectory`, and tail indexes all derive placement from the same live count, the result is internally consistent — only the physical layout differs. The single hard requirement is that routing be identical for live writes, replay, and snapshot-load within one process; do not cache a routing result computed under a different count.
+Fixed at `Open()`, power-of-two so routing is a mask. **Runtime-derived, not persisted** — nothing shard-specific reaches the WAL or mirror (both are logical), so a WAL/snapshot from a 32-core box (128 shards) replays on an 8-core box (64 shards): every row re-routes under the new count, and PK lookups, `pkDirectory`, and tail indexes all derive placement from the same live count. The one requirement: routing is identical for live writes, replay, and load within one process.
 
-Two table shapes exist; shard routing and PK uniqueness enforcement differ between them.
+Two table shapes.
 
-**Non-partitioned table** (default — no `PartitionKey` declared):
+**Non-partitioned** (default) — shard by `FNV-1a(PK)`; PK uniqueness and `WHERE id = ?` are shard-local (one lock, O(1)). For lookup-heavy tables (users, sessions).
 
 ```go
 type tableShard struct {
     mu   sync.RWMutex
     rows []Row             // append-only arena; tombstones for deletes
-    pk   map[UUID]uint64   // PK → rowID; shard determined by FNV-1a(PK)
+    pk   map[UUID]uint64   // PK → rowID
     live int
 }
 ```
 
-PK uniqueness and `WHERE id = ?` are fully local to the shard — one lock, O(1).
-
-> **Note:** the target keys this map by `UUID` (a fixed `[16]byte`), matching the partitioned `pkDirectory`'s `map[UUID]rowLocation`. A `[16]byte` is a comparable array usable as a map key with no allocation. The current M1+M2 code keys by `string` (integer/string PK, UUIDv7 not yet enforced — see *Implementation status*); that costs a string allocation + string hash per lookup and is inconsistent with the partitioned path. Switch to `map[UUID]uint64` when UUIDv7 enforcement lands (M3).
-
-**Partitioned table** (`PartitionKey` declared):
+**Partitioned** (`PartitionKey` declared) — shard by `FNV-1a(PartitionKey value)`. For append/scan-heavy tables (messages, events, logs).
 
 ```go
 type tableShard struct {
     mu    sync.RWMutex
-    rows  []Row                          // rows for ALL partition values that hash to this shard
-    tails map[PartitionValue]*partitionIndex  // one ordered tail index per partition value
+    rows  []Row                              // rows for ALL partition values hashing here
+    tails map[PartitionValue]*partitionIndex // one ordered tail index per partition value
     live  int
 }
-
-// One pkDirectory per partitioned table — not per shard.
-type pkDirectory struct {
-    mu  sync.RWMutex
-    idx map[UUID]rowLocation
-}
-
-type rowLocation struct {
-    shard uint16
-    rowID uint64
-}
+// One pkDirectory per table, not per shard:
+type pkDirectory struct { mu sync.RWMutex; idx map[UUID]rowLocation }
+type rowLocation struct { shard uint16; rowID uint64 }
 ```
 
-**A shard is not a partition value.** Routing is `FNV-1a(PartitionKey value) % shards`, and there are far fewer shards (64–1024) than distinct partition values, so multiple partition values necessarily collide into the same shard. The guarantee is one-directional: all rows for a *given* partition value land in *one* shard — but that shard's arena holds rows for every partition value that hashes to it. Therefore the ordered tail index **must be namespaced per partition value** (`map[PartitionValue]*partitionIndex` above), not a single per-shard index. A single per-shard index would interleave rows from unrelated partition values into one `seqs`/`rowIDs` order, so a tail scan for conversation P would return conversation Q's messages whenever P and Q collide. The rowIDs in each per-partition index still point into the shard's single shared arena (rowIDs are unique within the shard), so no `(shardID, rowID)` pairs are needed.
+There are far fewer shards than partition values, so many partition values collide into one shard. The guarantee is one-directional: all rows for a *given* partition value land in *one* shard, but a shard holds many partition values. So the **tail index is namespaced per partition value**, never a single per-shard index — which would interleave unrelated partitions, returning conversation Q's messages on a scan for P. rowIDs are unique within a shard and index its shared arena, so no `(shard, rowID)` pairs are needed.
 
-The per-shard `pk` map is absent for partitioned tables. PK uniqueness and `WHERE id = ?` go through the table-wide `pkDirectory`. INSERT: acquire pkDirectory lock → reject duplicate → acquire partition shard lock → write row → record location in pkDirectory → release both. `WHERE id = ?`: pkDirectory lookup → rowLocation → shard read. Two lock acquisitions instead of one; both O(1).
+Partitioned tables have no per-shard `pk` map: PK uniqueness and `WHERE id = ?` go through the table-wide **`pkDirectory`**. INSERT takes the pkDirectory lock (reject dup) → shard lock → write → record location. `WHERE id = ?` is pkDirectory lookup → `rowLocation` → shard read — two O(1) locks instead of one. **The `pkDirectory` is not deferred:** without it two partitions could hold the same UUID undetected and `WHERE id = ?` has no deterministic shard — PartitionKey tables are broken without it.
 
-**Read-path TOCTOU — the shard read must re-validate liveness.** If the pkDirectory lock is released before the shard lock is taken (the concurrency-favouring choice), a concurrent `DELETE` can tombstone the row between the lookup and the read:
+**Read-path TOCTOU.** Releasing the pkDirectory lock before the shard lock lets a concurrent `DELETE` (or a `DELETE`+`INSERT` move) tombstone the captured location. The rule: **on a tombstone or PK-mismatch at the resolved location, re-do the pkDirectory lookup — never return not-found from a stale location.** A PartitionKey move tombstones the old slot and writes a new one atomically; a reader holding the old location must re-look-up (→ the new location, or genuinely gone), else it reports a phantom disappearance for a PK that never left. The re-lookup also covers the compactor renumbering rowIDs; bound the retries against a move-storm. (Alternative: hold the pkDirectory read lock across the shard read — no TOCTOU, but every point-read serialises against every delete/move. Default is release-then-retry.)
 
-```
-reader:  pkDirectory → {shard 5, rowID 100}, release pkDirectory lock
-deleter: pkDirectory lock (remove entry); shard 5 lock (tombstone rowID 100)
-reader:  shard 5 lock → reads rowID 100 → finds a tombstone
-```
+**Row representation — `[]Value` tagged union.** A `Row` is `[]Value`; `Value` is a **packed 32-byte tagged union** (down from 72): int/bool in a word, a UUID inline, a string/bytes backing pointer in one `unsafe.Pointer` (nil or a real Go pointer, so the GC scans it). No binary rows, no deserialization on reads; read through typed accessors (`Int`/`Str`/`Bytes`/`UUID`/`Bool`). Halves resident memory and bytes copied per read. (A post-1.0 typed-struct wrapper can copy a `Row` into a Go struct for ergonomics; the engine runs on `[]Value`.)
 
-**Correction to an earlier draft (this was wrong before).** A previous revision said the read path should treat "rowLocation points at a tombstone / PK mismatch" as **not-found**. That is itself a bug. Consider a `DELETE` + `INSERT` of the *same* PK committed atomically in one transaction — exactly the PartitionKey-move pattern (`DELETE` + `INSERT` under a transaction, per *Immutability*). The transaction tombstones the old location, removes the old `pkDirectory` entry, writes the new row, and records the **new** location in the directory — all atomically. A reader that captured the *old* location before the transaction, then reads the shard after the transaction commits, sees a tombstone at the old rowID. Returning not-found is a phantom disappearance: the PK existed before the transaction and exists after it (at the new location); it was never absent. The row only "vanishes" because the reader is holding a stale location.
+**Immutability, enforced at plan time** — the PK, the `PartitionKey`, and (on partitioned tables) the tail-index order column are never valid `UPDATE SET` targets; a move or re-order is `DELETE` + `INSERT` under a transaction. The order column is immutable because `partitionIndex` caches it in `seqs` parallel to `rowIDs`; mutating it in place would leave `seqs` stale and corrupt tail-scan order.
 
-**The correct rule: on tombstone or PK-mismatch at the resolved location, re-do the `pkDirectory` lookup; do not return not-found from a stale location.** The retry observes the directory's current state: either the entry is gone (genuine delete → now correctly not-found) or it points to the new location (move → read the new row). The background compactor can renumber a shard's rowIDs (only under the `pkDirectory` + shard write locks), so a slot may later hold a different PK — but the tombstone / PK-mismatch check at the resolved location detects exactly that and triggers this re-lookup, so there is no silent ABA and a single retry suffices in the common case; bound the retries to avoid a pathological move-storm loop. The alternative remains holding the `pkDirectory` read lock across the shard read — no TOCTOU at all, since the move (which needs the directory write lock for both the entry-removal and the entry-add) cannot interleave, but every point-read then serialises against every delete/move on that table. Pick one explicitly; the recommended default is release-then-**retry** (not release-then-return-not-found).
-
-**The `pkDirectory` is not deferred.** Without it, two different partitions can hold the same UUID undetected (each shard sees no local duplicate), and `WHERE id = ?` has no deterministic shard to check. PartitionKey tables are semantically broken without a table-wide PK directory — it is a hard prerequisite, not an optimisation.
-
-**Key design choices:**
-
-- **PK is always UUIDv7** — see *Primary key* section above.
-- **`[]Value` tagged union in memory** — no binary-encoded rows, no deserialization on the read path. A `Row` is `[]Value` where `Value` carries `Kind` (Null/Int/String/Bytes/Bool/UUID). `Value` is a **packed 32-byte tagged union** (down from 72): the kind-exclusive payloads overlap two `uint64` words plus one `unsafe.Pointer` — int/bool in a word, a UUID inline in the two words, a string/bytes backing pointer in the pointer (always nil or a real Go pointer, so the GC scans it). This roughly halves the resident dataset's memory and the bytes copied per read/scan; payloads are read through typed accessors (`Int`/`Str`/`Bytes`/`UUID`/`Bool`), so the layout stays private. An optional typed-struct wrapper (post-1.0) could copy a `Row` into a per-table Go struct for caller ergonomics, but the engine itself runs on `[]Value`.
-- **Shard routing:**
-  - **No `PartitionKey`** — shard by FNV-1a(PK). `WHERE id = ?` → one shard, one lock. Use for lookup-heavy tables (users, sessions).
-  - **`PartitionKey` declared** — shard by FNV-1a(PartitionKey value). All rows for the same partition value land in one shard, but that shard also holds other partition values that hash to it, so the tail index is namespaced per partition value (`map[PartitionValue]*partitionIndex`) with rowIDs into the shard's shared arena. `WHERE id = ?` → pkDirectory → rowLocation → shard, two locks. Use for append/scan-heavy tables (messages, events, logs).
-- **Immutability — enforced at plan time:**
-  - The PK column (`id`) is never a valid target of `UPDATE SET` — rejected at plan time.
-  - The `PartitionKey` column is never a valid target of `UPDATE SET` — rejected at plan time. Moving a row to a different partition requires `DELETE` + `INSERT` under a transaction.
-  - **The tail-index order column is also immutable** on partitioned tables that declare one — rejected at plan time. The `partitionIndex` caches each row's order value in `seqs` parallel to `rowIDs`; an `UPDATE messages SET seq = ?` would change the row's stored value while leaving `seqs` stale, silently corrupting tail-scan order. If a mutable order column is ever required, the index must be maintained on update (find the entry, re-position it — an O(N) slice-shift, the same cost as an out-of-order insert), not just the row. v1 takes the simpler immutable-order-column route: the ordering value is set at insert and never changed; a new order requires `DELETE` + `INSERT`.
-- **Tombstone on delete** — `rows[i] = nil`; for non-partitioned tables the local pk map entry is removed; for partitioned tables the pkDirectory entry is removed. On delete rowIDs stay stable, so the tail index needs no update. A background sweeper (`compact.go`) later compacts a shard once it has gone mostly dead — relocating the live rows, renumbering, and rewriting the pkMap/pkDirectory + tails — so tombstone slots are reclaimed in-process, not only on a snapshot restart.
-  - **Churn caveat (load-bearing for the stated use cases).** Two of the target workloads — session state and in-process caches — are high-eviction by nature. Because nothing reclaims tombstone slots before a snapshot/restart (M7, the *last* milestone), a delete-heavy table grows memory monotonically, and `partitionIndex` tail-scans with `LIMIT n` degrade over time: dead entries stay in the index (rowIDs are kept stable on delete), so a scan must skip accumulating tombstones to reach `n` live rows, turning an O(n) scan into O(n + tombstones). For insert+expire workloads this is unbounded growth and slowly rising tail latency between restarts. If those use cases are real targets, pull a minimal in-place arena/index compaction earlier than M7, or document the restart cadence required to bound memory.
+**Tombstone on delete** — `rows[i] = nil`, drop the pk-map/pkDirectory entry; rowIDs stay stable so the tail index needs no update. A background sweeper (`compact.go`) compacts a mostly-dead shard off the write path — relocating live rows, renumbering, rewriting pkMap/pkDirectory + tails — so tombstone slots are reclaimed in-process, not only at restart; `/meta`'s `tombstones` is the transient backlog between sweeps.
 
 ### Lock ordering — global invariant
 
-Every operation that acquires more than one lock must acquire them in this fixed order:
+Every operation taking more than one lock acquires them in this order, or it can deadlock:
 
 ```
 pkDirectory  (per partitioned table involved, ascending table index)
@@ -169,77 +89,64 @@ pkDirectory  (per partitioned table involved, ascending table index)
 → walMu
 ```
 
-Violating this order causes deadlock. The canonical failure mode without this rule:
+The shard order is **lexicographic `(table index, shard index)`**, not shard index alone — within one table that reduces to ascending shard index, but a cross-table transaction touching `A.3` and `B.3` would otherwise let one acquire `(A.3, B.3)` and another `(B.3, A.3)` → deadlock. Rules: partitioned writes take pkDirectory → shard(s), never the reverse; transactions take all pkDirectories (ascending table index) → all shards (lexicographic) → WAL; non-partitioned tables have no pkDirectory (shard → walMu). Schema is read-only after `Open()`; any future runtime schema lock sits above all of these.
 
-- regular partitioned write holds pkDirectory, waits for shard
-- concurrent transaction holds shard, waits for pkDirectory → neither can proceed
+### Background goroutines
 
-The shard order is **lexicographic `(table index, shard index)`**, not shard index alone. Within a single table shard indices are unique, so for single-table operations (everything through M5) this reduces to plain ascending shard index. But the moment a transaction spans two tables that both have, say, shard index 3, "ascending shard index" is ambiguous: one transaction could grab `(A.3, B.3)` while another grabs `(B.3, A.3)` → deadlock. The table-index-first tie-break removes this. (Relevant once cross-table transactions land — M6 / v1.1 — but the invariant is stated globally, so it must be unambiguous now.)
+Four long-lived `time.Ticker` loops, each one maintenance unit per tick. Started by `Open()` (after replay, so they never race a recovery reader), stopped by `Close()` via stop+done channels:
 
-**Rules that follow from this order:**
+| Goroutine | File | Work per tick | On `Close()` |
+|---|---|---|---|
+| **Drain loop** | `drain.go` | feed sealed WAL segments into the SQLite mirror, advance the drain cursor | flush + drain a final time |
+| **Compaction sweeper** | `compact.go` | compact any >half-dead shard (relocate live rows, renumber, rewrite pkMap/pkDirectory + tails) | stop immediately (reclamation is optional) |
+| **Index merger** | `secindex.go` | merge each indexed table's dirty overlay into its ordered base (time/size-triggered) | final merge |
+| **WAL flusher** | `wal.go` | seal the pending WAL buffer into the next segment if the size trigger has not | joined before the final seal |
 
-- Regular writes on partitioned tables: pkDirectory lock → shard lock(s). Never the reverse.
-- Transactions that touch one or more partitioned tables: acquire all involved pkDirectories in ascending table index order, then all involved shards in lexicographic `(table index, shard index)` order, then WAL. Never acquire a shard before a pkDirectory for the same table.
-- Non-partitioned tables have no pkDirectory, so they follow: shard lock(s) → walMu.
-- Table schema is read-only after `Open()`. If future runtime schema changes are added, a schema lock must be acquired before all of the above.
-- **The M7 checkpoint write-barrier sits at the very top of this order.** The consistent-cut checkpoint (see *Roadmap → M7*) pauses all writes via a global barrier; model it as an RWMutex where every write path takes the barrier in *read* mode before acquiring any pkDirectory/shard/WAL lock, and the checkpoint takes it in *write* mode. Because it is acquired before everything else, it cannot deadlock against the write path. Omitting it from the documented order is how a "pause all writes" barrier silently becomes a lock-order violation once it is implemented.
+**Panic containment — `runRecovered`** ([events.go](events.go)). hazedb is embedded **in-process** (Caddy/FrankenPHP), so an unrecovered panic in any of these would crash the *whole host* — and they sit behind no request-boundary recover (the Caddy handler and cgo entry points recover only the calling request). Each tick's work is wrapped in `runRecovered(name, fn)`: a deferred `recover()` that logs to the standard logger (never the single-connection `_hz_events` companion — a panic may hold a mirror tx/lock, so an INSERT could deadlock) and lets the loop continue. It does **not** release resources the panicked code held (a half-open mirror tx, a non-`defer`'d lock), so a subsystem may stall until restart — better than a crash, loudly logged. It cannot catch Go *fatal* errors (stack overflow — bounded separately; OOM; concurrent-map-write; cgo/`unsafe` faults); defense there is prevention + the external durable store.
 
 ### Primary key — UUIDv7, enforced
 
-Every table has exactly one primary key column. Its type is always UUIDv7 — a 128-bit, time-ordered UUID. This is not configurable.
+Every table has exactly one PK column, always UUIDv7 (128-bit, time-ordered). Not configurable. Benefits:
 
-**Why enforce it:**
+- **Client-side generation** — the caller mints the ID before insert; no round-trip for a sequence number.
+- **Engine simplicity** — PK is always `UUID`, so lookups are uniform `map[UUID]uint64`, no `any`-PK or per-table type switch.
+- **`ORDER BY id` = creation order to the millisecond, total within one process.** The high 48 bits are a unix-ms timestamp. Within a ms, `NewUUIDv7` ([uuid.go](uuid.go)) is monotonic via a 12-bit counter in `rand_a` (RFC 9562 §6.2 fixed-length dedicated counter), advanced by a lock-free CAS stamp that restarts at 0 each ms, borrows from the next ms on overflow, and never regresses on a backward clock — so byte-wise compare is exact creation order. **Across multiple independent writers** within-ms order is *not* coordinated (per-process counters): IDs interleave by ms but not sub-ms, so a cross-writer feed cursor must mint from one front-door, tolerate sub-ms reordering, or order by an explicit `seq`.
+- **Collision-safe even across writers.** With the counter in `rand_a`, an auto-gen UUIDv7 carries **62 bits** of crypto-random `rand_b`. In one process IDs are unique by construction. Two IDs from *different* writers collide only on identical ms **and** counter **and** `rand_b` — `1/2⁶² ≈ 1 in 4.6×10¹⁸` per eligible pair (~1 collision per ~30,000 years even at 1M IDs/s across 10 writers). So a UUIDv7 PK is safe as the replication/feed cursor; the only multi-writer caveat is *ordering*, not collision. (62 bits < UUIDv4's 122 — the price of time-ordering; for guaranteed cross-writer uniqueness, single front-door or a node-id embedded in `rand_b`.)
 
-- **Client-side generation** — the caller generates the ID before the insert; no roundtrip to hazedb for a sequence number
-- **`ORDER BY id` ≈ temporal order at millisecond granularity** — UUIDv7's high 48 bits are a unix-ms timestamp, so IDs sort by creation time *across* milliseconds. **Within a single millisecond the order is not guaranteed** unless the generator implements RFC 9562 monotonicity (a sub-ms counter in `rand_a`); a plain random-fill UUIDv7 sorts randomly inside the same ms. For strict feed order, either mandate a monotonic UUIDv7 generator or order by an explicit sequence column — which is exactly what the tail index's `seqs` provides. Do not rely on `ORDER BY id` alone for exact within-ms ordering.
-- **WAL merge is collision-safe in practice** — UUIDv7 carries 74 bits of randomness; the birthday-bound collision probability across billions of IDs is negligible. We accept this residual theoretical risk in exchange for coordination-free client-side generation
-- **Engine stays simple** — the PK type is always UUID, so the runtime engine never needs an `any` PK or a per-table type switch; lookups are uniform `map[UUID]uint64`
-
-**Auto-generation:** if the INSERT omits the PK column, hazedb generates a UUIDv7. If the caller supplies one, hazedb accepts it as-is. In both cases the concrete UUID is written to the WAL record before execution — the WAL never contains a bare INSERT without an explicit PK column, because replay must regenerate the exact same row under the exact same ID.
-
-**Migration from an existing database with a different PK scheme:** write a transfer script, insert rows into hazedb (which generates new UUIDv7 PKs), and store the original key as a regular column (e.g. `external_id`). hazedb provides no migration tooling — this is intentionally the caller's responsibility.
+**Auto-generation:** INSERT omitting the PK gets a generated UUIDv7; a caller-supplied one is accepted as-is. Either way the concrete UUID is in the WAL record **before** execution, so replay reproduces the exact row under the exact id. **Migration:** insert into hazedb (new UUIDv7 PKs), keep the original key as a regular column; no migration tooling is provided.
 
 ### Ordered index (tail-scan path)
 
-Only valid on tables with a `PartitionKey` declared. There is **one `partitionIndex` per partition value**, held in the owning shard's `tails map[PartitionValue]*partitionIndex` (see *Partitioned table* above). Because all rows for a given partition value live in one shard, that index's `rowIDs` point unambiguously into that shard's arena — no `(shardID, rowID)` pairs needed. A scan resolves `PartitionKey value → shard → tails[value]` and walks only that partition value's `seqs`/`rowIDs`, so rows from other partition values that happen to share the shard are never mixed in.
+Only on tables with a `PartitionKey`. One `partitionIndex` per partition value, in the owning shard's `tails`:
 
 ```go
 type partitionIndex struct {
-    seqs   []int64   // ordered by this column's value, for ONE partition value
+    seqs   []int64   // ordered by the order column, for ONE partition value
     rowIDs []uint64  // parallel pointers into the owning shard's shared arena
 }
 ```
 
-Monotone-append (chat/log) is O(1). Out-of-order is O(N) slice-shift.
-
-**rowID is `uint64`, not `uint32` — overflow is a real hazard otherwise.** RowIDs are monotonic indices into an append-only arena that includes tombstone slots and never shrinks before a snapshot/restart (M7, the last milestone). A `uint32` caps a shard at ~4.29 billion slots *ever allocated*, tombstones included. A hot or skewed shard under high insert/churn can reach that within a single long-running process — at the benchmarked 690k inserts/s concentrated on one shard, in well under two hours — and `uint32` wraparound is silent: a reused rowID aliases a different live row, so reads and updates corrupt unrelated data with no error. `uint64` removes the practical ceiling (the arena hits RAM limits long first). If `uint32` is kept for memory reasons, the allocator **must** hard-detect approaching `MaxUint32` and force a compaction/snapshot-restart before wraparound rather than silently wrapping.
+A scan resolves `PartitionKey value → shard → tails[value]` and walks only that value's `seqs`/`rowIDs`. Monotone-append (chat/log) is O(1); out-of-order is an O(N) slice-shift. **rowID is `uint64`, not `uint32`:** rowIDs are monotonic indices into an append-only arena (tombstones included) that only shrinks on a sweep/restart; `uint32` caps a shard at ~4.29B slots *ever allocated* and wraps silently (a reused rowID aliases a live row → silent corruption), reachable on a hot shard in under two hours at 690k inserts/s. `uint64` removes the ceiling (RAM binds first); if `uint32` is ever kept, the allocator must hard-detect approaching `MaxUint32` and force a compaction before wrap.
 
 ### Byte capacity and store stats (`MaxBytes`, `/meta`)
 
-Every shard keeps a running **byte tally** of its live rows, maintained under the shard lock by every insert/delete/update — never a walk. A row's cost (`rowCost`) is the sum of its cells' in-RAM footprint (the 32-byte `Value` plus any string/bytes backing) plus a fixed per-row overhead and a flat per-secondary-index charge; the payload term is exact, the overheads are modelled constants biased slightly high. That tally is the O(1) source two features read.
+Every shard keeps a running **byte tally** of its live rows, maintained under the shard lock by each insert/delete/update (never a walk). `rowCost` = the cells' in-RAM footprint (32-byte `Value` + any string/bytes backing) + a fixed per-row overhead + a flat per-secondary-index charge (payload exact, overheads modelled slightly high). Two features read this O(1) tally:
 
-**Store stats.** `MetaSnapshot` — HTTP `GET /meta`, PHP `hazedb_meta`, both emitting the same JSON — reports the table count, the configured `MaxBytes`, store-wide `total_rows` / `total_approx_bytes` / `total_tombstones`, and per table its row / column / secondary-index counts, `approx_bytes`, and `tombstones`. It reads the per-shard tallies under a brief RLock — O(shards), independent of row count — so a dashboard hit stays cheap on a large store. The sizes are estimates (exact payload + modelled overhead), not byte-exact accounting.
+- **Store stats.** `MetaSnapshot` — HTTP `GET /meta`, PHP `hazedb_meta`, same JSON — reports table count, `MaxBytes`, store-wide `total_rows`/`total_approx_bytes`/`total_tombstones`, and per table its row/column/secondary-index counts, `approx_bytes`, `tombstones`. It sums the per-shard tallies under a brief RLock — O(shards), independent of row count. Sizes are estimates.
+- **Byte cap.** `Options.MaxBytes` (Caddyfile `max_bytes`) bounds approximate RAM via a db-wide `byteBudget`: every INSERT **reserves** its `rowCost` before the WAL append, and a reservation that would exceed `MaxBytes` is rejected with `ErrCapacity` (HTTP **507**, PHP **-1**), applying nothing. Deletes release; size-changing UPDATEs adjust. **Never auto-evicts** — no LRU; the caller frees space with `DELETE`/`DROP TABLE`. `MaxBytes == 0` (default) is unlimited (one predictable branch on the hot path; ~+11 ns per insert when capped). `reserve` adds-then-backs-out, so the ceiling is never exceeded (two inserts racing the last bytes can both reject — conservative). An UPDATE that grows a row is accounted but not gated, so a grow can push over `MaxBytes` and inserts then reject until space frees — a known edge, not a leak.
 
-**Arena slots are reclaimed by a background sweeper** (`compact.go`). A delete nils the arena slot and drops the PK from the pkMap/pkDirectory; the slot is not reused inline (rowIDs stay stable for the pointers), but a low-rate sweeper compacts any shard gone more-than-half dead — relocating the live rows and renumbering, off the write path — so a heavy insert+delete workload no longer grows arena memory unbounded until a restart. `/meta`'s `tombstones` / (`rows` + `tombstones`) is the visibility into the transient backlog between sweeps; a restart-from-checkpoint still compacts fully.
+---
 
-Two mechanisms keep this bounded while running. (1) The delete path prunes a partitioned table's `tails` scan list of dead rowIDs once they reach half the list (amortized O(1) per delete, no live row moved), so `scanPartition` never walks more than ~live. (2) A **background sweeper** (`compact.go`, default 200ms) reclaims the dead **arena slots** themselves: each tick it compacts any shard that has gone more-than-half dead — relocating the live rows into a fresh arena, renumbering `rowID`s, and rewriting the `pkMap` (non-partitioned) or `pkDirectory` + `tails` (partitioned). Secondary indexes and the ordered sorted view are PK-keyed, and `rowID`s are not persisted, so neither they nor the WAL need touching. It runs off the write path, so a user delete never pays the O(live) relocation; it pre-checks each shard under a shared lock and only write-locks the dense ones. So `/meta`'s `tombstones` is now a gauge the sweeper drives back down, not a number that only a restart resets. (Compaction holds the shard write lock for its duration — a brief stall on that shard, the price of reclamation; tunable via the interval.)
+## WAL — format (logical typed-mutation)
 
-**Byte cap.** `Options.MaxBytes` (Caddyfile `max_bytes`) bounds the store's approximate RAM. A db-wide `byteBudget` holds the live total — the sum of the per-shard tallies — and every INSERT **reserves** its `rowCost` against it before the WAL append; a reservation that would push the total past `MaxBytes` is rejected with `ErrCapacity` (HTTP **507 Insufficient Storage**, PHP **-1**), applying nothing. Deletes release and size-changing UPDATEs adjust the total. **The store never auto-evicts** — there is no LRU; the caller frees space with `DELETE` / `DROP TABLE`. This matches the in-memory stance (the source of truth lives elsewhere): a full store fails the write loudly rather than silently dropping data.
+Each record stores the resolved *operation* — op kind, target table, the concrete typed parameters applied — not SQL text and not physical row-image bytes. *Logical* because replay re-applies through the store's apply path (surviving storage-layout changes, carrying TXN grouping); **not** the SQL-string form of Redis AOF / statement binlog — benchmarked and rejected (SQL text cost +50% bytes/insert, 2.5× bytes/delete, ~2× replay; see *Settled decisions*, changelog rev. 7, spike `wal_format_spike_test.go`).
 
-`MaxBytes == 0` (the default) is unlimited, and the hot path then pays only one predictable branch — the accounting cost lands solely on deployments that opt into a cap. When enabled it costs one atomic op per insert on the shared counter (measured ~+11 ns on the cheapest concurrent client-PK insert; heavier paths amortise it). `reserve` adds-then-backs-out rather than CAS-looping: the ceiling is **never exceeded**, but two inserts racing the last free bytes can both back out and both reject, leaving a little headroom briefly unused — conservative, never the reverse. An UPDATE that **grows** a row is accounted but not itself gated (only inserts reserve); a grow can push the total over `MaxBytes`, after which inserts are rejected until space frees — a known edge, not a leak (the total stays accurate).
-
-### WAL — format (logical typed-mutation)
-
-hazedb uses a **logical typed-mutation WAL**: each record stores the resolved *operation* — op kind, target table, and the concrete typed parameters that were applied — not the SQL text and not physical page/row-image bytes. It is *logical* in that replay re-applies the mutation through the store's apply path (so it survives storage-layout changes and carries transaction grouping + checkpoint markers), but it is **not** the SQL-string form used by Redis AOF or statement-based binlog.
-
-> **The SQL-string form was benchmarked against this and rejected** (spike preserved in [`wal_format_spike_test.go`](wal_format_spike_test.go)). Carrying the SQL text per record cost **+50% bytes on insert, +37% on a narrow update, +69% on a wide update, 2.5× on delete**, and **~2× replay time with more allocations** (every record re-runs prepare + the eval pipeline). Its only plausible advantage — a human/replication-friendly log — is largely illusory: the envelope is binary-framed with CRC regardless, and consumers already need the exact schema + UUID + transaction semantics to replay it. Typed-mutation keeps every architectural benefit of "logical" without the parser tax. See *Settled decisions* and the changelog (rev. 7).
-
-**Record envelope.** A single mutation body is not enough: the WAL must also carry grouped transactions (multiple mutations committed atomically) and checkpoint markers, and recovery must be able to tell records apart. Every record is therefore wrapped in a typed, versioned, self-delimiting envelope. **All multi-byte integers are little-endian, fixed.**
+**Record envelope** — typed, versioned, self-delimiting. All multi-byte integers little-endian, fixed.
 
 ```
 Envelope: magic:2 | type:1 | version:1 | length:4 | payload:length | crc32c:4
-          // crc32c (Castagnoli) computed over magic|type|version|length|payload
-          // type: 1=MUTATION  2=TXN  3=CHECKPOINT
+          // crc32c (Castagnoli) over magic|type|version|length|payload
+          // type: 1=MUTATION  2=TXN  3=CHECKPOINT (reserved, unused)
           // length bounds-checked against bytes-remaining before payload is read
 
 MUTATION payload:   op:1 | tableID:2 | op-body
@@ -247,7 +154,6 @@ MUTATION payload:   op:1 | tableID:2 | op-body
   UPDATE op-body:   pk-cell | nsets:2 | (col_ordinal:2 | typed cell) × nsets
   DELETE op-body:   pk-cell
 TXN payload:        stmt_count:4 | MUTATION-payload × stmt_count
-CHECKPOINT payload: snapshot_path_len:2 | snapshot_path | lsn:8
 
 typed cell:         kind:1 | payload
   Int / Bool:       value:8
@@ -255,291 +161,126 @@ typed cell:         kind:1 | payload
   Null:             (kind byte only)
 ```
 
-The asymmetry between op-bodies is the whole point of the format: INSERT carries the full row (it must), but UPDATE carries only the PK plus the changed columns (not the whole row, as a physical row-image would), which is where the measured size win comes from — a one-column edit on a wide row is 51B here vs 218B for a full row-image.
+The asymmetry is the point: INSERT carries the full row, UPDATE only the PK + changed columns (a one-column edit on a wide row is 51B vs 218B for a full row-image). Parameters are the **resolved** typed values actually applied — the auto-gen UUIDv7 PK and any defaults resolved *before* the record is written — so replay reproduces the exact row. A `[]byte` argument is deep-copied at the write boundary so storage never aliases a caller-held slice (only `bytes` columns).
 
-**Unknown version/type must fail loud, never skip.** (Correcting an earlier draft that said recovery should "skip records it doesn't understand" — that is a silent data-loss bug for a *data* WAL: skipping an unrecognised data record drops a committed mutation and diverges from the true state.) On replay, an envelope whose `version` is newer than the binary understands, or whose `type` is unknown, is a hard error that aborts `Open()` — the operator must use a compatible binary. Skipping is only ever acceptable for record types explicitly defined as optional/advisory (none today; `recCheckpoint` is reserved and unused — the snapshot-checkpoint design it was meant for was superseded by the SQLite mirror, see *Recovery — SQLite mirror + WAL tail*). This is distinct from *tail* truncation, where a torn/CRC-failing record at the very end is the incomplete tail and is correctly discarded.
+**Two replay invariants, both fail-closed:**
 
-**Decoded records are validated before they are applied, not just parsed.** Envelope framing (length, CRC, version/type) is bounds-checked during the read, but a crafted-but-CRC-valid record can still decode to a semantically impossible mutation — an UPDATE ordinal past the table's column count, or an INSERT row whose cell count differs from it (the count is the payload's own `numCols`). Applying those unchecked indexes a `Row` out of range, and replay runs inside `Open()` with no `recover()` — and a slice out-of-range is a panic, so it crash-loops the process on every boot until the WAL is removed (CRC is no defense when the file itself is writable — a shared volume or file swap). So `applyMutation` range-checks every decoded ordinal against the column count and requires the INSERT row to be exactly that wide, failing closed with `ErrWALCorrupt` — the same guard the SQLite drain path applies, kept symmetric between the two consumers of `decodeUpdateMutation` / `decodeRow`.
+- **Unknown `version`/`type` aborts `Open()` — never skipped** (skipping a data record silently drops a committed mutation).
+- **Decoded records are validated, not just parsed.** A CRC-valid record can decode to an impossible mutation (UPDATE ordinal past the column count, INSERT row of the wrong width); applying it indexes a `Row` out of range, and replay runs inside `Open()` with no `recover()` → a panic crash-loops every boot. `applyMutation` range-checks every ordinal and the INSERT width, failing closed with `ErrWALCorrupt` — symmetric with the SQLite drain.
 
-Parameters are serialised as typed values (UUIDv7, int64, string, bool, bytes, null) — **always the concrete, resolved values that were actually applied**, never the caller's original unresolved arguments. Auto-generated values (the UUIDv7 PK when the caller omits it, any server-side defaults) are resolved before the WAL record is written.
+**Execution pipeline (mandatory order, follows global lock ordering):** resolve auto-values → determine pkDirectory + shards → lock pkDirectory (partitioned) → lock all affected shards ascending → validate → **append WAL envelope while still holding the locks; on a `bw.Write` error, abort here and do not apply** → apply to memory → unlock. Holding the locks across both validate and append makes WAL order == in-memory apply order — two writers cannot append in one order and apply to RAM in another. For an arbitrary multi-shard WHERE, lock all table shards or wrap in `db.Transaction()`; one-shard-at-a-time is non-serialisable (see *Transactions*).
 
-**Input `[]byte` is cloned at the write boundary.** A `[]byte` argument (or a caller-built `Value` carrying one) is deep-copied when it is converted to a stored value, so storage never aliases a slice the caller still holds and could mutate after the call returns — that would corrupt the stored row and diverge it from the already-written WAL record. Strings are immutable and int/bool/UUID are value types, so this applies only to `bytes` columns. (Reads are already detached by the clone-under-lock path; this makes the write side symmetric.)
+**Atomicity is the envelope.** A TXN record is one self-delimiting envelope holding all the transaction's MUTATION payloads; durable iff fully present with a valid CRC. A torn TXN fails its CRC/length check on tail recovery and is discarded whole — no half-applied transaction exists in the WAL.
 
-**Atomicity comes from the envelope, not a separate COMMIT token.** A TXN record is one self-delimiting envelope holding all of the transaction's statements; it is durable iff the whole envelope is present with a valid CRC. A torn or truncated TXN envelope (interrupted mid-write) fails the CRC / length check during tail recovery and is discarded in its entirety — there is no such thing as a half-applied transaction in the WAL. This replaces the earlier "pairs followed by a `COMMIT` marker" framing: the commit boundary is the envelope boundary.
+**Tail recovery validates lengths before trusting them.** The envelope `length` and inner cell lengths are unauthenticated integers read *before* the CRC is reachable, so a truncated/corrupt final record can carry a bogus length — recovery bounds-checks each against the bytes remaining (else over-alloc/OOM or out-of-range panic). A short read or over-long `length` is the incomplete **tail** of an interrupted write → recovery stops there. A bad `magic` or a CRC mismatch on a *fully-present* record is **bit-rot**, not a tail: the good prefix is applied, the break logged, the rest of that segment skipped (recovery and the drain both continue, never abort/stall). With born-sealed segments a sealed file should not present a torn tail at all.
 
-**Execution pipeline for every write (mandatory order — follows global lock ordering):**
-1. Resolve all auto-generated values (generate UUIDv7 PK if absent, apply server-side defaults)
-2. Determine affected pkDirectory (if table is partitioned) and data shards
-3. Acquire pkDirectory write lock (partitioned tables only)
-4. Lock all affected data shards in ascending shard index order
-5. Validate (PK uniqueness, type checks, any constraints)
-6. Append WAL envelope — while holding all locks; **if the append (`bw.Write`) returns an error, abort here, enter the WAL error state, and do not proceed to step 7**
-7. Apply mutation to in-memory store (only reached if the append succeeded)
-8. Unlock: release shard locks, then pkDirectory lock
+**Replay** applies each typed mutation through the apply path in order — no parse, no re-validation. **`hazedb dump <wal>`** reconstructs readable SQL from the typed mutations for inspection.
 
-**Why locking before WAL write is critical:** without it, two concurrent writers can append their WAL records in one order but have the OS scheduler apply them to RAM in a different order. WAL and RAM diverge. Holding the lock across both step 5 and step 6 ensures WAL order and in-memory application order are identical by construction — the only way to write the WAL record is while you hold the lock that serialises the memory mutation.
+## WAL — durability
 
-**Multi-shard writes:** when the WHERE clause can touch more than one shard (i.e., no PK or PartitionKey constraint that pins a single shard), all affected shards must be locked before the WAL write. For arbitrary WHERE with an unknown shard set, the two safe choices are: lock all table shards simultaneously (guaranteed correct, potential contention spike), or require the caller to wrap the operation in an explicit `db.Transaction()`. The one-shard-at-a-time alternative is unsafe (non-serialisable writes + replay divergence) — see *Transactions → The problem* and *Settled decisions → Multi-shard non-PK writes*.
+The WAL is a directory of immutable, **born-sealed** segments. A write appends a complete envelope to an in-memory buffer under `walMu`; the buffer seals into the next segment — temp file → fsync → **atomic rename** — once it reaches **1 MiB** (`flushMaxBytes`) or **~0.5s** elapses, whichever first. A flush *is* a new sealed segment: no open "active" file, no rotate step. **One switch:** `WALPath` set turns it on, empty is memory-only — no durability levels, no per-write fsync.
 
-A bare `INSERT INTO messages (body) VALUES (?)` does not journal any SQL — the WAL record is the resolved INSERT *mutation*: op=INSERT, the table id, and the full row including the generated UUIDv7 PK. The PK is resolved (generated if the caller omitted it) before the record is written, so replay reproduces the exact same row under the exact same id.
-
-A grouped transaction is one `TXN` envelope containing `stmt_count` MUTATION payloads, applied in order on replay. A `TXN` envelope that fails its CRC/length check (torn write) is discarded whole.
-
-**Why typed-mutation — not physical row-image, not SQL-string:**
-
-| | Physical row-image | SQL-string logical | Typed-mutation (chosen) |
-|---|---|---|---|
-| Write size (insert / wide update / delete) | 127B / 218B / 24B | 190B / 86B / 60B | **127B / 51B / 24B** |
-| Update payload | full row every time | SQL + pk + changed params | **pk + changed columns only** |
-| Replay cost | direct apply (fast) | parse + eval pipeline (~2× slower, +allocs) | **direct apply (fast)** |
-| Encode | per-type cell codec | per-type cell codec + SQL copy | **per-type cell codec** |
-| Human readable | No | No — binary-framed with typed params + CRC anyway | No — `hazedb dump` reconstructs SQL |
-| Cross-version safe | No — breaks on storage format change | survives storage format changes | survives storage format changes (replay through apply path); breaks on schema changes |
-| Sync / replication | Hard | consumer needs schema + UUID + txn semantics | same — consumer needs schema + codec + UUID + txn semantics |
-
-Physical and typed-mutation are byte-identical for insert and delete; the difference is the update payload (delta vs full row) and that typed-mutation replays *logically* (through the apply path), enabling snapshots, TXN grouping, and checkpoint markers. SQL-string lost on the two dimensions that matter — write size and replay — without a real simplicity win (see the spike note above).
-
-**Replay:** apply each typed mutation against the store in order, through the apply path — no SQL parse, no re-validation (the values were validated before they were journaled). A mutation in the WAL either applies completely or was never written — no partial row state possible.
-
-**Tail-recovery robustness — validate lengths before trusting them.** Both the envelope `length` and the inner cell lengths (a row's `numCols`, each string/bytes `len`) are unauthenticated integers that must be read *before* the CRC can be verified (you must read `length` bytes to reach the CRC). A crash-truncated or corrupt final record can therefore carry a bogus length. Recovery must bounds-check the envelope `length` against the bytes remaining in the file before reading the payload, and likewise bound each inner cell length against the payload size — otherwise a corrupt tail length causes an over-allocation (OOM) or an out-of-range read/panic. A record that ends in a short read, or whose declared `length` exceeds what remains, is the incomplete tail of an interrupted write — recovery stops there. A wrong `magic` or a CRC mismatch on a *fully-present* record is **not** a tail — it is bit-rot (CRC alone does not protect against this, since it sits *after* the length-driven read). Recovery and the drain apply the good prefix before it, log the break, and skip the rest of that segment (then continue with the next), so one rotted record neither aborts `Open()` nor stalls the mirror. A non-current `version` or an unknown record type is handled the opposite way: those bytes are intact and intentional, merely unreadable by this binary, so they **abort `Open()`** (and a drain leaves its cursor unmoved) rather than be silently dropped — a committed record must never vanish without a loud failure. With born-sealed segments a sealed `seg-*.wal` should never present a torn tail in the first place; the length tolerance covers only odd truncation, not data loss.
-
-**`hazedb dump <wal-file>`** reconstructs each typed mutation into readable SQL for inspection. Because the WAL stores typed mutations rather than SQL text, this is a small reconstruction step (op + table + params → SQL), not a raw passthrough.
-
-### WAL — durability
-
-The WAL is a directory of immutable, **born-sealed** segments. A write appends a complete record envelope to an in-memory buffer under `walMu`; the buffer is sealed into the next segment file — written to a temp file, fsynced, then **atomically renamed** into place — as soon as it reaches **1 MiB** (`flushMaxBytes`) OR **~0.5s** has elapsed, whichever comes first. There is no separate "flush to an open active file" step and no rotate step: a flush *is* a new sealed segment.
-
-**One durability story, one switch.** `WALPath` set turns the WAL on; empty is memory-only. No durability levels, no per-write fsync mode, no flush/rotate-interval options.
-
-| WAL | Process-crash loss window | Power-loss guarantee |
+| WAL | Process-crash loss | Power-loss |
 |---|---|---|
-| off (`WALPath` empty) | everything (memory only) | none |
-| **on (`WALPath` set)** | ≤ the flush window (~0.5s, or sooner once 1 MiB buffers) | ≤ the flush window — each sealed segment is fsynced on creation |
+| off (empty `WALPath`) | everything (memory only) | none |
+| **on** | ≤ the flush window (~0.5s / 1 MiB) | ≤ the flush window — each segment is fsynced on creation |
 
-A crash loses only the un-sealed in-memory buffer; every segment already on disk is durable. **Acknowledge-after-fsync (zero acknowledged-loss) is deliberately not offered** — it costs an fsync per write, defeating the in-memory throughput that is the point of hazedb, and the data here is rebuildable from the source of truth. A deployment that needs zero-loss durability should use a disk-first database.
+A crash loses only the un-sealed buffer. **Acknowledge-after-fsync (zero acknowledged-loss) is deliberately not offered** — an fsync per write defeats the in-memory throughput that is the point, and this data is rebuildable from the source of truth; a zero-loss deployment uses a disk-first database. **Why born-sealed over append-then-rotate:** appending to an open segment leaves a partially-written file (a torn tail recovery must tolerate, indistinguishable from a later-corrupted sealed segment); writing each segment whole to a temp file and renaming makes a partial write invisible — a crash leaves either no segment or a complete one. So every `seg-*.wal` is complete by construction and any parse failure is unambiguous corruption (hard error). **Concurrency + error state:** writers and the flusher both take `walMu` (buffer never raced); `Close()` joins the flusher before the final seal. If a buffer append or seal errors, the DB enters a **permanent error state** — step 6 of the pipeline aborts *before* applying to memory (else RAM holds a change not in the WAL), all later writes return the error, reads continue; recovery requires close + reopen.
 
-**Why born-sealed (atomic rename) over append-then-rotate.** Appending to an open "active" segment leaves a file partially written at any instant, so a crash can leave a torn tail that recovery must detect and tolerate — and a *sealed* segment corrupted after the fact is then indistinguishable from that torn tail. Writing each segment whole to a temp file and `rename`-ing it into place makes a partial write invisible: a crash leaves either no segment or a complete one. So every `seg-*.wal` is complete by construction, recovery needs no torn-tail special case, and any segment that fails to parse is unambiguously real corruption (hard error — bad magic / wrong version / CRC mismatch abort `Open()`, never a silent truncation). The cost is holding ≤1 MiB / ≤0.5s of writes in RAM before they are durable — the same loss window the old flush-ticker had.
+## Recovery — SQLite mirror + WAL tail (M7)
 
-**Concurrency.** Writers append under `walMu`; the background flusher takes the same `walMu` before it touches the buffer; `Close()` stops the flusher (joining it) before sealing the final buffer. The 1 MiB size trigger fires inline on the writing goroutine, the time trigger on the flusher — both under the lock, so the buffer is never raced. A failed write or flush sets a sticky error and the write pipeline aborts before applying to memory (see *WAL error handling*). The flush interval is an internal test-only knob (`walFlushInterval`: 0 = 0.5s, negative disables the flusher for deterministic segment-count tests); the 1 MiB trigger always applies.
+Durability across restart rests on two on-disk artefacts: the **WAL segments** (recent tail) and the **SQLite mirror** (compacted base). The mirror lives in the **SQLite companion** — always a real file (`Options.CompanionPath`; default `hazedb.db` in WALPath, or the working dir with no WAL), **never in-memory** (an in-memory `CompanionPath` is rejected at `Open()` with `ErrCompanionInMemory`). The companion holds the `_hz_events` operational log (`ts, level, kind, message` — corrupt-segment skips, drain failures; the reserved `_hz_` table prefix can't collide with user tables) in every mode; the mirror part is filled by the drain when WAL is on.
 
-**WAL error handling:** if the record append (into the buffer) or a segment seal (`flushLocked`'s write/fsync/rename) returns an error — from the execution pipeline or the background flusher — the DB enters a permanent error state. **The append error matters as much as the seal:** step 6 of the execution pipeline must check `writeRecord`'s return and abort *before* step 7, so the in-memory mutation is never applied — otherwise RAM holds a change that is not (and may never be) in the WAL, diverging from any replay. In the error state all subsequent write calls return the WAL error immediately without touching in-memory state. Read-only queries may continue (subject to the usual async loss window: already-buffered-but-unsealed writes are visible and lost on restart if a crash precedes their seal). The error state is not recoverable without closing and reopening the DB.
+**The drain (normal operation).** A background loop feeds *sealed* segments into SQLite holding **current state** — compacted (`INSERT OR REPLACE` overwrites, `DELETE` removes), one row per live PK. Each segment applies in **one SQLite transaction**, and the segment number — the durable **drain cursor** (`last_drained_segment` in `_hz_meta`) — commits in that same transaction, so a crash mid-drain leaves a clean boundary (whole segment + cursor, or neither). A drained segment is then deleted from disk; the mirror is the system of record up to the cursor. Driver: `modernc.org/sqlite` (pure Go, no cgo). The drain is off the write path.
 
-### Recovery — SQLite mirror + WAL tail (M7)
+**Recovery on `Open()` (mirror present) — base-first, tail-on-top:**
 
-Durability across restart rests on two on-disk artefacts: the **WAL segments** (the recent write tail) and the **SQLite mirror** (a compacted base). The mirror lives in the **SQLite companion** — an always-present file on disk (`Options.CompanionPath`; default `hazedb.db` inside WALPath, or in the working directory with no WAL). The companion holds the `_hz_events` log in every mode; the mirror part is filled by the drain when WAL is on. It is always a real file — never in-memory. With no WAL there is no mirror (data stays in RAM and a restart starts empty), but the companion file still exists for logging.
+1. Open the mirror, read the drain cursor.
+2. Rebuild memory from SQLite (the compacted base, rows up to the cursor) through the insert path, **not re-journaled**.
+3. Remove WAL segments ≤ the cursor (already in the mirror).
+4. Replay the undrained tail (segments past the cursor) directly into memory, **on top of the base** — a tail UPDATE/DELETE of a mirrored row lands correctly because newer mutations apply last.
+5. Keep the WAL's segment counter **above the drain cursor** across restarts, so the next flush seals at `cursor+1` or higher — otherwise it could reuse a number ≤ the cursor that `drainOnce` skips forever, silently losing those writes.
 
-**The drain (normal operation).** A background loop feeds *sealed* WAL segments into an on-disk SQLite database that holds **current state** — compacted: an `INSERT OR REPLACE` overwrites, a `DELETE` removes, so the mirror is one row per live PK, not the mutation history. Each segment is applied in **one SQLite transaction**, and the segment number — the durable **drain cursor**, stored as `last_drained_segment` in the mirror's `_hz_meta` table — is committed in that *same* transaction. A crash mid-drain therefore leaves SQLite on a clean segment boundary: either the whole segment landed and the cursor advanced, or neither did. Once a segment is durably in SQLite it is deleted from disk — the mirror is the system of record for everything up to the cursor. The driver is `modernc.org/sqlite` (pure Go, no cgo), so the mirror adds no C-toolchain dependency. The drain runs off the write path; reads and live writes never touch it.
+The tail is replayed into memory, never re-drained into SQLite. **No WAL → no mirror:** data lives only in RAM (restart starts empty), but the companion file still exists for `_hz_events`. **`recCheckpoint` is reserved** — the original CHECKPOINT-record-naming-a-snapshot design was superseded by the mirror; the type stays reserved for format stability, unused.
 
-**Recovery on `Open()` (mirror present)** rebuilds **base-first, tail-on-top** — not the reverse:
+---
 
-1. Open the mirror and read the drain cursor.
-2. **Rebuild memory from SQLite** — the compacted base, every row up to the cursor. Rows enter through the table insert path and are **not re-journaled** (a WAL-free load).
-3. Remove WAL segments at or below the cursor (already folded into the mirror).
-4. **Replay the undrained WAL tail** — segments past the cursor — directly into memory, applied **on top of the base**. A tail `UPDATE` or `DELETE` of a row that already lives in the mirror lands correctly: newer mutations win because they apply last.
-5. Resume writes: the WAL's segment counter is kept **above the drain cursor** across restarts, so the next flush seals at `cursor+1` or higher — otherwise it could reuse a number ≤ the cursor, which `drainOnce` would skip forever, silently losing those writes on the next recovery.
+## SQL interpreter
 
-The undrained tail is replayed **into memory, never re-drained into SQLite** — the mirror is only ever advanced by the live drain, so recovery is a pure read of it.
+Path: `parseSQL(sql) → assignParamIndices → plan() → execSelect/execInsert/…`.
 
-**No WAL means no mirror — but the companion file still exists.** Without WAL the data lives only in RAM (the source of truth is elsewhere, so a restart starts empty): no mirror, no data recovery. The SQLite companion file is still there for the `_hz_events` log and health/perf — logging does not depend on durability.
+**Statement cache** (`sync.Map` keyed by SQL string) eliminates parse+plan on repeated calls. **Unbounded** — safe *only* because every value must be a `?` placeholder (see *Parameterize all values*), so the key space is the set of query *shapes*, finite. Inlining literals would mint a new key per value — a memory-leak/DoS vector.
 
-**The companion is always a file.** A real file on disk in every mode (`<WALPath>/hazedb.db`, the working-directory `hazedb.db`, or `Options.CompanionPath`) — never in-memory. An explicit in-memory `CompanionPath` (`:memory:`, or any DSN carrying `mode=memory`) is **rejected at `Open()`** with `ErrCompanionInMemory` (`Options.validate`), so the on-disk guarantee cannot be configured away — the companion must survive a restart to serve logging, health, and the mirror. When WAL is on it is also the data mirror's home and the recovery base. It holds the `_hz_events` table (`ts, level, kind, message`), where rare operator-relevant events — a corrupt segment skipped, a drain failure — are recorded as queryable rows for a dashboard, in every mode. A user `CREATE TABLE` in the reserved `_hz_` namespace is rejected so it cannot collide. Metrics and per-request counters stay in memory (the stats endpoints); high-frequency occurrences are counted, not logged per event.
+**PK fast path** — `WHERE id = ?` detected at plan time: non-partitioned → FNV-1a(id) → shard → local pk map (one lock, O(1)); partitioned → pkDirectory → rowLocation → shard (two locks, O(1)). No scan.
 
-**`recCheckpoint` is reserved.** The original M7 design — a `CHECKPOINT` WAL record naming a separate snapshot file — was superseded by the SQLite mirror. The record type stays reserved in the envelope for format stability but is unused: recovery loads the mirror, not a WAL-pointed snapshot.
-
-### Replication — read-only standby from snapshot + WAL tail (proposed)
-
-> **Status: proposed, not implemented.** The mechanism below reuses the recovery path verbatim; it documents the intended replication shape, not current behaviour.
-
-A second host can run a **read-only standby** rebuilt entirely from two shippable artefacts the primary already produces — a consistent base snapshot and the WAL tail after it — with almost no new code, because the standby's startup *is* the existing SQLite-mirror recovery (*Recovery — SQLite mirror + WAL tail*).
-
-**The base is a `VACUUM INTO` snapshot.** `VACUUM INTO 'snap.db'` writes a consistent, compacted, standard SQLite copy of the mirror in one statement, on a live database (it reads a WAL-MVCC snapshot, so the drain keeps running). A naive `cp` of the live mirror is unsafe — it can catch a transaction mid-flight, and the `-wal`/`-shm` sidecars make the copy inconsistent — but `VACUUM INTO` is atomic. The snapshot **carries its own drain cursor**: `VACUUM INTO` copies every table including `_hz_meta`, so `last_drained_segment` travels with it. The base is self-describing — it knows exactly which WAL segment the tail resumes at.
-
-**The standby start is the existing recovery path.** Ship the snapshot and the WAL segments past its cursor to the other host; it calls `Open(CompanionPath=snap.db, WALPath=copied-segments)`, and the unchanged `recoverFromSQLite` + tail-replay rebuilds the engine — load the base up to the cursor, replay the segments after it. No replication-specific code.
-
-**Why immutable files share safely.** SQLite's network-filesystem locking hazards apply to a *live, written* database shared between hosts — not to a *static, read-only* copy. A `VACUUM INTO` snapshot and the sealed WAL segments are immutable once produced, so any number of standbys can read their own copies with no locking and no corruption — shared disk, rsync, or object storage, it is just bytes.
-
-**The one correctness gate — retain WAL by cursor, never by age.** The snapshot is current to cursor `C`; the standby needs *every* WAL segment `> C`. But the live drain deletes a segment once it is durably in SQLite (`os.Remove` in `drainSegment`), so a race exists: while the snapshot still sits at `C`, the primary can drain and delete `C+1` before the standby has copied it — a gap. The fix is to gate WAL reclamation on `min(drain cursor, oldest still-supported snapshot cursor)` so no segment a live snapshot still needs is deleted; or to copy the segments atomically with the `VACUUM`, before the drain catches up. **Deleting WAL by wall-clock age ("keep the last hour") is the trap** — if the drain falls behind, or the snapshot is older than the window, age-based deletion drops a segment the snapshot still needs. Always cursor, never clock — the same rule the primary's own `removeDrainedSegments(lastDrained)` already follows.
-
-**Constraints.** *Single writer:* the standby is read-only; only the primary owns the canonical WAL. A standby loads the snapshot and replays the shipped tail but never produces its own canonical history (else the two diverge). *Freshness:* the standby is as current as the snapshot plus the tail shipped on top — an hourly snapshot means up to ~1h behind; streaming each sealed segment as it seals (≈ every flush interval, ~0.5s) brings it to within one flush of live.
-
-**Scope.** This gives cold standbys, read replicas, fast new-node bring-up, and backup/restore — all via immutable files. It does **not** give multi-master / shared-write: that is a consensus + conflict-resolution problem the file-shipping model does not address.
-
-### SQL interpreter (M1+M2 complete)
-
-Parse → plan → execute path:
-
-```
-parseSQL(sql) → assignParamIndices → plan() → execSelect/execInsert/...
-```
-
-**Statement cache** (`sync.Map` keyed by SQL string) eliminates parse+plan on repeated calls. **It is unbounded.** This is safe only as long as the key space is bounded — i.e. callers parameterise with `?` so the cache key is the query *shape*, not the data. Any path that inlines literal values into the SQL string (`... WHERE id = 'abc-123'`) produces a fresh key per value and grows the map without limit — a quiet memory leak / DoS vector. Enforce "always parameterise" at the API boundary, or bound the cache (LRU) if ad-hoc literal SQL must be allowed.  
-**PK fast path** — `WHERE id = ?` is detected at plan time. Non-partitioned tables: FNV-1a(id) → shard → local pk map, one lock, O(1). Partitioned tables: pkDirectory lookup → rowLocation → shard, two locks, O(1). No scan in either case.
-
-Supported today:
+Supported surface:
 
 ```sql
 SELECT col_list FROM table [alias]
        [[INNER | LEFT [OUTER] | RIGHT [OUTER]] JOIN table2 [alias] ON a.col = b.col]
        [WHERE expr] [ORDER BY col [DESC]] [LIMIT n] [OFFSET m]
-INSERT INTO table (cols) VALUES (vals)
-UPDATE table SET col = val [WHERE expr]
+INSERT INTO table (cols) VALUES (vals)        -- multiple VALUES tuples allowed; one atomic TXN
+UPDATE table SET col = val [WHERE expr]        -- arithmetic SET: balance = balance - ? (M3)
 DELETE FROM table [WHERE expr]
 ```
 
-WHERE supports: `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IS NULL`, `IS NOT NULL`, `?` params, literals (int/string/bool/null).
+WHERE: `= != <> < <= > >= AND OR NOT IS NULL IS NOT NULL`, `?` params. **Arithmetic in `SET`** (`balance = balance - ?`) is evaluated per row against the live value under the commit lock — read-modify-write with no lost-update window and no prior read.
 
-**Expression nesting is bounded (`maxExprDepth` = 256).** The recursive-descent parser recurses on parentheses (`parseAtom` re-entering `parseExpr`) and on chained `NOT`; nothing else nests (`AND`/`OR`/arithmetic chains iterate). Left unbounded, a crafted `WHERE` with ~1–2 MB of nested parens — under the adapter body cap — drives the parser past the goroutine stack limit, and a Go **stack overflow is a fatal error `recover()` cannot catch**: one request kills the process and the in-memory DB, bypassing the Caddy handler's recover, net/http's per-request guard, and the cgo path alike. The parser counts depth at those two recursion points and rejects past 256 with a normal `ErrParse` (→ 400 / PHP -1). 256 is far above any genuine query (real nesting is a handful deep) and far below the overflow point. The guard lives in the parser, so both adapters are covered; and because expression trees originate only from `parseSQL`, it transitively bounds the AST walks (`evalExpr` / `validateExpr` / `assignParamIndices`) too.
+**Expression nesting is bounded (`maxExprDepth = 256`).** The recursive-descent parser recurses only on parentheses (`parseAtom` → `parseExpr`) and chained `NOT`; everything else iterates. Unbounded, a ~1–2 MB nested-paren `WHERE` drives the parser past the goroutine stack limit, and a Go **stack overflow is a fatal error `recover()` cannot catch** — one request kills the process, bypassing every boundary recover. The parser rejects past 256 with `ErrParse` (→ 400 / PHP -1); because all expression trees originate in `parseSQL`, this transitively bounds the downstream AST walks too.
 
-**Joins (two-table, equi-join, indexed-only).** `[INNER|LEFT] JOIN t2 ON a.col = b.col` joins two tables on a single equality. The result row is the left table's columns concatenated with the right's; columns are addressed with `table.col` / `alias.col`, and an unqualified name must be unambiguous across the two tables. **Law: the probed (non-driving) join column must be the PK or carry an index** — a join on an unindexed column is rejected (`ErrUnindexedJoin`), never run as an O(A×B) scan. Execution is an indexed nested-loop: scan the driver, probe the other side via its PK map or secondary index (so a join is O(driver) probes). `INNER` drives whichever side keeps the probe indexed; `LEFT`/`RIGHT` (the `OUTER` keyword is optional) drive the preserved side and NULL-pad unmatched rows on the other side, so the *probed* side's join column must be indexed. `WHERE`/`ORDER BY`/`LIMIT`/`OFFSET` apply to the joined result; a single-table `WHERE` conjunct on the driving side is pushed down (and fetched via the driver's own index when it is an equality on an indexed column). The driver is materialised before probing (no cross-table lock held), so a join is **per-shard consistent, not point-in-time** — same contract as any multi-shard read. A column counts as "indexed" for the probe if it is the PK, a single-column index, or the **leading column of a composite `ORDERED INDEX`**; and when the probe table carries an `ORDERED INDEX (joinkey, ordercol)`, a probe-side `ORDER BY ordercol` is served by walking that join key's already-sorted sub-range and stopping at `LIMIT` (single-driver), instead of gathering the whole bucket and sorting — turning the headline filtered-feed join from ~1.1× slower than SQLite into ~4× faster.
+**Joins (two-table, equi-join, indexed-only).** Result row = left columns ++ right columns; address with `table.col`/`alias.col` (unqualified must be unambiguous). **Law: the probed (non-driving) join column must be the PK or carry an index** — an unindexed-probe join is rejected (`ErrUnindexedJoin`), never an O(A×B) scan. Execution is an indexed nested-loop: scan the driver, probe the other side via its PK map or secondary index (O(driver) probes). `INNER` drives whichever side keeps the probe indexed; `LEFT`/`RIGHT` drive the preserved side and NULL-pad. The driver is materialised before probing (no cross-table lock held), so a join is **per-shard consistent, not point-in-time**. A column is "indexed" for the probe if it is the PK, a single-column index, or the **leading column of a composite `ORDERED INDEX`**; with `ORDERED INDEX (joinkey, ordercol)`, a probe-side `ORDER BY ordercol` walks the already-sorted sub-range and stops at `LIMIT` (single-driver). **Not supported (deliberate): `FULL OUTER`, `CROSS` (no join column to index), N-way joins, non-equi `ON`, covering indexes.** Composite multi-column `ORDERED INDEX (a, b)` *is* supported (prefix equality + `WHERE a=? ORDER BY b` without a sort).
 
-**Not supported: `FULL OUTER` and `CROSS` (deliberate, not an oversight).** A `CROSS JOIN` is the Cartesian product (every left row × every right row) with no `ON` equality — there is no join column to index, so it is the one join shape that *cannot* satisfy the indexed-only law and cannot be made `O(driver)`. It is excluded by design, not deferred. A `FULL OUTER JOIN` preserves unmatched rows from *both* sides; the indexed nested-loop drives one side and probes the other, so emitting the probed side's unmatched rows would require tracking every probe hit and a second pass over the misses — driving both sides. It is tractable but unbuilt, deferred until a real need appears. (For the SQLite-vs-hazedb sync-checking use case, neither is required — compare per-table by PK instead.) Note both *do* exist in modern SQLite — `CROSS JOIN` always, `FULL OUTER JOIN` since 3.39 (2022) — so this is hazedb's narrower surface, not a shared limitation. Also deferred: N-way (3+ table) joins, non-equi `ON` conditions, covering indexes. (Composite multi-column indexes **are** supported — `ORDERED INDEX (a, b)`, NOT-NULL columns — serving prefix equality and `WHERE a=? ORDER BY b` without a sort; see the SQL layer doc.)
+**`OFFSET m`** skips the first `m` matches (in `ORDER BY` order; else the same undefined scan order `LIMIT` uses), on every read path; standard fetch-and-skip (a large offset still walks that many). `LIMIT m, n` not accepted — use `LIMIT n OFFSET m`.
 
-`OFFSET m` skips the first `m` matched rows (in `ORDER BY` order; without `ORDER BY`, in the same undefined scan order `LIMIT` uses) and applies on every read path — PK/index/ordered-walk/scan and the streaming reads. It is the standard fetch-and-skip: a path fetches `m+n` matches (the top-N heap keeps `m+n`) and drops the first `m`, so a large offset still walks that many matches — the usual SQL `OFFSET` cost. `LIMIT m, n` (MySQL short form) is not accepted; use `LIMIT n OFFSET m`.
-
-**Read consistency of multi-shard SELECT (explicit).** A `SELECT` pinned to a single shard — `WHERE id = ?` on a non-partitioned table, or any scan confined to one partition value on a partitioned table — reads under that shard's read lock and is a consistent point-in-time view. A `SELECT` whose `WHERE`/`ORDER BY`/`LIMIT` spans multiple shards (no PK/PartitionKey pin) does **not** read all shards under a single lock by default: it takes and releases each shard's read lock in turn, so concurrent writes between shard reads mean the assembled result can reflect a mix of moments and may represent no single instant that ever existed. This is the read-side counterpart of the multi-shard write rule. The contract is: **per-shard consistent, not globally point-in-time.** Callers needing a consistent cross-shard snapshot must either pin the query to one shard, or use the consistent path — read-lock all involved shards for the duration of the scan (correct, but an all-shard read-lock contention spike, same tradeoff as multi-shard writes). `ORDER BY` + `LIMIT` over a multi-shard scan inherits this: it merges per-shard results that were each consistent only at their own read instant. **And it must gather-then-sort: `LIMIT n` cannot be pushed down to each shard.** A correct multi-shard `ORDER BY col LIMIT n` collects all matching rows (or at least the top-n per shard) from every involved shard, merges, sorts globally, then applies `LIMIT n`. Taking `n` rows *per shard* and concatenating gives wrong results; even taking the per-shard top-n is only valid as an optimisation if each shard is individually sorted on `col` first. Document which mode a given query uses; do not assume snapshot semantics for unpinned scans.
-
-**Arithmetic in `SET` (`balance = balance - ?`) is supported** (M3): the right-hand side of a `SET` may reference a column, evaluated per row against the live value. This is what lets a transaction express read-modify-write without a prior read — the arithmetic is evaluated under the commit locks, so no lost-update window exists.
+**Read consistency of multi-shard SELECT.** A SELECT pinned to one shard (`WHERE id = ?`, or a scan confined to one partition value) reads under that shard's lock — a consistent point-in-time view. A SELECT spanning shards takes and releases each shard's read lock in turn, so the assembled result may reflect a mix of moments. The contract is **per-shard consistent, not globally point-in-time** (the read-side counterpart of the multi-shard write rule). A multi-shard `ORDER BY col LIMIT n` must **gather-then-sort**: collect (at least the top-n per shard, only if each shard is sorted on `col`), merge, sort globally, then `LIMIT` — taking `n` per shard and concatenating is wrong. For a consistent cross-shard snapshot, pin to one shard or read-lock all involved shards for the scan (all-shard contention spike).
 
 ---
 
 ## Query API
 
-**One runtime engine serves every query.** `db.Query()` / `db.Exec()` parse a SQL string once, cache the compiled plan, and re-run it from the cache on every subsequent call. There is no separate "hot path" — this *is* the hot path. The interpreter was measured at roughly 8× SQLite on point reads *without* any code generation, so the engine carries the speed on its own; codegen is not a precondition for performance.
+**One runtime engine serves every query** — `db.Query()`/`db.Exec()` parse a SQL string once, cache the compiled plan, re-run from cache. There is no separate "hot path"; this *is* it (~8× SQLite on point reads with no codegen).
 
 ```go
-rows, err := db.Query("SELECT body FROM messages WHERE id = ?", id)
-// rows is []Row; the plan for this SQL string is parsed once and cached
-
-_, row, err := db.QueryRow("SELECT body FROM messages WHERE id = ?", id)
-// row is a single Row (nil if no match) — no []Row result slice is allocated;
-// for a PK-pinned lookup this is the leanest read (2 allocs: the row + arg box)
-
-n, err := db.Exec("INSERT INTO messages (id, body) VALUES (?, ?)", id, "hello")
-// n is rows affected
+rows, err := db.Query("SELECT body FROM messages WHERE id = ?", id)   // []Row; plan cached
+_, row, err := db.QueryRow("SELECT body FROM messages WHERE id = ?", id) // single Row, nil if none; no []Row alloc
+n, err := db.Exec("INSERT INTO messages (id, body) VALUES (?, ?)", id, "hello") // rows affected
 ```
 
-`QueryRow` returns the first matching row without the `[]Row` slice `Query` allocates; for a PK lookup it goes straight through the point-read path. For an unpinned query it returns the first row of the scan, so add `LIMIT 1`.
+`QueryRow` skips the `[]Row` slice; for an unpinned query it returns the first scan row, so add `LIMIT 1`.
 
-### Prepared statements
+**The gateway — one official entry point.** `*DB` is the single entry point: Caddy calls these methods as native Go; the FrankenPHP extension reaches the *same* methods via cgo (`C → exported Go → same verbs`). There is no second transport. Verbs: `Open`/`Close`/`FlushWAL`/`Exec`/`Query`/`QueryRow`/`Transaction`. Three guarantees every consumer inherits:
 
-`db.Prepare(sql)` compiles a SQL string to a plan once and returns a `*Stmt` that holds it, skipping the per-call statement-cache lookup (no SQL-string hash) that the bare `Query`/`Exec` path pays. The handle rebinds its plan automatically if a `CREATE`/`DROP` changes the catalog after `Prepare` (one atomic load + version compare on the hot path), and is safe for concurrent use.
+- **Validation** — SQL parsed, planned, bound to the live catalog (`prepare()`); args type-coerced (`toValue`). Every value must be a `?` placeholder (below), which bounds the plan cache and makes injection structurally impossible.
+- **Boundary clone** — `[]byte`/`Value` args deep-copied in; returned rows deep-cloned out, so callers may retain them past later writes.
+- **No bypass** — storage types (`table`, `shard`, `catalog`, `wal`) are unexported. Cross-cutting concerns (auth, tenancy, PHP↔Go marshalling) live in the consumer/adapter, which calls the same verbs.
+
+**Parameterize all values — the `?` requirement.** Every value **must** be a `?`; an inline literal (`WHERE email = 'a@b'`, `SET age = 30`) is rejected at `prepare()` with `ErrParse` (`rejectValueLiterals`). `LIMIT`/`OFFSET`/`ORDER BY`/`IS [NOT] NULL` are structural, not values. Two load-bearing properties: (1) **the plan cache stays bounded** (key = SQL string = query shape, finite — splicing values mints a new key per value, unbounded growth + reparse); (2) **SQL injection is structurally impossible** (a `?` value binds as a typed `Value` at execution, never reaching the lexer/parser). **Escape hatch — `db.ExecScript(sql)`:** a trusted, uncached, multi-statement boot/seed file with inline literals allowed (splits on top-level `;` via the lexer); never fed untrusted input.
+
+**Prepared statements.** `db.Prepare(sql)` returns a `*Stmt` holding the plan, skipping the per-call statement-cache hash; it rebinds automatically if a `CREATE`/`DROP` bumps the catalog version (one atomic load + compare on the hot path), concurrency-safe.
 
 ```go
 st, _ := db.Prepare("SELECT name, age FROM users WHERE id = ?")
-cols, rows, err := st.Query(args...)      // mirrors db.Query
-_, row, err := st.QueryRow(args...)       // mirrors db.QueryRow
-
-// Zero-allocation point-read fast path:
-dst := make([]Value, 0, 4)                // caller-owned buffer, reused
-out, found, err := st.QueryRowByPK(id, dst)
+cols, rows, err := st.Query(args...)
+dst := make([]Value, 0, 4)                       // caller-owned, reused
+out, found, err := st.QueryRowByPK(id, dst)      // typed UUID key + scan-into buffer
 ```
 
-`QueryRowByPK` is the hot-read fast path the in-process cgo/FrankenPHP front wants: the key is a typed `UUID` (no interface boxing) and the projected cells are written into a caller-owned, reused buffer (no result clone), so a projection without `BYTES` columns **allocates nothing**. `BYTES` cells are cloned to honour storage's no-alias guarantee; a non-PK-pinned statement is rejected as misuse.
+`QueryRowByPK` is the zero-alloc point-read fast path: typed `UUID` key (no interface boxing), cells written into the caller's reused buffer (no result clone), so a projection without `BYTES` columns **allocates nothing** (`BYTES` cells are cloned for the no-alias guarantee; a non-PK-pinned statement is rejected). Measured point read (go1.25): `db.QueryRow` ~87 ns / 2 allocs → `Stmt.QueryRowByPK` ~36 ns / **0 allocs**. (The handle alone saves only the cache hash ~6%; the win is the typed key + scan-into buffer — the stable, allocation-free read a non-Go consumer wants without changing the core.)
 
-The win is the typed argument plus the scan-into buffer, not the handle alone. Measured against `db.QueryRow` (point read, go1.25):
-
-| Path | ns/op | allocs |
-|---|---|---|
-| `db.QueryRow` (baseline) | ~87 | 2 |
-| `Stmt.QueryRow` (handle, `...any`) | ~82 | 2 |
-| `Stmt.QueryRowByPK` (typed + scan-into) | ~36 | **0** |
-
-The handle alone saves only the statement-cache hash (~6%); `QueryRowByPK` nearly halves the point read and removes every engine-side allocation. This is the layer that gives a non-Go consumer a stable, allocation-free read without changing the core.
-
-### The gateway — one official entry point
-
-`*DB` is the **single official entry point** — the gateway. Every consumer enters through it: Caddy calls these methods as native Go, and the FrankenPHP/PHP extension reaches them via cgo (`C → exported Go → the same methods`). **There is no second transport** — the PHP path is cgo calling the very same verbs, not a parallel API. This is the key difference from a network-fronted cache: both consumers bottom out in the same in-process Go call.
-
-The gateway verbs are `Open` / `Close` / `FlushWAL` / `Exec` / `Query` / `QueryRow`, plus `Transaction`. Every verb upholds three guarantees, so all consumers inherit them for free rather than re-implementing them per consumer:
-
-- **Validation.** SQL is parsed, planned, and bound to the live catalog (`prepare()`); args are type-coerced (`toValue`). Malformed SQL or args fail at the verb, identically for both consumers. Every value must be a `?` placeholder — an inline value literal is rejected (see *Parameterize all values*), which both bounds the plan cache and makes SQL injection structurally impossible.
-- **Boundary clone.** `[]byte`/`Value` args are deep-copied on the way in, so storage never aliases caller memory; returned rows are deep-cloned on the way out, so callers may retain them past later writes.
-- **No bypass.** The storage types (`table`, `shard`, `catalog`, `wal`) are unexported, so no consumer can reach storage around the validated verbs.
-
-**Boundary rule.** Database semantics live behind the gateway (the core package). Cross-cutting concerns — auth, tenancy, logging, and the PHP↔Go marshalling the extension needs — live in the consumer/adapter, which then calls the same verbs. The cgo extension is therefore a *translation layer* (PHP zvals ↔ Go `Value`, result-set marshalling), not a second API surface; Caddy needs none of that translation and calls the verbs directly. Consumer-specific concerns never move into the core.
-
-This is why hazedb has **no separate `Gateway` type** the way a multi-transport cache does: with one transport, `*DB` already *is* the gateway. A second public type would only restate what `*DB`'s exported surface already guarantees.
-
-### Output boundaries — Go-native vs protocol (deferred, to build on later)
-
-A design thread worth recording before it's built, because "gateway" hides two different boundaries:
-
-**db.go is the Go API boundary.** It returns Go types — `[]string`, `[]Row`, `Value`, `UUID`, `error`. A Go consumer (Caddy serving hazedb directly) handles those natively and needs nothing more. *Caddy-as-Go is not a special case* — it only needs encoding when it writes an HTTP wire response, at which point it's just another wire consumer.
-
-**A non-Go consumer needs a protocol boundary** — Go `Value`s turned into bytes a caller can read stably. That is real code that has to live somewhere, but it is *not* a new layer between Go and the engine: it sits **beside** db.go, calls the same gateway verbs, and encodes their results. The engine never learns it exists. Deferred shape (small package, function-level, not a service — only when the first non-Go consumer lands):
-
-```
-bridge/            // protocol/encoding boundary — portable, shared by wire consumers
-  EncodeRowsJSON
-  EncodeRowsMsgPack
-  DecodeParams
-  MapError
-```
-
-So there are **three** things, not two:
-
-1. **db.go** — the Go API boundary (gateway). Shared by every consumer.
-2. **`bridge/`** — portable encoders (JSON/MsgPack). Shared by *wire* consumers (HTTP responses, Node over a socket, debug). Deferred.
-3. **The PHP extension's `Value` → zval translation** — PHP-specific (depends on PHP headers), therefore *unshareable*; it lives in the extension, not in `bridge/`.
-
-**Open, bench-decided question:** what format the *fast* FrankenPHP path uses. hazedb's whole pitch is in-process cgo with no serialization roundtrip, so JSON on that path may reintroduce exactly the cost the architecture removes — the maximal-speed alternative is `Value` → zval directly in the extension (item 3). The cgo section below currently defaults to JSON-with-optional-skip; whether that is fast *enough* relative to the ~200 ns cgo crossing is a `build.sh` + `bench.sh` measurement, not an assumption. `bridge/` is useful for the portable consumers either way; the question only governs whether the PHP fast path routes through it or goes zval-direct.
-
-The `Value` accessors (`Str`/`Int`/`Bytes`/`UUID`) are already the stable read surface all of the above build on — a JSON encoder and a zval translator are both just "loop rows, switch on `Kind`, call the accessor." The encoding sits on top of that surface; it is not a second safety layer.
-
-### Prepared plans and the catalog version
-
-The engine memoises `SQL string → *plan` in a `sync.Map`. A plan never parses its SQL twice. Each cached plan is stamped with the **catalog version** it was bound against (see *Runtime catalog* below); on the next call the engine compares that stamp to the live catalog and:
-
-- **match** → reuse the cached plan directly (the common case — no parse, no re-bind),
-- **mismatch** → a `CREATE`/`DROP` has happened since, so re-parse and re-bind against the current catalog before running.
-
-This keeps a cached plan from ever pointing at a table that has since been dropped or replaced: after a `DROP`, the re-bind resolves the now-missing table and the call returns `ErrUnknownTable` cleanly, rather than dereferencing stale storage. Because the catalog version is monotonic and never reused, a stale stamp is always detected.
-
-The PK fast path (`WHERE id = ?` → one shard, O(1) map lookup) and the indexed partition scan (`WHERE partkey = ?`) are both properties of the compiled plan, so a runtime-created table reaches them exactly like a predeclared one — runtime tables are not second-class.
-
-### Parameterize all values — the `?` requirement
-
-Every value in a statement **must** be a `?` placeholder. An inline value literal — `WHERE email = 'a@b'`, `SET age = 30`, `VALUES ('x', 1)` — is rejected at `prepare()` with `ErrParse` (`rejectValueLiterals`). Only `?` carries values; `LIMIT`/`OFFSET`/`ORDER BY` and `IS NULL`/`IS NOT NULL` are structural, not values, so they are untouched. It is enforced once at the gateway, so both consumers (Caddy, the PHP extension) inherit it.
-
-Two load-bearing properties fall out — which is why it is a hard rule, not a convention:
-
-- **The plan cache stays bounded.** The cache key is the SQL string. A parameterized statement set is finite — one key per query *shape* — so the cache (above) converges and every later call reuses a plan. Splicing values into the text would mint a new key per value (`email = 'a@b'`, `email = 'c@d'`, …), growing the cache without bound in a long-lived process and turning every call back into a parse. The `?` rule is what makes "parse once, reuse forever" actually hold.
-- **SQL injection is structurally impossible.** A `?` value rides in as a typed `Value` bound at execution; it never passes through the lexer/parser, so no byte of it can become SQL syntax — `' OR 1=1 --` is just a string compared to a column. (The single-statement parser also rejects a smuggled second statement, and Go's memory safety caps any residual mischief at the logical-SQL level — never a buffer overflow.) The in-process cgo/PHP path inherits this for free: it forwards the SQL string verbatim and the args as a separate typed `[]Value` to the `*Values` verbs, so a value can never reach the SQL text.
-
-**Trusted escape hatch — `ExecScript`.** An operator's boot/seed script is trusted, run once, and has no `?` args, so inline literals there are neither an injection vector nor a cache-growth risk. `db.ExecScript(sql)` runs such a multi-statement file with inline literals allowed: it splits on top-level `;` using the lexer (so a `;` inside a string literal does not split) and runs each statement. It is **not** cached and must never be fed request or otherwise untrusted input.
-
-### Optional typed-struct wrapper (post-1.0, not a speed mechanism)
-
-The engine returns `[]Row` (a `[]Value` tagged union). Callers who want typed Go structs instead of pulling fields out of `Value` cells can, post-1.0, layer a thin generated wrapper on top of the *same* prepared plans:
-
-```go
-// optional, generated from a declared query — ergonomics only:
-type MessageBodyRow struct{ Body string }
-func (q *Queries) SelectBodyByMessageID(id UUID) ([]MessageBodyRow, error)
-```
-
-The wrapper calls the identical executor and copies each `Row` into the typed struct. It buys **compile-time type safety and nicer call sites**, not throughput — the plan it runs is the one the runtime engine already caches. It is therefore optional, deferred, and explicitly subordinate to the runtime engine: hazedb is fast with codegen absent. (Earlier revisions of this RFC made codegen the hot path and the interpreter a "fallback"; that is inverted — the runtime engine is primary, codegen is an optional ergonomic layer.)
-
-### FrankenPHP / cgo boundary
-
-The primary cgo entry points map straight onto the runtime engine:
+**FrankenPHP / cgo boundary.** The cgo entry points map straight onto the engine; one parse per distinct string (cached), one cgo crossing per call. Args are a native PHP array (PDO-style); result rows come back as native PHP arrays via zval trampolines — no JSON crosses the boundary. See [docs/php-array-bridge.md](docs/php-array-bridge.md).
 
 ```php
-hazedb_fetch("SELECT body FROM messages WHERE id = ?", [$id])      // → ['body'=>...] or null
-hazedb_exec("INSERT INTO messages (id, body) VALUES (?, ?)", [$id, "hello"])  // → affected count
+hazedb_fetch("SELECT body FROM messages WHERE id = ?", [$id])                  // → ['body'=>…] or null
+hazedb_exec("INSERT INTO messages (id, body) VALUES (?, ?)", [$id, "hello"])    // → affected count
 ```
 
-One SQL parse per distinct string (cached thereafter), one cgo crossing per call. Args are a native PHP array (PDO-style) and result rows come back as native PHP arrays built via zval trampolines — no JSON crosses the boundary in either direction. See [docs/php-array-bridge.md](docs/php-array-bridge.md) for the full design + benchmarks.
+*(Deferred: an optional `bridge/` package of portable encoders (JSON/MsgPack) for wire consumers, and a post-1.0 generated typed-struct wrapper over the same plans for compile-time-typed call sites — ergonomics, not throughput. The open bench-decided question is whether the fast PHP path uses JSON or goes `Value`→zval direct.)*
 
 ---
 
 ## Runtime catalog and DDL
 
-The set of tables is **live DB state, not a compile-time constant.** `CREATE TABLE` and `DROP TABLE` are first-class SQL statements that run while the database is serving traffic; the schema does not have to be known at `Open()`. An empty schema is a valid starting point.
-
-### The catalog snapshot
-
-All tables live in an immutable `catalog` value published behind an `atomic.Pointer[catalog]`:
+The set of tables is **live DB state, not a compile-time constant.** `CREATE TABLE`/`DROP TABLE` are first-class SQL run while serving; the schema need not be known at `Open()` (an empty schema is valid).
 
 ```go
 type catalog struct {
@@ -549,372 +290,81 @@ type catalog struct {
 }
 ```
 
-Every read and write loads the pointer **once** at the top of the call and uses that one snapshot for the whole operation — entirely lock-free. DDL never blocks or slows a read/write: it builds a **new** catalog (copying only the small registry maps; existing table storage is shared by pointer, never copied) and swaps the pointer atomically (RCU). An in-flight query keeps its consistent view; the old catalog is GC'd once no call still holds it.
+All tables live in an immutable `catalog` behind an `atomic.Pointer[catalog]`. Every read/write loads the pointer **once** and uses that snapshot for the whole call — lock-free. DDL builds a **new** catalog (copying only the small registry maps; table storage is shared by pointer) and swaps atomically (RCU); in-flight queries keep their view, the old catalog is GC'd when no call holds it. `ddlMu` serialises `CREATE`/`DROP` against each other; reads/writes never take it.
 
-`ddlMu` serialises concurrent `CREATE`/`DROP` against each other. Reads and writes never take it.
-
-### Durable table IDs
-
-Each table has a `tableID` assigned at creation = the current length of `byID`. IDs are **append-only and never reused**: `DROP` nils the `byID` slot but keeps the slice length, so a later `CREATE` of the same name gets a *new* id. This is what makes WAL replay unambiguous — a mutation record carries its `tableID`, and after a drop+recreate the old id's records never collide with the new table.
-
-### Catalog version → plan invalidation
-
-`version` increments on every `CREATE`/`DROP`. It is the stamp the statement cache checks (see *Query API → Prepared plans*): a bump invalidates cached plans lazily, on next use, so a plan can never run against a table that changed under it. DDL being rare, re-binding every cached plan after a schema change is an acceptable cost.
-
-### WAL-logged, replayed before mutations
-
-`CREATE` and `DROP` are journaled to the WAL (`recCreateTable` / `recDropTable`) **before** the new catalog is published — so a crash between the journal and the swap replays to the same state, never a published-but-unlogged table. On `Open()`, replay processes catalog records in order before the mutations that reference them, rebuilding the exact `tableID → table` mapping; runtime-created tables and their rows survive restart. `CREATE` records the full `TableDef` (column types + PK/PartitionKey/Immutable/Nullable flags); a partitioned table created at runtime rebuilds its `pkDirectory` and tail index on replay, identical to a predeclared one.
-
-### v1 limits
-
-- **`CREATE` and `DROP` only — no `ALTER`.** Column add/drop/retype is out of scope for v1; `ALTER` is not even a keyword, so it surfaces as a parse error rather than partial handling. To change a table's shape: `CREATE` the new table, copy rows across, `DROP` the old one.
-- **No "DROP while an active cursor holds the table."** This needs no lock: `Query()` fully materialises and deep-clones its result before returning, so there are no streaming cursors aliasing storage. A concurrent `DROP` only unlinks the table from the next catalog; rows already returned to the caller are independent copies, and an in-flight query finishes against the snapshot it loaded.
+- **Durable table IDs.** `tableID` = the length of `byID` at creation, **append-only, never reused**: `DROP` nils the slot but keeps the length, so a recreate gets a new id. This makes WAL replay unambiguous — a mutation carries its `tableID`, and a drop+recreate never collides.
+- **Catalog version → plan invalidation.** `version` increments on every `CREATE`/`DROP`; cached plans are stamped with it and re-bind lazily on the next use if it changed, so a plan never runs against a table that changed under it (a dropped table → `ErrUnknownTable` cleanly). DDL is rare, so re-binding all cached plans is acceptable.
+- **WAL-logged, replayed before mutations.** `CREATE`/`DROP` are journaled (`recCreateTable`/`recDropTable`) **before** the new catalog is published, so a crash between journal and swap replays to the same state. On `Open()`, catalog records replay in order before the mutations that reference them; `CREATE` records the full `TableDef` (types + PK/PartitionKey/Immutable/Nullable), so a runtime partitioned table rebuilds its `pkDirectory` + tail index on replay.
+- **v1 limits.** `CREATE`/`DROP` only — **no `ALTER`** (not even a keyword; to reshape: create new, copy, drop old). No "DROP while a cursor holds the table" lock is needed — `Query()` fully materialises + deep-clones before returning, so there are no streaming cursors aliasing storage.
 
 ---
 
 ## Transactions and atomicity
 
-### The problem
+`db.Transaction(func(tx *Tx) error)` (M6, v1 scope) commits a group of **PK-pinned statements on one table** atomically under a single `TXN` WAL envelope. Non-transactional ops pay zero overhead; atomicity is explicit opt-in.
 
-`UPDATE ... WHERE expr` and `DELETE ... WHERE expr` can touch rows across multiple shards. The naive implementation locks and writes one shard at a time:
+**The multi-shard hazard (why the rule exists).** `UPDATE/DELETE … WHERE expr` can touch rows across shards. Locking and writing one shard at a time, releasing each lock before the next, is a **write-serializability + replay-divergence bug**, not just a torn read: two concurrent multi-shard statements can interleave to a live state with no single serial order (`A=S2, B=S1`), while the WAL's `walMu` total order replays to a *different* state (`A=S2, B=S2`) — post-crash memory diverges from pre-crash by construction. So a multi-shard, non-PK-pinned write has exactly two safe forms: **(1)** lock *all* affected shards before the WAL append (the `updateWhereAll`/`deleteWhereAll` path — collect+validate every new row image under all shard locks, journal as one `TXN`, then apply — all-or-nothing, possible contention spike), or **(2)** wrap it in `db.Transaction()`. One-shard-at-a-time is closed by correctness, never used.
 
-```
-lock shard 0 → mutate matching rows → unlock
-lock shard 1 → mutate matching rows → unlock  ← UNSAFE: see below
-...
-```
-
-**This pattern is not just a torn-read problem — it is a write-serializability and replay-divergence bug, and it must not be used.** The lock-before-WAL-write invariant (*WAL — format*, step 6) guarantees "WAL order = in-memory apply order by construction" **only when the single lock that serialises the mutation is held across the WAL append**. That holds for single-shard / PK-pinned writes. It does *not* hold once a statement spans shards and releases each shard lock before taking the next.
-
-Concretely, two concurrent multi-shard statements S1 and S2, both touching shards A and B and both writing some row on each:
-
-```
-S1 locks A, applies, unlocks A
-S2 locks A, applies, unlocks A      // on A: S1 then S2  → A's row = S2
-S2 locks B, applies, unlocks B
-S1 locks B, applies, unlocks B      // on B: S2 then S1  → B's row = S1
-```
-
-Live memory ends at (A=S2, B=S1) — a state with no single serial order. The WAL is a total order via `walMu` (say S1 then S2), so replay applies S1 fully, then S2 fully, ending at (A=S2, **B=S2**). **Post-crash replay diverges from pre-crash memory**, directly violating the "identical by construction" invariant. Even with no crash, the live state is non-serialisable.
-
-The fix is to hold **all** affected shard locks (in ascending shard-index order — see *Lock ordering*) across the single WAL append and all applies, exactly as `db.Transaction()` does. There are therefore only two safe ways to run a multi-shard, non-PK-pinned write:
-
-1. Lock all affected shards simultaneously before the WAL write (guaranteed correct; possible all-shard contention spike), or
-2. Require the caller to wrap it in `db.Transaction()`.
-
-The one-shard-at-a-time pattern above is neither and is a bug. See *Settled decisions → Multi-shard non-PK writes* — this is **closed by correctness**, not an open tradeoff: the status quo third option is unsafe and one of the two safe options is mandatory. Multi-shard non-PK `UPDATE`/`DELETE` outside a transaction takes the lock-all-shards path (`updateWhereAll`/`deleteWhereAll`); inside a transaction, statements are PK-pinned by the v1 rule.
-
-**Crash safety (PK-pinned and single-shard writes)** is solved by the logical WAL combined with the lock-before-WAL-write ordering: the resolved statement is appended to the WAL buffer while holding the shard lock that serialises the mutation, and only then applied to memory (still under lock). For these writes WAL order and in-memory application order are identical by construction. Crash mid-execution → the statement is either fully in the WAL (replay re-executes it deterministically) or not in the WAL at all (nothing to replay) — no partial row state is possible. For multi-shard writes the same guarantee holds **only** under option 1 or 2 above.
-
-**What is atomic today:** PK-based operations (`WHERE id = ?`) on non-partitioned tables hit exactly one shard under that shard's lock — fully atomic. On partitioned tables, `WHERE id = ?` acquires pkDirectory lock then shard lock in that fixed order — also fully atomic (no other operation acquires them in reverse order).
-
-**Broad single-statement writes are atomic too.** A predicate `UPDATE`/`DELETE` spanning shards (`updateWhereAll`/`deleteWhereAll`) runs in two passes under all shard locks: collect + validate every matched row's new image, journal the whole batch as **one `TXN` envelope**, then apply. A WAL failure aborts with nothing applied; a crash leaves the whole statement in the WAL or none of it. So such a statement is all-or-nothing, not partially applied. (The single-row-per-WAL-record form it replaced could half-apply on a mid-statement WAL failure.)
-
-**Multi-statement atomicity** is provided by `db.Transaction()` (M6, v1 scope below): a group of PK-pinned statements on one table commits or rolls back together under a single `TXN` WAL envelope. **Still not atomic:** multi-shard `WHERE` operations run *one-shard-at-a-time* (the unsafe pattern — non-serialisable + torn reads; never used), and cross-table or non-PK-pinned statement *groups* (out of v1 transaction scope).
-
-### Design decision — explicit opt-in
-
-Non-transactional operations pay zero overhead. Atomicity is explicit opt-in. No implicit transaction wrapping, no global serialisation for callers that don't need it.
-
-### Go API
+**What is atomic today.** PK ops (`WHERE id = ?`) hit one shard (non-partitioned) or pkDirectory→shard in fixed order (partitioned) — fully atomic. A broad predicate `UPDATE`/`DELETE` runs the lock-all-shards two-pass path above — all-or-nothing. Multi-statement groups are atomic via `db.Transaction()`. **Not atomic:** one-shard-at-a-time (the unsafe pattern, never used) and cross-table / non-PK-pinned statement *groups* (out of v1 scope).
 
 ```go
-// Arithmetic in SET (balance = balance - ?) is evaluated under the commit lock.
-// Pre-reading balances outside the transaction creates a lost-update race — do
-// not use that pattern.
 err := db.Transaction(func(tx *Tx) error {
     if _, err := tx.Exec("UPDATE accounts SET balance = balance - ? WHERE id = ?", 100, fromID); err != nil {
-        return err  // propagate → rollback
+        return err  // any non-nil return → rollback
     }
-    if _, err := tx.Exec("UPDATE accounts SET balance = balance + ? WHERE id = ?", 100, toID); err != nil {
-        return err
-    }
-    return nil  // commit; return non-nil = rollback
+    _, err := tx.Exec("UPDATE accounts SET balance = balance + ? WHERE id = ?", 100, toID)
+    return err
 })
 ```
 
-**A failed `tx.Exec` poisons the transaction — ignoring the error cannot commit a partial result.** The example checks every `tx.Exec` error, and that is the recommended style, but correctness must not *depend* on the caller doing so. Once any `tx.Exec` returns an error, the `Tx` is marked poisoned: every subsequent `tx.Exec` is a no-op that returns the same sticky error, and at the end `db.Transaction` **forces a rollback and returns that error even if the closure returned `nil`**. Without this, a closure that ignores a failed statement and falls through to `return nil` would commit everything *except* the failed statement — a silent partial transaction. Fatal-on-first-error makes "ignored error" fail safe (whole transaction rolls back) rather than fail open (partial commit).
+**Poison-on-first-error.** Once any `tx.Exec` errors, the `Tx` is poisoned: later `tx.Exec` are no-ops returning the sticky error, and `db.Transaction` **forces rollback even if the closure returns `nil`**. So an ignored error fails safe (whole rollback), never a silent partial commit.
 
-**How it works internally:**
+**Internals.** Statements are staged in a per-transaction **overlay** keyed by `(table, PK)`, layered over the committed store — so statement *N* sees 1…*N*−1's effects (**read-your-writes**, the SQL contract; required, not optional). On `return nil`: union the affected pkDirectories + shards, acquire them in global lock order, **re-validate the staged set against the now-locked live state** (PK conflicts, types) and **re-evaluate arithmetic `SET` against the locked live values**, write the single `TXN` envelope (commit boundary = envelope boundary), apply in statement order, unlock. **The envelope is written only after validation** — a committed `TXN` always replays cleanly; writing it before validating could leave a committed record that never applied. A torn/CRC-failing `TXN` is discarded whole on replay.
 
-1. Entering the closure, statements are **not** applied to the live arena, but they are **not** evaluated blind either: each `tx.Exec` evaluates against a per-transaction **staged overlay** layered over the committed store. Statement *N* sees the effects of statements 1…*N*−1 in the same transaction (read-your-writes). The overlay records pending inserts/updates/deletes keyed by `(table, PK)`; reads inside the transaction consult the overlay first, then the live store.
-2. `return nil` → determine all affected pkDirectories and data shards (union across all staged mutations, including predicate-evaluation under lock — see *Predicate writes* below); acquire all pkDirectories in ascending table index order; lock all data shards in lexicographic `(table index, shard index)` order (global lock order — deadlock-safe); re-validate the staged set against the now-locked live state (PK conflicts, constraints, types) — and re-evaluate any arithmetic `SET` against the locked live values plus earlier in-transaction effects, so the overlay reflects the true committed-time result; if any validation fails, unlock in reverse and return error — nothing is written to the WAL; write the single `TXN` envelope (commit boundary = envelope boundary; no separate COMMIT token); apply the staged mutations to the live arena in statement order; unlock shards then pkDirectories; return success
-3. `return err` → discard the overlay, nothing written, nothing in WAL
+**v1 scope (closed by construction, not machinery).**
+- **PK-pinned only.** Every statement must pin its rows by PK (partitioned: also the PartitionKey), so the shard set is known up front and no predicate is re-evaluated. A predicate matching set must be resolved *under the commit locks*, never frozen at buffer time (a concurrent writer can change what matches) — supporting unpinned `WHERE` inside a transaction would require locking all shards of each table, deferred.
+- **Write-only API.** `tx.Exec` only — no `tx.Query` handing committed data back for app-side compute. The only reads are read-your-writes and the read embedded in arithmetic `SET` (evaluated against the **locked** live value at commit). This closes read-compute-write lost updates without optimistic-concurrency/SSI machinery (deferred).
+- **Auto-gen PKs resolve at statement-execution time** (recorded in the overlay), so a later statement can back-reference the row and the exact UUID lands in the `TXN` envelope = what replay regenerates.
 
-**Read-your-writes (required, not optional).** Without the overlay, `INSERT INTO t (id, …) VALUES (X, …); UPDATE t SET … WHERE id = X` would fail or operate on stale state at commit, because the row X does not exist in the committed store until apply time — and two updates to the same row in one transaction would lose the first. The overlay makes intra-transaction reads observe prior intra-transaction writes, which is the SQL contract. The `db.Transaction` transfer example below touches two *different* rows (`fromID`, `toID`) and so does not exercise this path, but the general guarantee must hold. (This is distinct from the lost-update warning about pre-reading *outside* the transaction.)
-
-**Predicate writes — the matching set must be resolved under the commit locks, not frozen at buffer time.** The `(table, PK)` overlay correctly represents pending *effects*, but it cannot pre-freeze *which rows a predicate matches*. For `UPDATE/DELETE … WHERE status = ?`, the set of matching rows can change between the closure body and commit (a concurrent writer flips a row's `status`, or inserts a new matching row). Evaluating the predicate when the statement is first seen and replaying that frozen PK set at commit is a serializability bug — the transaction would touch rows that no longer match and miss rows that now do. Two correct options:
-
-- **Default in v1 — restrict transactions to PK-pinned statements.** Every statement inside `db.Transaction()` must pin its target row(s) by PK (`WHERE id = ?`/`IN (…)`); routing for partitioned tables additionally pins the PartitionKey. The affected shard set is then known up front, no predicate re-evaluation is needed, and contention stays bounded. Non-PK-pinned statements inside a transaction are rejected at plan time.
-- **Predicate writes (later) — evaluate under all-shard locks.** If unpinned `WHERE` inside a transaction is supported, the statement's shard set is unknown in advance, so it must lock **all** shards of each table it touches, then evaluate the predicate against the locked live state (plus prior in-transaction effects) and apply. This is correct but reintroduces the all-shard contention spike, which is exactly why it is not the v1 default.
-
-Either way, predicate matching happens under the same locks that protect the apply — never against a stale pre-lock snapshot.
-
-**Read isolation — what a transaction may read, and what is not promised in v1.** The overlay gives *read-your-writes* (a statement sees the transaction's own earlier effects), but it does **not** by itself give isolation against *other* committed transactions. The dangerous pattern is read-compute-write spanning the closure: read value A early, compute something from it in Go, then write B based on it — a concurrent transaction can commit a change to A in between, and because only the *write set* is validated under the commit locks, the stale read of A is never rechecked → lost update / non-serialisable result. v1 closes this by construction rather than by adding optimistic-concurrency machinery:
-
-- **v1 transactions are write-only at the API.** `tx.Exec` only; there is no `tx.Query` that hands committed row data back to the closure for arbitrary computation. The only "reads" are internal: read-your-writes of the transaction's own staged effects, and the read embedded in an arithmetic `SET` (`balance = balance - ?`), which is evaluated against the **locked** live value at commit — so that read is consistent, not a pre-lock snapshot. Read-then-write logic must be expressed as arithmetic `SET`, not as app-side compute over a `tx.Query` result.
-- **Arbitrary read-for-compute inside a transaction is not promised in v1.** Supporting it requires tracking the transaction's read set and validating it under the commit locks (abort if any read row changed — optimistic concurrency / SSI), or taking read locks on read rows. Both are deferred; the spec must not imply serialisable read-compute-write until one is implemented.
-
-**Auto-generated PKs resolve at statement-execution time, not at commit.** When a transaction's `INSERT` omits the PK, the UUIDv7 is generated when that statement executes inside the closure (and recorded in the overlay), not deferred to commit. This is required so that (a) a later statement in the same transaction can refer to the row via read-your-writes, and (b) the exact same concrete UUID is what lands in the `TXN` envelope and what replay regenerates-by-reading. Deferring generation to commit would make in-transaction back-references impossible and risk a mismatch between the value the closure observed and the value written to the WAL.
-
-**Why this ordering is critical:** the `TXN` envelope is written only after all mutations have been validated (and predicates resolved) under lock. A committed `TXN` envelope therefore always means the transaction was validated and will apply cleanly on replay. It is never possible for a committed WAL record to represent a transaction that would fail on re-execution. Writing the envelope before validating (the naive order) is wrong — a PK conflict discovered after the WAL write leaves a committed record that was never successfully applied.
-
-WAL replay: a torn or CRC-failing `TXN` envelope is discarded in its entirety (the commit boundary is the envelope boundary). A complete, CRC-valid `TXN` envelope is always safe to replay — it was written only after successful in-memory validation under the relevant locks.
-
-### FrankenPHP / cgo API
-
-A Go closure cannot cross the cgo boundary. `START TRANSACTION` / `COMMIT` as separate calls would work but requires goroutine-local state between calls and four cgo crossings (~200 ns each).
-
-**The array form is strictly better:**
+**cgo transaction API.** A Go closure can't cross cgo, so the array form is one crossing (vs four for `START`/`COMMIT` calls), pure (no goroutine-local state), and leak-free if PHP crashes before the call:
 
 ```php
-// Arithmetic in SET is evaluated under the commit lock.
-// Pre-reading balances outside the transaction creates a lost-update race.
 hazedb_exec_transaction([
     ["UPDATE accounts SET balance = balance - ? WHERE id = ?", [100, $fromID]],
     ["UPDATE accounts SET balance = balance + ? WHERE id = ?", [100, $toID]],
-])
+])  // → db.Transaction(loop tx.Exec)
 ```
 
-- One cgo crossing instead of four
-- No goroutine-local state between calls — pure function, input in, result out
-- If PHP crashes before the call: the call never happened, no leaked state to clean up
-
-On the Go side this maps directly onto the closure API:
-
-```go
-func hazedb_exec_transaction(stmts []Statement) error {
-    return db.Transaction(func(tx *Tx) error {
-        for _, s := range stmts {
-            if _, err := tx.Exec(s.SQL, s.Params...); err != nil {
-                return err
-            }
-        }
-        return nil
-    })
-}
-```
-
-### Multi-statement transactions at runtime
-
-A transaction is a Go closure (`db.Transaction(func(tx) {...})`, M6) that issues several statements which commit atomically. Each statement runs through the same runtime engine and its cached plan — the SQL is parsed once per distinct string, not per call, so there is no per-transaction parse cost to "compile away." Locking, WAL write, and commit execute at runtime under one `TXN` envelope.
-
-An optional generated wrapper (post-1.0) could expose a fixed transaction as one typed function — e.g. `TransferBalance(fromID, toID, amount)` calling the same cached plans — for caller ergonomics and one cgo crossing. It is a convenience layer, not a performance requirement.
-
-### What this does not cover
-
-Cross-table transactions (debit one table, credit another) require locking shards across two tables. The locking order must be globally consistent (table index ascending, then shard index ascending within each table) to remain deadlock-safe. Deferred to v1.1+.
+**Not covered:** cross-table transactions (lock shards across two tables in the global order — table index then shard index) — deferred to v1.1+.
 
 ---
 
 ## Measured benchmarks
 
-> **Scope:** the *Point operations* table below — **all** columns, hazedb and SQLite/Bolt — was re-measured at rev. 23 under **go1.25**, on top of the fold shard-hash and the prepared-statement path. The *Parallel* / *Durability* / *Mixed* sub-tables are still from earlier sweeps (those paths are unchanged or only get faster, so treat them as conservative). These are the runtime engine itself (no code generation); it runs ~18× SQLite `:memory:` on point reads. All on AMD Ryzen AI MAX+ 395 (32 threads), Docker, go1.25; absolute µs are load-sensitive on this dev box, so read them as ratios, not an SLA.
-
-### Point operations vs SQLite and Bolt (single-thread, fair 16-byte UUID keys)
-
-All four stores key by the same 16-byte UUID, so the comparison is fair on key width. SQLite appears twice: `:memory:` (RAM, no disk — the like-for-like in-memory comparison) and on-disk (WAL journal).
-
-| Operation | hazedb (mem) | hazedb (+WAL) | SQLite (mem) | SQLite (disk) | Bolt |
-|---|---:|---:|---:|---:|---:|
-| INSERT | **0.38 µs** | 0.50 µs | 1.8 µs | 22 µs | 4 100 µs † |
-| SELECT WHERE id=? | **0.11 µs** (`QueryRow` 0.087, `QueryRowByPK` 0.036) | — | 2.0 µs | 3.0 µs | 0.52 µs |
-| UPDATE WHERE id=? | **0.085 µs** | — | 1.07 µs | 2.9 µs | 1 480 µs † |
-| DELETE WHERE id=? | **0.30 µs** | — | — | ~45 µs | 4 100 µs † |
-
-**Even RAM-vs-RAM, hazedb leads:** vs SQLite `:memory:` it is ~18× on reads (~23× via `QueryRow`, ~55× via the zero-alloc `QueryRowByPK`), ~4.7× on inserts, ~12× on updates. Allocations per op are 1 (update/delete), 2 (insert, or point read via `QueryRow`), 3 (point read via `Query`), 4 (range scan), and **0 via the prepared `QueryRowByPK`** (typed key + scan-into buffer); bytes/op roughly halved by the packed 32-byte `Value` (below).
-
-**What the gap is — and isn't.** It is mostly the Go *access layer*, and it is **not** the cgo crossing. Evidence: swapping the cgo driver for **pure-Go SQLite** (`modernc.org/sqlite`, no cgo, same `database/sql`) made it *slower*, not faster — read **4.1 µs**, insert **15.3 µs**, update **3.4 µs** vs the cgo build's 2.0 / 1.8 / 1.1 µs. So removing cgo costs speed; the crossing was never the bottleneck. What a Go program actually pays to use SQLite is the `database/sql` layer (reflection, interface conversions, ~24 allocations per read vs hazedb's 3, or 0 via `QueryRowByPK`) on top of a general-purpose engine. hazedb is faster because it skips that layer — typed rows returned in-process, no SQL dispatch per call — which is the project thesis, **not** a claim that its lookup beats SQLite's B-tree. † Write rows for SQLite-disk and Bolt are **not** like-for-like on durability (they fsync/journal to disk; hazedb-mem does not). Allocations/op: hazedb 0–4, SQLite 8–24, Bolt 50–66.
-
-### Transactions (single-table, v1)
-
-| Operation | Time | Allocs |
-|---|---:|---:|
-| 2-row transfer — `db.Transaction` with two PK-pinned arithmetic UPDATEs | **~1.1 µs** | 19 |
-
-Commit locks only the shards the staged statements touch (not all shards) and writes one `TXN` WAL envelope; ~2× a bare PK update, the price of atomicity + the staged overlay. See *Transactions*.
-
-### Parallel scaling (32 cores)
-
-| Operation | Single | Parallel |
-|---|---:|---:|
-| SELECT WHERE id=? | 0.15 µs | **0.06 µs** |
-| INSERT (memory) | 0.42 µs | **0.10 µs** |
-| UPDATE WHERE id=? | 0.11 µs | **0.04 µs** |
-
-### Durability — INSERT, WAL off vs on (relative; overlay FS, not a real-disk SLA)
-
-| | INSERT |
-|---|---:|
-| WAL off (memory) | 0.42 µs |
-| WAL on (born-sealed) | ~0.6 µs |
-
-WAL on adds only the in-RAM buffer append to the write path — the fsync happens off-path on the background seal (1 MiB / ~0.5s), so per-write cost stays sub-µs. There is no per-write-fsync mode to pay for. (The ~0.6 µs carries over from the prior buffered-write path, which has the same write-path shape; re-measure after the born-sealed rewrite if a precise figure is needed.)
-
-### Indexed partition scan, and the LIMIT short-circuit
-
-A feed query `SELECT … WHERE partitionkey=? ORDER BY seq DESC LIMIT n` reads only the matching partition's rows — O(partition), not O(table):
-
-| Scan | Time | Allocs |
-|---|---:|---:|
-| One partition (~120 rows) of a 10k-row table, `ORDER BY … LIMIT 10` | **~11.6 µs** | 124 |
-
-The partition index earns its keep when `ORDER BY` forces examining the whole matching set. An `ORDER BY … LIMIT n` keeps only the running top-n (a bounded heap, cloning a row only when it makes the cut) and sorts just those n, instead of cloning + sorting every match — ~2× faster on the feed query above; the clone savings grow when the scan order is not adversarial to the sort order. **Without `ORDER BY`, `LIMIT` now short-circuits the scan** (stop at the limit, project under the lock): an unindexed `SELECT id FROM users WHERE age > ? LIMIT 10` over 10k rows (≈4 900 match) is **~0.6 µs / 4 allocs** — versus **~770 µs / 4 932 allocs before the pushdown** (rev. 12), which cloned every matching row before truncating. So the index matters for ordered tail scans; for an unordered `LIMIT`, the short-circuit already makes a full scan cheap.
-
-### Mixed workload — 4 writers + 16 readers, 2 s, WAL on
-
-*Not re-measured at rev. 12; these predate the read-path fast path, so the read percentiles are if anything conservative.*
-
-| | Value |
-|---|---:|
-| Insert throughput | 0.72 M/sec |
-| Read throughput | 7.0 M/sec |
-| SELECT WHERE id=? p50 | 0.70 µs |
-| SELECT WHERE id=? p90 | 1.3 µs |
-| SELECT WHERE id=? p99 | **17 µs** |
-| SELECT WHERE id=? p99.9 | 259 µs |
-
----
+Headline: the runtime engine (no codegen) runs **~18× SQLite `:memory:`** on point reads — INSERT 0.38 µs, SELECT WHERE id=? 0.11 µs (0 allocs via `QueryRowByPK`), UPDATE 0.085 µs (hazedb in-memory; AMD Ryzen AI MAX+ 395, go1.25; ratios, not an SLA). Full tables in [rfc-benchmarks.md](rfc-benchmarks.md).
 
 ## Current file layout
 
-Files that exist today. Where a file's eventual scope differs from what runs now (notably `wal.go`), the planned additions are annotated inline and dated by milestone — they are not implemented yet.
-
-```
-github.com/VeloxCoding/hazedb   (package hazedb)
-├── value.go         Value union (Int/String/Bytes/Bool/Null), Row, Clone
-├── schema.go        Schema, TableDef, ColumnDef, resolvedTable, validateValue
-├── errors.go        Sentinel errors
-├── store.go         Sharded RWMutex storage: insert/getByPK/scanAll/update/delete (clone-under-lock reads)
-├── partition_store.go  Partitioned-table storage: pkDirectory (UUID→location), tail index, two-lock insert, release-then-retry read
-├── catalog.go       Runtime catalog (atomic snapshot, RCU swap), CREATE/DROP, durable table IDs, catalog WAL record codec
-├── txn.go           Transactions: Tx, db.Transaction closure, staged overlay, commit (lock-all-shards + one TXN envelope), lock-free apply helpers
-├── wal.go           Logical typed-mutation WAL: versioned envelope (magic|type|version|length|payload|crc32c), MUTATION + TXN + CREATE/DROP catalog records, CRC32C, durability modes, bounds-checked tail recovery, segmented WAL rotation (M7)
-├── drain.go         SQLite mirror + drain: feeds sealed WAL segments into the on-disk SQLite base (compacted current state, drain cursor in _hz_meta), modernc.org/sqlite (no cgo)
-├── recover_sqlite.go  SQLite-backed recovery: rebuild memory from the mirror base, then the undrained WAL tail replays on top
-├── uuid.go          UUID [16]byte type + monotonic RFC-9562 UUIDv7 generator
-├── lexer.go         Tokenizer
-├── ast.go           AST node types (incl. createStmt/dropStmt)
-├── parser.go        Recursive-descent parser (incl. CREATE/DROP TABLE)
-├── exec.go          Planner + executor (PK fast path, indexed partition scan, full-scan fallback)
-├── db.go            Public API: Open/Exec/Query/Close, catalog pointer, stmt cache + plan re-bind, replay
-├── *_test.go        Unit, race, stress, mixed-latency, bench, comparison
-└── spike/           Preserved prototype code (package spike) — reference only
-```
-
----
+`package hazedb` in the repo root; every `.go` file carries a one-line doc comment stating its scope — the code is the source of truth, and a per-file table here only drifts. Subsystems: **core types** (`value` / `schema` / `uuid` / `pkmap` / `composite_key` / `errors`); **storage** (`store*`, `partition_store`, `compact`, `secindex`, `budget`); **catalog / DDL** (`catalog`); **SQL engine** (`lexer` → `parser` → `plan` → `eval` → `filter` / `exec_*` / `join`, `stmt`, `txn`); **WAL · durability · recovery** (`wal*`, `mutation_codec`, `drain`, `recover_sqlite`, `db_replay`, `events`); **public API · adapters** (`db*`, `query_stream`, `options`, `stats`, `wire`). `spike/` is reference-only prototype code.
 
 ## Open decisions
 
 | # | Question | Default if left open |
 |---|---|---|
-| 1 | Out-of-order seq policy | Accept O(N) shift, document |
-| 2 | walMu contention ceiling | Single mutex until parallel-WAL benchmark demands change |
-| 3 | pkDirectory mutex strategy for partitioned tables | Single `sync.RWMutex` until a contention benchmark shows it is the bottleneck; then shard by FNV-1a(UUID top bits) |
+| 1 | Out-of-order seq policy | accept O(N) shift, document |
+| 2 | walMu contention ceiling | single mutex until a parallel-WAL benchmark demands change |
+| 3 | pkDirectory mutex strategy | single `sync.RWMutex` until a contention benchmark shows it is the bottleneck; then shard by FNV-1a(UUID top bits) |
 
 **Settled decisions (not revisitable without good reason):**
 
 | Decision | Choice |
 |---|---|
 | PK type | UUIDv7, enforced, auto-generated if omitted |
-| Shard routing | By `PartitionKey` if declared; by PK hash otherwise |
-| Tail index rowID ambiguity | Solved by PartitionKey sharding — all rows for a partition value in one shard; `(shardID, rowID)` pairs rejected |
-| pkDirectory for partitioned tables | Required from day one — not deferred. Enforces table-wide PK uniqueness and enables O(1) `WHERE id = ?` without scanning all shards. PK and PartitionKey columns are immutable (enforced at plan time). |
-| WAL format | Logical **typed-mutation**: op + tableID + resolved typed params per record (full row on insert; PK + changed-column deltas on update; PK on delete). **NOT SQL-string** — benchmarked and rejected (SQL text cost +50% bytes/insert, 2.5× bytes/delete, ~2× replay; spike in `wal_format_spike_test.go`). All auto-generated values resolved before write; deterministic replay via the apply path; `hazedb dump` reconstructs SQL for inspection. |
-| WAL durability | One switch (`WALPath` on/off). Born-sealed segments: writes buffer in RAM, seal to disk (fsync + atomic rename) at 1 MiB / ~0.5s, so a crash loses ≤ that window. No per-write-fsync mode — a zero-loss deployment uses a disk-first DB. (Superseded the M3 ticker + fsync-modes design.) |
-| Public API | One runtime engine: `db.Query()`/`db.Exec()` parse once, cache the plan per SQL string, re-bind on catalog-version change. This is the hot path (~9× SQLite on point reads, without codegen). An optional typed-struct wrapper over the same plans is post-1.0 ergonomics, not a speed mechanism. |
+| Shard routing | by `PartitionKey` if declared; by PK hash otherwise |
+| Tail index rowID ambiguity | solved by PartitionKey sharding — all rows for a partition value in one shard; `(shardID, rowID)` pairs rejected |
+| pkDirectory for partitioned tables | required from day one; enforces table-wide PK uniqueness + O(1) `WHERE id = ?`; PK/PartitionKey immutable at plan time |
+| WAL format | logical **typed-mutation** (op + tableID + resolved typed params; delta on update). NOT SQL-string (benchmarked + rejected). Deterministic replay via the apply path |
+| WAL durability | one switch (`WALPath` on/off); born-sealed segments, fsync + atomic rename at 1 MiB / ~0.5s; no per-write-fsync mode |
+| Public API | one runtime engine: parse once, cache the plan per SQL string, re-bind on catalog-version change. Optional typed-struct wrapper is post-1.0 ergonomics |
 | Schema lifecycle | `CREATE`/`DROP TABLE` at runtime over an atomic catalog (RCU); durable append-only table IDs; no `ALTER` in v1 |
-| Multi-shard non-PK writes | Closed by correctness, not preference. The one-shard-at-a-time pattern is a write-serializability + replay-divergence bug (see *Transactions — The problem*). A multi-shard `UPDATE`/`DELETE` not pinned to a single shard by PK/PartitionKey must either lock all affected shards before the WAL write, or be wrapped in `db.Transaction()` (M6, shipped). Outside a transaction such statements take the lock-all-shards path; inside one, the v1 rule requires PK-pinned statements. |
-
----
-
-## Roadmap
-
-| Milestone | Content | Status |
-|---|---|---|
-| **M1** | Single-table store, WAL, tail-recovery, CI bench gate | ✅ done |
-| **M2** | SQL parser + interpreter (SELECT/INSERT/UPDATE/DELETE) | ✅ done |
-| **M3** | WAL ticker flush + optional fsync; arithmetic expressions in `SET`/`WHERE` (`col + ?`, `col - ?`, `col * ?`) | ✅ done (the flush/fsync-modes design was later replaced by the born-sealed WAL — see *WAL — durability*) |
-| **M4** | UUIDv7 PK enforced (`[16]byte` inline, monotonic auto-gen) + immutable order column + logical typed-mutation WAL | ✅ done |
-| **M5** | PartitionKey routing + table-wide `pkDirectory` + indexed partition scan; **runtime catalog + first-class `CREATE`/`DROP TABLE`** (atomic RCU swap, durable table IDs, catalog-version plan invalidation, WAL-logged DDL) | ✅ done |
-| **M6** | Single-table transactions: `db.Transaction(func)` Go API + staged overlay (read-your-writes) + atomic `TXN` WAL envelope + torn-envelope discard on replay | ✅ done (v1 scope: tx.Exec only, PK-pinned, single-table) |
-| **M7** | Segmented WAL + recovery base: a background drain mirrors sealed segments into an on-disk SQLite database (compacted current state, durable drain cursor); `Open()` rebuilds from the mirror, then replays the undrained WAL tail on top. See *Recovery — SQLite mirror + WAL tail*. (The consistent-cut `CHECKPOINT`-record + snapshot-file design detailed below was the original plan, **superseded** by the mirror.) | ✅ done |
-| **M8** | CLI (`hazedb dump/verify/checkpoint`), Caddy module, FrankenPHP cgo binding (`hazedb_exec_transaction` array API) | open |
-| **post-1.0** | Multi-table support + secondary indexes on non-PK columns (note: `pkDirectory` for partitioned tables is a primary-key directory, not a secondary index — it is core, not deferred here); optional typed-struct query wrapper | open |
-
-> **⚠️ Superseded design (kept for rationale).** The notes from here to *Pre-M7 caveat* describe the **original** M7 plan — a `CHECKPOINT` WAL record naming a snapshot file, taken under a consistent-cut write barrier. The shipped implementation instead uses the **SQLite mirror** (*Recovery — SQLite mirror + WAL tail*): no write barrier, the base is a compacted SQLite database advanced by the background drain, and a durable **drain cursor** (not a global LSN) marks where the WAL tail resumes. The text below is retained for the durability/consistency reasoning it captures, **not** as a description of current behaviour.
-
-**M7 note (original design):** the snapshot IS a logical WAL file — a series of INSERT *mutations* (typed-mutation records, not SQL text) for every live row at a known WAL position. Loading it produces a fresh arena with no tombstones. No special arena compaction code is needed: tombstones accumulate in active memory until a snapshot restart or live reload; once the snapshot loads, the arena starts clean.
-
-**Consistent cut is required.** If writes continue during the dump, the snapshot can contain rows that are also replayed after the checkpoint, miss rows that belong before it, or represent a row combination that never existed simultaneously. The correct protocol is: briefly pause all writes (global write barrier) → record the current global LSN → dump all live rows → write `CHECKPOINT <file> <lsn>` → resume writes. On restart: load snapshot, then replay WAL from LSN onward (resolving the global LSN to a `(segment, offset)` by segment-base comparison). Without the write barrier, checkpoint recovery is not reliable.
-
-**Durability ordering of the checkpoint itself is also load-bearing.** The `CHECKPOINT <file> <lsn>` marker must not become durable, and pre-checkpoint segments must not be deleted, until the snapshot file is actually on stable storage. The required order is: dump snapshot → `fsync` the snapshot file **and** `fsync` its containing directory (so the new file's directory entry survives power loss) → only then write and flush/sync the `CHECKPOINT` marker → only then delete pre-checkpoint segments. If the marker is made durable (or old segments deleted) before the snapshot is fsync'd, a crash can leave a committed checkpoint pointing at a snapshot that is absent or partial, with the WAL prefix it depended on already gone — unrecoverable. The same directory-fsync requirement applies whenever a new WAL segment file is created, not just for snapshots.
-
-**LSN semantics must be pinned down (off-by-one otherwise).** Define `lsn` as the **exclusive** position of the first WAL record *not* reflected in the snapshot — i.e. the write cursor at the moment the write barrier is taken, before the `CHECKPOINT` marker is appended. Because the barrier guarantees no data records are written between dumping the snapshot and appending the marker, the snapshot reflects exactly everything before `lsn` and the `CHECKPOINT` marker itself is written *at or after* `lsn`. Replay then: (1) read the snapshot to rebuild state as of `lsn`, (2) re-open the WAL and scan **from `lsn` inclusive**, (3) treat any `CHECKPOINT` record encountered during replay as a no-op marker (skip it; it carries no row state), (4) apply every data record from `lsn` onward exactly once. Getting this wrong in either direction is a real bug: an inclusive-vs-exclusive mismatch double-applies or skips the first post-snapshot record, and replaying the `CHECKPOINT` marker as if it were a statement fails. State the offset convention in the marker format and in the replay code comment so both sides agree.
-
-**LSN must be segment-aware (a bare byte offset is ambiguous once the WAL is segmented, M7).** With multiple segment files, "byte offset 4096" does not identify a position — offset *into which segment*? Define the LSN as a **global, monotonically increasing logical offset** across the whole WAL, and give every segment file a header recording its `base` global offset (the global offset of its first byte). An LSN then maps to a physical location by finding the segment with `base ≤ lsn < base + segment_size` and seeking to `lsn − base` within it. Equivalently, store the LSN as an explicit `(segmentID, offsetInSegment)` pair. Either is fine, but it must be one of them: a raw per-file offset in the `CHECKPOINT` marker can, after segment rotation, point recovery at the wrong segment or the wrong place in the right segment. The `lsn:8` field in the `CHECKPOINT` payload is this global logical offset; segment selection during recovery is by segment-base comparison, not by filename ordering alone.
-
-**Records never span a segment boundary; segment headers are outside LSN space.** Two framing rules make segmented recovery simple and unambiguous:
-
-- **No record straddles two segments.** Before appending an envelope that would not fit in the current segment's remaining capacity, rotate to a new segment and write the whole envelope there. Recovery then reads each segment as a self-contained sequence of complete envelopes and never has to stitch a record's bytes across files. (Any trailing free space in a segment is just padding the tail scan stops at.)
-- **The segment header does not consume LSN space.** The global LSN counts only the logical record stream, not the per-file framing header. So `lsn − base` is the offset to the first *record* in a segment, and resolving an LSN never lands the reader in the middle of (or at the start of) a segment header. State explicitly whether `base` is the global LSN of the segment's first record (recommended) so the arithmetic is unambiguous on both write and recovery paths.
-
-**Checkpoint discovery at recovery must be explicit — naive one-pass replay is wrong.** The snapshot path and `lsn` live inside a `CHECKPOINT` marker that is itself in the WAL, which creates a chicken-and-egg: you cannot just open the first segment and replay forward, because the records *before* the latest checkpoint are already captured in the snapshot — replaying them re-applies pre-checkpoint history (double-apply, and far slower than necessary), and you also have to find the *newest valid* checkpoint, not the first one. Recovery is therefore explicitly staged:
-
-- **Preferred — a checkpoint manifest.** Maintain a tiny `MANIFEST` file holding the current `{snapshot_path, lsn}` (and the live segment list). It is updated by atomic replace (write `MANIFEST.tmp` → fsync → rename → fsync dir) **after** the snapshot is durable and **before** old segments are deleted. Recovery reads `MANIFEST` first — no WAL scan needed to locate the checkpoint — verifies the named snapshot exists and passes a integrity check (e.g. a length/CRC recorded in the manifest), loads it, then replays WAL data records from `lsn` onward. A torn `MANIFEST.tmp` is ignored; the last good `MANIFEST` always points at a complete checkpoint because of the ordering above.
-- **Alternative — explicit two-pass recovery.** Pass 1 scans the WAL **without applying anything**, tracking the highest-LSN `CHECKPOINT` marker whose envelope CRC is valid *and* whose named snapshot verifies. Pass 2 loads that snapshot and replays data records from its `lsn` forward. Slower (a full scan to find the checkpoint) but needs no extra file.
-
-Either way the invariant is: find the latest *verified* checkpoint first, load its snapshot, then replay strictly from its `lsn`. Never apply records below the chosen `lsn`. If no valid checkpoint exists (fresh DB, or all checkpoints fail verification), fall back to replaying the entire WAL from the beginning.
-
-Snapshot also functions as a sync baseline for replication consumers, provided the consumer receives both the snapshot file and the WAL offset it corresponds to.
-
-**WAL bounding — resolved by the SQLite mirror (M7).** Whenever WAL is on the companion file is present and the drain runs, so the on-disk WAL is **always** bounded to the **undrained tail**: the drain deletes each segment once it is durably in SQLite, and recovery rebuilds from the mirror base then replays only that tail — cold-start scales with live data size, not total writes ever made. There is no WAL-on-without-mirror mode (the companion is always a file, never in-memory), so the original unbounded-WAL / linear-cold-start caveat no longer applies. Memory-only (no WAL) keeps no WAL at all — nothing to bound, and a restart starts empty.
-
-**Deferred to v1.1+:** cross-table transactions, group-commit drainer, skiplist index, blob out-of-line storage, lock-free reads via `atomic.Pointer`, read-only standby replication (`VACUUM INTO` snapshot + cursor-gated WAL-tail shipping — see *Replication — read-only standby from snapshot + WAL tail*).
-
----
-
-## Review coverage (invariant × operation sweep)
-
-Each mechanism was checked against every operation that can touch it — insert, single-shard read, multi-shard read, PK update/delete, predicate update/delete, transaction, WAL append, flush/sync, tail recovery, replay, checkpoint, snapshot-load — under concurrency and under crash-at-each-step. Status: **safe** (holds as written), **§** (addressed, see section), **open** (documented limitation or deferred). This table is the audit trail for what has been examined; anything not listed has *not* been swept and should be treated as unreviewed.
-
-| Mechanism / invariant | Result | Where |
-|---|---|---|
-| Non-partitioned shard routing (FNV-1a PK) | safe; routing re-derived, nothing shard-specific persisted | *Store foundation* |
-| Partitioned shard ≠ partition value; tail index per partition value | § fixed (was a mixing bug) | *Partitioned table*, *Ordered index* |
-| `pkDirectory` table-wide uniqueness | safe; catches cross-partition dup UUID | *Partitioned table* |
-| Partitioned `WHERE id=?` read TOCTOU | § retry pkDirectory on tombstone/mismatch (not return not-found) | *Read-path TOCTOU* |
-| Transaction error handling | § first `tx.Exec` error poisons the tx; ignored error → rollback, not partial commit | *Go API* |
-| Checkpoint discovery at recovery | § manifest or two-pass; load newest verified checkpoint before replay | *Checkpoint discovery* |
-| rowID width | § `uint64` (uint32 overflow under churn) | *Ordered index* note |
-| Tombstones / arena reclamation | § background sweeper compacts dead arena slots live (rev 38); partition `tails`-prune keeps scans O(live) (rev 37); a mirror restart also starts a clean arena | *Churn caveat* |
-| Tail-index order column mutability | § immutable at plan time | *Immutability* |
-| Global lock order (incl. checkpoint barrier, cross-table tie-break) | § lexicographic + barrier topmost | *Lock ordering* |
-| Multi-shard non-PK writes | § lock-all-shards or `db.Transaction()`; one-at-a-time is a bug | *Transactions → The problem* |
-| Multi-shard SELECT consistency | open by design: per-shard consistent, not point-in-time; gather-then-sort for LIMIT | *Read consistency* |
-| Lock-before-WAL-append ordering | safe for pinned/single-shard; holds for multi-shard only under lock-all | *WAL format* |
-| WAL envelope (mutation/txn/checkpoint, versioned, CRC32C, LE) | § typed self-delimiting envelope; typed-mutation payload chosen over SQL-string after benchmarking | *Record envelope* |
-| Unknown WAL version/type | § fail loud, never skip (corrected from a bad draft) | *Record envelope* |
-| Tail-recovery length validation | § bounds-check envelope + inner lengths before read | *Tail-recovery robustness* |
-| `bw.Write` append error | § abort before apply; enter error state | *Execution pipeline*, *WAL error handling* |
-| Flush vs fsync after auto-flush | § `dirtySinceSync` flag, not `Buffered()` | *WAL durability* |
-| Flush goroutine concurrency | § holds `walMu`; no ticker when interval ≤ 0 | *WAL durability* |
-| Logical-WAL replay determinism | safe; all non-deterministic values resolved before append | *Primary key*, *WAL format* |
-| Transaction read-your-writes | § staged overlay | *Read-your-writes* |
-| Transaction predicate writes | § resolve matching set under commit locks; v1 = PK-pinned only | *Predicate writes* |
-| Transaction read isolation (read-compute-write) | open: v1 write-only API; SSI/read-set validation deferred | *Read isolation* |
-| Auto-gen PK inside a transaction | § resolved at statement-execution time | *Auto-generated PKs* |
-| Checkpoint consistent cut + fsync ordering | § barrier + fsync snapshot/dir before marker | *Consistent cut* |
-| Checkpoint LSN inclusive/exclusive + marker skip | § exclusive; scan from LSN; skip marker | *LSN semantics* |
-| Segmented WAL: LSN ambiguity, record-boundary, header LSN-space | § global LSN + base; no record spans a segment; header outside LSN-space | *LSN segment-aware* |
-| WAL truncation / recovery time | § SQLite mirror bounds both: drained segments deleted, base + tail recovery; WAL on always has a mirror, so the WAL is always bounded | *Recovery*, *WAL bounding* |
-| Statement cache growth | open: unbounded; safe only under parameterisation | *SQL interpreter* |
-| UUIDv7 ordering | § ms-granularity; strict order needs monotone gen or `seq` | *Primary key* |
-
-**Not yet swept (flagged for a future pass):** backpressure when `walMu` or the fsync path cannot keep up with writers (does append block, drop, or error?); behaviour of a *failed* replay/`Open()` (partially-applied state vs clean abort); `Close()` semantics with in-flight writes and a pending flush; clock-regression effects on UUIDv7 monotonic generators; per-value size caps (large blob params vs the `uint32` payload length).
-
----
-
-## One line
-
-hazedb compiles into your Go binary, keeps all data in RAM, writes a WAL for durability, and serves SQL queries at sub-µs p50 / <50 µs p99 under concurrent mixed workload.
+| Multi-shard non-PK writes | closed by correctness: lock-all-shards or `db.Transaction()`; one-shard-at-a-time is a write-serializability + replay-divergence bug |
