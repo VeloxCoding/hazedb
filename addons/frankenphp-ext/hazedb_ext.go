@@ -540,7 +540,8 @@ func hazedb_meta() (ret unsafe.Pointer) {
 // hazedb_ping reports that the extension is loaded and whether a DB is wired up.
 //
 // export_php:function hazedb_ping(): string
-func hazedb_ping() unsafe.Pointer {
+func hazedb_ping() (ret unsafe.Pointer) {
+	defer cgoRecoverPtr("hazedb_ping", &ret)
 	if defaultSlot.Load() == nil {
 		return phpStringFromBytes([]byte("pong (no db)"))
 	}

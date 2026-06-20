@@ -9,7 +9,9 @@ package hazedb
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -160,6 +162,34 @@ func TestArgsFromJSONRejectsTrailing(t *testing.T) {
 	// A clean array, even with surrounding whitespace, still parses.
 	if args, err := ArgsFromJSON([]byte(" [1, 2] ")); err != nil || len(args) != 2 {
 		t.Fatalf("clean array should parse: args=%v err=%v", args, err)
+	}
+}
+
+// TestArgsFromJSONBoundsNesting: the explicit maxArgsDepth guard rejects
+// pathologically nested args with ErrParse before the decoder recurses over
+// them — and a bracket inside a STRING literal is not structural, so a string
+// arg full of brackets is still depth 1 and must parse.
+func TestArgsFromJSONBoundsNesting(t *testing.T) {
+	n := maxArgsDepth + 8
+	deep := "[" + strings.Repeat("[", n) + strings.Repeat("]", n) + "]"
+	_, err := ArgsFromJSON([]byte(deep))
+	if err == nil {
+		t.Fatal("expected error for over-nested args")
+	}
+	if !errors.Is(err, ErrParse) {
+		t.Fatalf("over-nested args should wrap ErrParse, got %v", err)
+	}
+	// Brackets inside a string value are not nesting — depth 1, must parse verbatim.
+	args, err := ArgsFromJSON([]byte(`["[[[[[not structural]]]]]"]`))
+	if err != nil {
+		t.Fatalf("brackets inside a string must not count as nesting: %v", err)
+	}
+	if len(args) != 1 || args[0] != "[[[[[not structural]]]]]" {
+		t.Fatalf("string with brackets must pass verbatim, got %#v", args)
+	}
+	// A normal flat args array is depth 1, far under the limit.
+	if a, err := ArgsFromJSON([]byte(`[1, "x", true, null]`)); err != nil || len(a) != 4 {
+		t.Fatalf("flat args must parse: args=%v err=%v", a, err)
 	}
 }
 

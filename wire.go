@@ -287,12 +287,56 @@ func QueryArgs(s string) ([]any, error) {
 	return []any{s}, nil
 }
 
+// maxArgsDepth bounds JSON bracket/brace nesting in a positional-args payload.
+// Valid args are a FLAT array of scalars (depth 1) — nested arrays/objects are
+// rejected as unsupported types below regardless — so this is a cheap
+// defense-in-depth bound at the boundary: argsNestingOK rejects pathologically
+// nested input with a normal ErrParse *before* encoding/json recurses and
+// allocates over it, rather than relying on the decoder's internal nesting cap.
+// 32 is far above any real flat args array; raise it only if a structured/JSON
+// column type is ever added.
+const maxArgsDepth = 32
+
+// argsNestingOK reports whether raw's bracket/brace nesting stays within
+// maxArgsDepth. Bytes inside a JSON string literal — and the byte after a '\'
+// escape — are skipped, so a bracket inside a string does not count toward depth.
+// Cheap single pass; runs before the decoder so deep input is rejected without
+// allocation. (Unbalanced closers drive depth negative, which the decoder then
+// rejects as malformed — only over-nesting is our concern here.)
+func argsNestingOK(raw []byte) bool {
+	depth := 0
+	inStr := false
+	for i := 0; i < len(raw); i++ {
+		switch c := raw[i]; {
+		case inStr && c == '\\':
+			i++ // skip the escaped byte (handles \" and \\)
+		case inStr && c == '"':
+			inStr = false
+		case inStr:
+			// other in-string byte: not structural
+		case c == '"':
+			inStr = true
+		case c == '[' || c == '{':
+			depth++
+			if depth > maxArgsDepth {
+				return false
+			}
+		case c == ']' || c == '}':
+			depth--
+		}
+	}
+	return true
+}
+
 // ArgsFromJSON parses a JSON array of positional SQL args into the []any
 // db.Query / db.Exec accept. Empty/nil input yields no args. See the file header
 // for the type mapping (strings stay STRING here; UUID coercion is by column type).
 func ArgsFromJSON(raw []byte) ([]any, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil, nil
+	}
+	if !argsNestingOK(raw) {
+		return nil, fmt.Errorf("%w: args nested too deep (limit %d)", ErrParse, maxArgsDepth)
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()

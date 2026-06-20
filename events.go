@@ -2,6 +2,7 @@ package hazedb
 
 import (
 	"log"
+	"runtime/debug"
 	"time"
 )
 
@@ -41,4 +42,29 @@ func (db *DB) logEvent(level, kind, message string) {
 	); err != nil {
 		log.Printf("hazedb error [events]: recording %q event failed: %v", kind, err)
 	}
+}
+
+// runRecovered runs fn with a deferred recover, so a panic in one iteration of a
+// long-lived background goroutine (drain, compaction, index merge, WAL flush) is
+// logged and the loop survives to its next tick instead of taking the process
+// down. hazedb is embedded in-process (Caddy/FrankenPHP): an unrecovered panic in
+// any of these goroutines crashes the whole host — unlike a request-path panic,
+// which the HTTP and cgo boundaries already recover.
+//
+// It logs only to the standard logger (with a stack), never to the _hz_events
+// companion table: a panic may have left a mirror transaction or a lock in an
+// indeterminate state, and the companion is single-connection, so an INSERT here
+// could deadlock (see logEvent). Stderr always works.
+//
+// NOTE: recovering a panic does NOT release resources the panicked code held (a
+// half-open mirror tx, a lock not guarded by defer). This prevents the process
+// crash, not every downstream stall — per-work-unit cleanup (a deferred tx
+// rollback, defer-unlock) is the deeper hardening, tracked separately.
+func runRecovered(name string, fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("hazedb error [background-panic]: recovered panic in %s: %v\n%s", name, r, debug.Stack())
+		}
+	}()
+	fn()
 }

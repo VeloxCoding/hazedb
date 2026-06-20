@@ -90,7 +90,7 @@ func (db *DB) startCompactLoop(interval time.Duration) {
 			case <-db.compactStop:
 				return // reclamation is optional maintenance — no final sweep on Close
 			case <-t.C:
-				db.sweepCompact()
+				runRecovered("compact", db.sweepCompact)
 			}
 		}
 	}()

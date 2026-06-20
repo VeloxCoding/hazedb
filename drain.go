@@ -555,15 +555,19 @@ func (db *DB) startDrainLoop(interval time.Duration) {
 			case <-db.drainStop:
 				// Final drain: seal the pending buffer so its records reach the
 				// mirror, then drain every sealed segment.
-				_ = db.wal.flush()
-				if err := db.drainOnce(); err != nil {
-					db.logEvent("error", "drain-error", err.Error())
-				}
+				runRecovered("drain", func() {
+					_ = db.wal.flush()
+					if err := db.drainOnce(); err != nil {
+						db.logEvent("error", "drain-error", err.Error())
+					}
+				})
 				return
 			case <-t.C:
-				if err := db.drainOnce(); err != nil {
-					db.logEvent("error", "drain-error", err.Error())
-				}
+				runRecovered("drain", func() {
+					if err := db.drainOnce(); err != nil {
+						db.logEvent("error", "drain-error", err.Error())
+					}
+				})
 			}
 		}
 	}()

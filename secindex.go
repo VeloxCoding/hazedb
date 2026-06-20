@@ -531,15 +531,17 @@ func (db *DB) startMergeLoop(interval time.Duration, threshold int64) {
 		for {
 			select {
 			case <-db.mergeStop:
-				db.mergeIndexes() // final drain so a clean Close leaves no lag
+				runRecovered("index-merge", db.mergeIndexes) // final drain so a clean Close leaves no lag
 				return
 			case <-t.C:
 				ticks++
-				sizeHit := sizeActive && db.sizeTriggerFired(threshold)
-				if sizeHit || ticks >= ticksPerInterval {
-					db.mergeIndexes()
-					ticks = 0
-				}
+				runRecovered("index-merge", func() {
+					sizeHit := sizeActive && db.sizeTriggerFired(threshold)
+					if sizeHit || ticks >= ticksPerInterval {
+						db.mergeIndexes()
+						ticks = 0
+					}
+				})
 			}
 		}
 	}()

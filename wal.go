@@ -143,11 +143,13 @@ func (w *wal) startFlusher(interval time.Duration) {
 			case <-w.stop:
 				return
 			case <-t.C:
-				w.mu.Lock()
-				if w.err == nil {
-					_ = w.flushLocked()
-				}
-				w.mu.Unlock()
+				runRecovered("wal-flush", func() {
+					w.mu.Lock()
+					defer w.mu.Unlock()
+					if w.err == nil {
+						_ = w.flushLocked()
+					}
+				})
 			}
 		}
 	}()
